@@ -23,6 +23,7 @@
 #include "circt/Dialect/Moore/MoorePasses.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
@@ -225,6 +226,12 @@ struct CLOptions {
                "interface, and programs."),
       cl::init(false), cl::cat(cat)};
 
+  cl::opt<bool> allowTopLevelIfacePorts{
+      "allow-top-level-interface-ports",
+      cl::desc("Permit top-level modules to expose unconnected interface "
+               "ports without producing an error."),
+      cl::init(true), cl::cat(cat)};
+
   cl::list<std::string> topModules{
       "top",
       cl::desc("One or more top-level modules to instantiate (instead of "
@@ -290,6 +297,7 @@ static void populatePasses(PassManager &pm) {
   if (opts.loweringMode == LoweringMode::OutputIRMoore)
     return;
   populateMooreToCorePipeline(pm);
+  pm.addPass(sv::createLowerInterfacesPass());
   if (opts.loweringMode == LoweringMode::OutputIRLLHD)
     return;
   LlhdToCorePipelineOptions options;
@@ -334,6 +342,7 @@ static LogicalResult executeWithSources(MLIRContext *context,
     options.timeScale = opts.timeScale;
   options.allowUseBeforeDeclare = opts.allowUseBeforeDeclare;
   options.ignoreUnknownModules = opts.ignoreUnknownModules;
+  options.allowTopLevelIfacePorts = opts.allowTopLevelIfacePorts;
   if (opts.loweringMode != LoweringMode::OnlyLint)
     options.topModules = opts.topModules;
   options.paramOverrides = opts.paramOverrides;
