@@ -92,22 +92,26 @@ private:
     SmallVector<PortInfo> newInputs, newOutputs;
     bool needsChange = false;
     DenseMap<Value, InterfaceInfo *> ifaceValueInfo;
+    Block *body = mod.getBodyBlock();
 
     for (const auto &port : ports.getInputs()) {
       auto updated = port;
-      InterfaceInfo *ifaceInfo = nullptr;
-      Type newType = convertInterfaceType(port.type, port, mod, ifaceInfo);
-      if (!newType)
+      auto ifaceInfo = lookupInterfaceInfo(port.type, mod);
+      if (failed(ifaceInfo))
         return failure();
-      if (newType != port.type) {
-        updated.type = newType;
-        needsChange = true;
+
+      if (*ifaceInfo) {
+        BlockArgument arg = body->getArgument(port.argNum);
+        if (!canLowerInterfaceValue(arg)) {
+          ifaceInfo = nullptr;
+        } else {
+          updated.type = (*ifaceInfo)->getStructType();
+          ifaceValueInfo[arg] = *ifaceInfo;
+          needsChange = true;
+        }
       }
+
       newInputs.push_back(updated);
-      if (ifaceInfo) {
-        BlockArgument arg = mod.getBodyBlock()->getArgument(port.argNum);
-        ifaceValueInfo[arg] = ifaceInfo;
-      }
     }
 
     for (const auto &port : ports.getOutputs()) {
@@ -136,7 +140,6 @@ private:
         hw::ModuleType::get(mod.getContext(), inputTypes, outputTypes);
     mod.setHWModuleType(newType);
 
-    Block *body = mod.getBodyBlock();
     for (auto [idx, port] : llvm::enumerate(newInputs))
       body->getArgument(idx).setType(port.type);
 
@@ -178,32 +181,36 @@ private:
     return success();
   }
 
-  Type convertInterfaceType(Type type, const PortInfo &port,
-                            hw::HWModuleOp mod, InterfaceInfo *&infoOut) {
-    infoOut = nullptr;
-    if (auto ifaceType = type.dyn_cast<InterfaceType>()) {
-      auto symName = StringAttr::get(mod.getContext(),
-                                     ifaceType.getInterface().getValue());
-      auto it = interfaces.find(symName);
-      if (it == interfaces.end()) {
-        mod.emitOpError()
-            << "references unknown interface " << ifaceType.getInterface();
-        return {};
-      }
-      const InterfaceInfo &info = it->second;
-      if (info.fields.empty()) {
-        mod.emitOpError() << "interface " << info.op.getSymName()
-                          << " has no signals; lowering is not meaningful";
-        return {};
-      }
-      infoOut = const_cast<InterfaceInfo *>(&info);
-      return info.getStructType();
-    }
+  DenseMap<StringAttr, InterfaceInfo> interfaces;
 
-    return type;
+  FailureOr<InterfaceInfo *> lookupInterfaceInfo(Type type,
+                                                 hw::HWModuleOp mod) {
+    auto ifaceType = type.dyn_cast<InterfaceType>();
+    if (!ifaceType)
+      return static_cast<InterfaceInfo *>(nullptr);
+
+    auto symName = StringAttr::get(mod.getContext(),
+                                   ifaceType.getInterface().getValue());
+    auto it = interfaces.find(symName);
+    if (it == interfaces.end()) {
+      mod.emitOpError()
+          << "references unknown interface " << ifaceType.getInterface();
+      return failure();
+    }
+    InterfaceInfo &info = it->second;
+    if (info.fields.empty()) {
+      mod.emitOpError() << "interface " << info.op.getSymName()
+                        << " has no signals; lowering is not meaningful";
+      return failure();
+    }
+    return &info;
   }
 
-  DenseMap<StringAttr, InterfaceInfo> interfaces;
+  bool canLowerInterfaceValue(Value ifaceVal) {
+    return llvm::all_of(ifaceVal.getUsers(), [](Operation *user) {
+      return isa<sv::ReadInterfaceSignalOp>(user);
+    });
+  }
 };
 
 } // namespace
