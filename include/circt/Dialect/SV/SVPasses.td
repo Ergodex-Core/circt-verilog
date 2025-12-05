@@ -166,4 +166,15 @@ def HWEliminateInOutPorts : Pass<"hw-eliminate-inout-ports",
   ];
 }
 
+def LowerInterfaces : Pass<"sv-lower-interfaces", "mlir::ModuleOp"> {
+  let summary = "Collect interface schemas in preparation for lowering";
+  let description = [{
+    This pass walks all HW modules and records the layout of any interface or
+    modport typed ports.  The gathered metadata will form the basis for
+    lowering SV interfaces to plain HW ports in subsequent revisions.
+  }];
+  let constructor = "circt::sv::createLowerInterfacesPass()";
+  let dependentDialects = ["circt::hw::HWDialect", "circt::sv::SVDialect"];
+}
+
 #endif // CIRCT_DIALECT_SV_SVPASSES

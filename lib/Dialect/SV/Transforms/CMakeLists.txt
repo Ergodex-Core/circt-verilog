@@ -3,6 +3,7 @@ add_circt_dialect_library(CIRCTSVTransforms
   HWCleanup.cpp
   HWStubExternalModules.cpp
   HWLegalizeModules.cpp
+  LowerInterfaces.cpp
   PrettifyVerilog.cpp
   SVExtractTestCode.cpp
   HWExportModuleHierarchy.cpp

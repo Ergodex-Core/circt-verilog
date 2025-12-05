@@ -31,6 +31,7 @@ std::unique_ptr<mlir::Pass> createHWLowerInstanceChoices();
 std::unique_ptr<mlir::Pass> createHWGeneratorCalloutPass();
 std::unique_ptr<mlir::Pass> createHWEliminateInOutPortsPass(
     const HWEliminateInOutPortsOptions &options = {});
+std::unique_ptr<mlir::Pass> createLowerInterfacesPass();
 std::unique_ptr<mlir::Pass>
 createSVExtractTestCodePass(bool disableInstanceExtraction = false,
                             bool disableRegisterExtraction = false,
