@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ImportVerilogInternals.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Support/Timing.h"
@@ -234,6 +235,9 @@ LogicalResult ImportDriver::prepareDriver(SourceMgr &sourceMgr) {
       slang::ast::CompilationFlags::IgnoreUnknownModules,
       options.ignoreUnknownModules);
   driver.options.compilationFlags.emplace(
+      slang::ast::CompilationFlags::AllowTopLevelIfacePorts,
+      options.allowTopLevelIfacePorts);
+  driver.options.compilationFlags.emplace(
       slang::ast::CompilationFlags::LintMode,
       options.mode == ImportVerilogOptions::Mode::OnlyLint);
   driver.options.compilationFlags.emplace(
@@ -274,17 +278,27 @@ LogicalResult ImportDriver::importVerilog(ModuleOp module) {
   // Traverse the parsed Verilog AST and map it to the equivalent CIRCT ops.
   mlirContext
       ->loadDialect<moore::MooreDialect, hw::HWDialect, cf::ControlFlowDialect,
-                    func::FuncDialect, verif::VerifDialect, ltl::LTLDialect,
+                    sv::SVDialect, verif::VerifDialect, ltl::LTLDialect,
                     debug::DebugDialect>();
   auto conversionTimer = ts.nest("Verilog to dialect mapping");
   Context context(options, *compilation, module, driver.sourceManager);
-  if (failed(context.convertCompilation()))
+  if (failed(context.convertCompilation())) {
+    if (driver.diagEngine.getNumErrors() == 0) {
+      auto diag = mlirContext->getDiagEngine().emit(
+          UnknownLoc::get(mlirContext), DiagnosticSeverity::Error);
+      diag << "import failed without diagnostics";
+    }
     return failure();
+  }
   conversionTimer.stop();
 
   // Run the verifier on the constructed module to ensure it is clean.
   auto verifierTimer = ts.nest("Post-parse verification");
-  return verify(module);
+  if (failed(verify(module))) {
+    module.emitError("imported module failed verification");
+    return failure();
+  }
+  return success();
 }
 
 /// Preprocess the prepared source files and print them to the given output

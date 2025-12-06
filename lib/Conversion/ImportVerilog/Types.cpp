@@ -162,6 +162,39 @@ struct TypeVisitor {
     return moore::StringType::get(context.getContext());
   }
 
+  Type visit(const slang::ast::ClassType &type) {
+    // Represent class handles as simple 32-bit integers. This allows the
+    // importer to thread class-typed values through the IR without modeling
+    // full object semantics.
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               Domain::TwoValued);
+  }
+
+  Type visit(const slang::ast::NullType &type) {
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               Domain::TwoValued);
+  }
+
+  Type visit(const slang::ast::VirtualInterfaceType &type) {
+    auto &ifaceInst = type.iface;
+    auto &ifaceBody = ifaceInst.body;
+    auto *lowering = context.convertInterface(&ifaceBody);
+    if (!lowering)
+      return {};
+
+    if (type.modport) {
+      if (auto attr = lowering->modportRefs.lookup(type.modport))
+        return sv::ModportType::get(context.getContext(), attr);
+      auto d = mlir::emitError(loc, "missing modport lowering for `")
+               << type.modport->name << "`";
+      d.attachNote(context.convertLocation(type.modport->location))
+          << "modport declared here";
+      return {};
+    }
+
+    return lowering->type;
+  }
+
   /// Emit an error for all other types.
   template <typename T>
   Type visit(T &&node) {

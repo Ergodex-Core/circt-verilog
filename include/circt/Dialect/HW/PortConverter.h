@@ -47,7 +47,9 @@ public:
   /// will not be reflected in the modules new port list. Will also add the new
   /// input to the block arguments of the body of the module.
   Value createNewInput(hw::PortInfo origPort, const Twine &suffix, Type type,
-                       hw::PortInfo &newPort);
+                       hw::PortInfo &newPort,
+                       hw::ModulePort::Direction dir =
+                           hw::ModulePort::Direction::Input);
   /// Same as above. 'output' is the value fed into the new port and is required
   /// if 'body' is non-null. Important note: cannot be a backedge which gets
   /// replaced since this isn't attached to an op until later in the pass.

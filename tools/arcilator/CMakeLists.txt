@@ -23,6 +23,9 @@ set(libs
   CIRCTSupport
   CIRCTTransforms
   CIRCTVerif
+  CIRCTSeq
+  CIRCTSV
+  CIRCTMoore
   MLIRArithDialect
   MLIRBuiltinToLLVMIRTranslation
   MLIRControlFlowDialect

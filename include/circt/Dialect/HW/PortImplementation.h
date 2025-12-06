@@ -173,11 +173,14 @@ struct ModulePortInfo {
 private:
   // convert input inout<type> -> inout type
   void sanitizeInOut() {
-    for (auto &p : ports)
+    for (auto &p : ports) {
+      if (!p.type)
+        continue;
       if (auto inout = dyn_cast<hw::InOutType>(p.type)) {
         p.type = inout.getElementType();
         p.dir = ModulePort::Direction::InOut;
       }
+    }
   }
 
   /// This contains a list of all ports.  Input first.

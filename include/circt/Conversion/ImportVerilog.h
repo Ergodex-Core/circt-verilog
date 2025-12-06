@@ -106,6 +106,9 @@ struct ImportVerilogOptions {
   /// If true, ignore errors about unknown modules.
   std::optional<bool> ignoreUnknownModules;
 
+  /// If true, allow top-level modules to have unconnected interface ports.
+  std::optional<bool> allowTopLevelIfacePorts;
+
   /// If non-empty, specifies the list of modules that should serve as the top
   /// modules in the design. If empty, this will be automatically determined
   /// based on which modules are unreferenced elsewhere.

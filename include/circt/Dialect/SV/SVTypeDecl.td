@@ -310,7 +310,8 @@ def AssignInterfaceSignalOp : SVOp<"interface.signal.assign", []> {
     ```
   }];
 
-  let arguments = (ins InterfaceType:$iface, FlatSymbolRefAttr:$signalName,
+  let arguments = (ins AnyTypeOf<[InterfaceType, ModportType]>:$iface,
+    FlatSymbolRefAttr:$signalName,
     AnyType:$rhs);
 
   let assemblyFormat = [{
@@ -337,7 +338,9 @@ def ReadInterfaceSignalOp : SVOp<"interface.signal.read", [Pure]> {
     ```
   }];
 
-  let arguments = (ins InterfaceType:$iface, FlatSymbolRefAttr:$signalName);
+  let arguments =
+      (ins AnyTypeOf<[InterfaceType, ModportType]>:$iface,
+        FlatSymbolRefAttr:$signalName);
   let results = (outs AnyType:$signalData);
 
   let assemblyFormat = [{

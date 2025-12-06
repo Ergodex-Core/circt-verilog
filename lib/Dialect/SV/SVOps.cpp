@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/SV/SVOps.h"
+#include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -19,6 +20,7 @@
 #include "circt/Dialect/HW/ModuleImplementation.h"
 #include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Support/CustomDirectiveImpl.h"
+#include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
@@ -54,7 +56,9 @@ bool sv::isExpression(Operation *op) {
 }
 
 LogicalResult sv::verifyInProceduralRegion(Operation *op) {
-  if (op->getParentOp()->hasTrait<sv::ProceduralRegion>())
+  auto *parent = op->getParentOp();
+  if (parent->hasTrait<sv::ProceduralRegion>() ||
+      isa<moore::ProcedureOp>(parent))
     return success();
   op->emitError() << op->getName() << " should be in a procedural region";
   return failure();
@@ -1548,10 +1552,29 @@ GetModportOp::getReferencedDecl(const hw::HWSymbolCache &cache) {
       cache.getDefinition(getFieldAttr()));
 }
 
+static FlatSymbolRefAttr getInterfaceSymbolRef(Type type) {
+  if (auto ifaceTy = dyn_cast<InterfaceType>(type))
+    return ifaceTy.getInterface();
+  if (auto modportTy = dyn_cast<ModportType>(type))
+    return FlatSymbolRefAttr::get(modportTy.getModport().getRootReference());
+  return {};
+}
+
+static InterfaceType getInterfaceTypeFrom(Type type) {
+  if (auto ifaceTy = dyn_cast<InterfaceType>(type))
+    return ifaceTy;
+  if (auto modportTy = dyn_cast<ModportType>(type))
+    return InterfaceType::get(
+        type.getContext(),
+        FlatSymbolRefAttr::get(modportTy.getModport().getRootReference()));
+  return {};
+}
+
 void ReadInterfaceSignalOp::build(OpBuilder &builder, OperationState &state,
                                   Value iface, StringRef signalName) {
-  auto ifaceTy = dyn_cast<InterfaceType>(iface.getType());
-  assert(ifaceTy && "ReadInterfaceSignalOp expects an InterfaceType.");
+  auto ifaceTy = getInterfaceTypeFrom(iface.getType());
+  assert(ifaceTy &&
+         "ReadInterfaceSignalOp expects an InterfaceType or ModportType.");
   auto fieldAttr = SymbolRefAttr::get(builder.getContext(), signalName);
   InterfaceOp ifaceDefOp = SymbolTable::lookupNearestSymbolFrom<InterfaceOp>(
       iface.getDefiningOp(), ifaceTy.getInterface());
@@ -1571,31 +1594,68 @@ ReadInterfaceSignalOp::getReferencedDecl(const hw::HWSymbolCache &cache) {
 ParseResult parseIfaceTypeAndSignal(OpAsmParser &p, Type &ifaceTy,
                                     FlatSymbolRefAttr &signalName) {
   SymbolRefAttr fullSym;
-  if (p.parseAttribute(fullSym) || fullSym.getNestedReferences().size() != 1)
+  if (p.parseAttribute(fullSym))
     return failure();
 
-  auto *ctxt = p.getBuilder().getContext();
-  ifaceTy = InterfaceType::get(
-      ctxt, FlatSymbolRefAttr::get(fullSym.getRootReference()));
+  auto nested = fullSym.getNestedReferences();
+  if (nested.empty())
+    return p.emitError(p.getCurrentLocation())
+           << "expected interface::signal or interface::modport::signal";
+
   signalName = FlatSymbolRefAttr::get(fullSym.getLeafReference());
-  return success();
+  if (ifaceTy) {
+    if (!isa<InterfaceType, ModportType>(ifaceTy))
+      return p.emitError(p.getCurrentLocation())
+             << "expected interface or modport type";
+    return success();
+  }
+
+  auto *ctxt = p.getBuilder().getContext();
+  if (nested.size() == 1) {
+    ifaceTy = InterfaceType::get(
+        ctxt, FlatSymbolRefAttr::get(fullSym.getRootReference()));
+    return success();
+  }
+
+  if (nested.size() == 2) {
+    auto modportRef =
+        SymbolRefAttr::get(fullSym.getRootReference(), {nested.front()});
+    ifaceTy = ModportType::get(ctxt, modportRef);
+    return success();
+  }
+
+  return p.emitError(p.getCurrentLocation())
+         << "expected interface::signal or interface::modport::signal";
 }
 
 void printIfaceTypeAndSignal(OpAsmPrinter &p, Operation *op, Type type,
                              FlatSymbolRefAttr signalName) {
-  InterfaceType ifaceTy = dyn_cast<InterfaceType>(type);
-  assert(ifaceTy && "Expected an InterfaceType");
-  auto sym = SymbolRefAttr::get(ifaceTy.getInterface().getRootReference(),
-                                {signalName});
+  FlatSymbolRefAttr ifaceRef = getInterfaceSymbolRef(type);
+  assert(ifaceRef && "Expected an Interface or Modport type");
+  if (auto modportTy = dyn_cast<ModportType>(type)) {
+    auto modportName =
+        FlatSymbolRefAttr::get(modportTy.getModport().getLeafReference());
+    auto sym = SymbolRefAttr::get(ifaceRef.getAttr(),
+                                  {modportName, signalName});
+    p << sym;
+    return;
+  }
+
+  auto sym = SymbolRefAttr::get(ifaceRef.getAttr(), {signalName});
   p << sym;
 }
 
 LogicalResult verifySignalExists(Value ifaceVal, FlatSymbolRefAttr signalName) {
-  auto ifaceTy = dyn_cast<InterfaceType>(ifaceVal.getType());
-  if (!ifaceTy)
+  auto ifaceRef = getInterfaceSymbolRef(ifaceVal.getType());
+  if (!ifaceRef)
     return failure();
+  Operation *lookupAnchor = ifaceVal.getDefiningOp();
+  if (!lookupAnchor)
+    if (auto blockArg = dyn_cast<BlockArgument>(ifaceVal))
+      lookupAnchor = blockArg.getOwner() ? blockArg.getOwner()->getParentOp()
+                                         : nullptr;
   InterfaceOp iface = SymbolTable::lookupNearestSymbolFrom<InterfaceOp>(
-      ifaceVal.getDefiningOp(), ifaceTy.getInterface());
+      lookupAnchor, ifaceRef);
   if (!iface)
     return failure();
   InterfaceSignalOp signal = iface.lookupSymbol<InterfaceSignalOp>(signalName);

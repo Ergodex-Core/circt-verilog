@@ -84,17 +84,21 @@ PortConverterImpl::PortConverterImpl(igraph::InstanceGraphNode *moduleNode)
 }
 
 Value PortConverterImpl::createNewInput(PortInfo origPort, const Twine &suffix,
-                                        Type type, PortInfo &newPort) {
-  newPort = PortInfo{
-      {append(origPort.name, suffix), type, ModulePort::Direction::Input},
-      newInputs.size(),
-      {},
-      origPort.loc};
+                                        Type type, PortInfo &newPort,
+                                        ModulePort::Direction dir) {
+  newPort = PortInfo{{append(origPort.name, suffix), type, dir},
+                     newInputs.size(),
+                     {},
+                     origPort.loc};
   newInputs.emplace_back(0, newPort);
 
   if (!body)
     return {};
-  return body->addArgument(type, origPort.loc);
+
+  Type argType = type;
+  if (dir == ModulePort::Direction::InOut)
+    argType = hw::InOutType::get(type);
+  return body->addArgument(argType, origPort.loc);
 }
 
 void PortConverterImpl::createNewOutput(PortInfo origPort, const Twine &suffix,

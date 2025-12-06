@@ -8,8 +8,13 @@
 
 #include "ImportVerilogInternals.h"
 #include "slang/ast/EvalContext.h"
+#include "slang/ast/HierarchicalReference.h"
 #include "slang/ast/SystemSubroutine.h"
 #include "slang/syntax/AllSyntax.h"
+#include "circt/Dialect/HW/HWTypes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/APInt.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -26,6 +31,18 @@ static FVInt convertSVIntToFVInt(const slang::SVInt &svint) {
   }
   auto value = ArrayRef<uint64_t>(svint.getRawPtr(), svint.getNumWords());
   return FVInt(APInt(svint.getBitWidth(), value));
+}
+
+static Type getInterfaceSignalType(Type type) {
+  if (auto intTy = dyn_cast<moore::IntType>(type)) {
+    unsigned width = intTy.getBitSize().value_or(1);
+    if (width == 0)
+      width = 1;
+    auto widthAttr = IntegerAttr::get(IntegerType::get(type.getContext(), 32),
+                                      APInt(32, width));
+    return hw::IntType::get(widthAttr);
+  }
+  return type;
 }
 
 /// Map an index into an array, with bounds `range`, to a bit offset of the
@@ -60,6 +77,52 @@ static Value getSelectIndex(Context &context, Location loc, Value index,
     return moore::SubOp::create(builder, loc, offsetConst, index);
 }
 
+static FailureOr<Value>
+resolveInterfaceHandle(Context &context,
+                       const slang::ast::HierarchicalValueExpression &expr,
+                       Location loc) {
+  auto hierLoc = context.convertLocation(expr.symbol.location);
+  llvm::errs() << "[import-verilog] resolveInterfaceHandle for "
+               << expr.symbol.name << " path size: "
+               << expr.ref.path.size() << "\n";
+  for (const auto &element : expr.ref.path)
+    llvm::errs() << "  element: "
+                 << slang::ast::toString(element.symbol->kind) << "\n";
+  if (expr.ref.target)
+    llvm::errs() << "  target: "
+                 << slang::ast::toString(expr.ref.target->kind) << "\n";
+  auto lookUpSymbol = [&](const slang::ast::Symbol *symbol) -> Value {
+    if (!symbol)
+      return Value();
+    if (auto *ifacePort =
+            symbol->as_if<slang::ast::InterfacePortSymbol>()) {
+      if (auto value = context.valueSymbols.lookup(ifacePort);
+          value && isa<sv::InterfaceType>(value.getType()))
+        return value;
+    }
+    if (auto *valueSym = symbol->as_if<slang::ast::ValueSymbol>()) {
+      if (auto value = context.valueSymbols.lookup(valueSym);
+          value && isa<sv::InterfaceType>(value.getType()))
+        return value;
+    }
+    return Value();
+  };
+
+  for (const auto &element : expr.ref.path)
+    if (auto value = lookUpSymbol(element.symbol))
+      return value;
+
+  if (auto value = lookUpSymbol(expr.ref.target))
+    return value;
+
+  auto diag = mlir::emitError(loc, "unable to resolve interface for `")
+              << expr.symbol.name << "`";
+  diag.attachNote(hierLoc)
+      << "hierarchical reference traverses an interface port but no SSA value "
+         "was recorded for it";
+  return failure();
+}
+
 /// Get the currently active timescale as an integer number of femtoseconds.
 static uint64_t getTimeScaleInFemtoseconds(Context &context) {
   static_assert(int(slang::TimeUnit::Seconds) == 0);
@@ -80,6 +143,69 @@ static uint64_t getTimeScaleInFemtoseconds(Context &context) {
   while (exp-- > 0)
     scale *= 1000;
   return scale;
+}
+
+FailureOr<Value> Context::assignInterfaceMember(
+    const slang::ast::Expression &lhsExpr,
+    const slang::ast::Expression &rhsExpr, Location loc) {
+  Value ifaceValue;
+  const slang::ast::ValueSymbol *memberSymbol = nullptr;
+  const slang::ast::Type *memberType = nullptr;
+  Location memberLoc = loc;
+
+  if (auto *member =
+          lhsExpr.as_if<slang::ast::MemberAccessExpression>()) {
+    ifaceValue = convertRvalueExpression(member->value());
+    if (!ifaceValue || !isa<sv::InterfaceType>(ifaceValue.getType()))
+      return failure();
+    memberSymbol = member->member.as_if<slang::ast::ValueSymbol>();
+    if (!memberSymbol)
+      return mlir::emitError(loc)
+             << "interface member `" << member->member.name
+             << "` is not a value symbol";
+    memberType = member->type;
+    memberLoc = convertLocation(member->member.location);
+  } else if (auto *hier =
+                 lhsExpr.as_if<slang::ast::HierarchicalValueExpression>()) {
+    if (!hier->ref.isViaIfacePort())
+      return failure();
+    auto ifaceHandle = resolveInterfaceHandle(*this, *hier, loc);
+    if (failed(ifaceHandle))
+      return failure();
+    ifaceValue = ifaceHandle.value();
+    memberSymbol = hier->symbol.as_if<slang::ast::ValueSymbol>();
+    if (!memberSymbol)
+      return mlir::emitError(loc)
+             << "interface member `" << hier->symbol.name
+             << "` is not a value symbol";
+    memberType = hier->type;
+    memberLoc = convertLocation(hier->symbol.location);
+  } else {
+    return failure();
+  }
+
+  auto signalAttr = lookupInterfaceSignal(*memberSymbol, memberLoc);
+  if (failed(signalAttr))
+    return failure();
+
+  auto targetType = convertType(*memberType);
+  if (!targetType)
+    return failure();
+
+  auto signalType = getInterfaceSignalType(targetType);
+  if (!signalType)
+    return failure();
+
+  auto rhs = convertRvalueExpression(rhsExpr, targetType);
+  if (!rhs)
+    return failure();
+
+  rhs = materializeConversion(signalType, rhs, false, rhs.getLoc());
+  if (!rhs)
+    return failure();
+  builder.create<sv::AssignInterfaceSignalOp>(memberLoc, ifaceValue,
+                                              *signalAttr, rhs);
+  return rhs;
 }
 
 namespace {
@@ -321,6 +447,43 @@ struct ExprVisitor {
         isLvalue ? moore::RefType::get(cast<moore::UnpackedType>(type)) : type;
     auto memberName = builder.getStringAttr(expr.member.name);
 
+    if (isa<sv::InterfaceType>(value.getType()) ||
+        isa<sv::ModportType>(value.getType())) {
+      if (auto *valueSym = expr.member.as_if<slang::ast::ValueSymbol>()) {
+        if (isLvalue)
+          return Value();
+        auto signalAttr = context.lookupInterfaceSignal(*valueSym, loc);
+        if (failed(signalAttr))
+          return Value();
+        auto signalType = getInterfaceSignalType(type);
+        Value read = builder.create<sv::ReadInterfaceSignalOp>(loc, signalType,
+                                                               value,
+                                                               *signalAttr);
+        if (signalType != type)
+          read = context.materializeConversion(type, read,
+                                               expr.type->isSigned(), loc);
+        return read;
+      }
+      if (auto *modportSym = expr.member.as_if<slang::ast::ModportSymbol>()) {
+        auto modportAttr = context.lookupInterfaceModport(*modportSym, loc);
+        if (failed(modportAttr))
+          return Value();
+        auto modportType =
+            sv::ModportType::get(builder.getContext(), *modportAttr);
+        auto fieldAttr = FlatSymbolRefAttr::get(
+            builder.getContext(), modportSym->name);
+        if (!isa<sv::InterfaceType>(value.getType())) {
+          mlir::emitError(loc)
+              << "cannot derive modport `" << modportSym->name
+              << "` from non-interface value";
+          return Value();
+        }
+        return builder
+            .create<sv::GetModportOp>(loc, modportType, value, fieldAttr)
+            .getResult();
+      }
+    }
+
     // Handle structs.
     if (valueType->isStruct()) {
       if (isLvalue)
@@ -359,6 +522,35 @@ struct RvalueExprVisitor : public ExprVisitor {
       : ExprVisitor(context, loc, /*isLvalue=*/false) {}
   using ExprVisitor::visit;
 
+  /// Materialize a stubbed-out call by evaluating its arguments for their side
+  /// effects and synthesizing a constant result.
+  Value materializeStubCall(const slang::ast::CallExpression &expr) {
+    if (auto *thisClass = expr.thisClass())
+      if (!context.convertRvalueExpression(*thisClass))
+        return {};
+
+    for (auto *arg : expr.arguments())
+      if (!context.convertRvalueExpression(*arg))
+        return {};
+
+    auto resultType = context.convertType(*expr.type);
+    if (!resultType)
+      return {};
+
+    if (isa<moore::VoidType>(resultType)) {
+      return mlir::UnrealizedConversionCastOp::create(builder, loc, resultType,
+                                                      ValueRange{})
+          .getResult(0);
+    }
+
+    if (auto intType = dyn_cast<moore::IntType>(resultType))
+      return moore::ConstantOp::create(builder, loc, intType, /*value=*/1,
+                                       /*isSigned=*/true);
+
+    mlir::emitError(loc, "unsupported stub call return type: ") << resultType;
+    return {};
+  }
+
   // Handle references to the left-hand side of a parent assignment.
   Value visit(const slang::ast::LValueReferenceExpression &expr) {
     assert(!context.lvalueStack.empty() && "parent assignments push lvalue");
@@ -394,6 +586,34 @@ struct RvalueExprVisitor : public ExprVisitor {
   // Handle hierarchical values, such as `x = Top.sub.var`.
   Value visit(const slang::ast::HierarchicalValueExpression &expr) {
     auto hierLoc = context.convertLocation(expr.symbol.location);
+
+    if (expr.ref.isViaIfacePort()) {
+      auto ifaceValueOr = resolveInterfaceHandle(context, expr, loc);
+      if (failed(ifaceValueOr))
+        return {};
+      auto ifaceValue = ifaceValueOr.value();
+
+      auto *memberSym = expr.symbol.as_if<slang::ast::ValueSymbol>();
+      if (!memberSym) {
+        auto d = mlir::emitError(loc, "interface member `")
+                 << expr.symbol.name << "` is not a value symbol";
+        d.attachNote(hierLoc)
+            << "kind: " << slang::ast::toString(expr.symbol.kind);
+        return {};
+      }
+      auto signalAttr = context.lookupInterfaceSignal(*memberSym, hierLoc);
+      if (failed(signalAttr))
+        return {};
+
+      auto type = context.convertType(*expr.type);
+      if (!type)
+        return {};
+
+      auto readOp = builder.create<sv::ReadInterfaceSignalOp>(
+          loc, type, ifaceValue, *signalAttr);
+      return readOp.getResult();
+    }
+
     if (auto value = context.valueSymbols.lookup(&expr.symbol)) {
       if (isa<moore::RefType>(value.getType())) {
         auto readOp = moore::ReadOp::create(builder, hierLoc, value);
@@ -423,6 +643,27 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   // Handle blocking and non-blocking assignments.
   Value visit(const slang::ast::AssignmentExpression &expr) {
+    if (auto *member =
+            expr.left().as_if<slang::ast::MemberAccessExpression>()) {
+      auto ifaceValue = context.convertRvalueExpression(member->value());
+      if (ifaceValue && isa<sv::InterfaceType>(ifaceValue.getType())) {
+        auto assigned =
+            context.assignInterfaceMember(expr.left(), expr.right(), loc);
+        if (succeeded(assigned))
+          return assigned.value();
+        return {};
+      }
+    } else if (auto *hier =
+                   expr.left().as_if<slang::ast::HierarchicalValueExpression>()) {
+      if (hier->ref.isViaIfacePort()) {
+        auto assigned =
+            context.assignInterfaceMember(expr.left(), expr.right(), loc);
+        if (succeeded(assigned))
+          return assigned.value();
+        return {};
+      }
+    }
+
     auto lhs = context.convertLvalueExpression(expr.left());
     if (!lhs)
       return {};
@@ -916,10 +1157,8 @@ struct RvalueExprVisitor : public ExprVisitor {
 
   /// Handle calls.
   Value visit(const slang::ast::CallExpression &expr) {
-    // Class method calls are currently not supported.
     if (expr.thisClass()) {
-      mlir::emitError(loc, "unsupported class method call");
-      return {};
+      return materializeStubCall(expr);
     }
 
     // Try to materialize constant values directly.
@@ -932,12 +1171,47 @@ struct RvalueExprVisitor : public ExprVisitor {
         expr.subroutine);
   }
 
+  /// Handle class object construction.
+  Value visit(const slang::ast::NewClassExpression &expr) {
+    // Evaluate constructor call for side effects if present.
+    if (const auto *ctor = expr.constructorCall())
+      if (!context.convertRvalueExpression(*ctor))
+        return {};
+
+    auto type = context.convertType(*expr.type);
+    if (!type)
+      return {};
+
+    if (auto intType = dyn_cast<moore::IntType>(type))
+      return moore::ConstantOp::create(builder, loc, intType, /*value=*/1,
+                                       /*isSigned=*/true);
+
+    mlir::emitError(loc, "unsupported new-expression result type: ") << type;
+    return {};
+  }
+
+  /// Handle `null` literals that appear in class constructors and handles.
+  Value visit(const slang::ast::NullLiteral &expr) {
+    auto type = context.convertType(*expr.type);
+    if (!type)
+      return {};
+
+    if (auto intType = dyn_cast<moore::IntType>(type))
+      return moore::ConstantOp::create(builder, loc, intType, /*value=*/0,
+                                       /*isSigned=*/true);
+
+    mlir::emitError(loc, "unsupported null literal type: ") << type;
+    return {};
+  }
+
   /// Handle subroutine calls.
   Value visitCall(const slang::ast::CallExpression &expr,
                   const slang::ast::SubroutineSymbol *subroutine) {
     auto *lowering = context.declareFunction(*subroutine);
     if (!lowering)
       return {};
+    if (!lowering->op)
+      return materializeStubCall(expr);
 
     // Convert the call arguments. Input arguments are converted to an rvalue.
     // All other arguments are converted to lvalues and passed into the function
@@ -1664,6 +1938,42 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
   // Nothing to do if the types are already equal.
   if (type == value.getType())
     return value;
+
+  // When values arrive from SV/HW interfaces, convert them into Moore ints so
+  // the standard conversion logic can reason about widths and domains.
+  if (auto srcHWInt = dyn_cast<hw::IntType>(value.getType())) {
+    int64_t width = hw::getBitWidth(srcHWInt);
+    if (width < 0) {
+      mlir::emitError(loc) << "unsupported hw.int type " << srcHWInt;
+      return {};
+    }
+    auto mooreType =
+        moore::IntType::get(getContext(), width, moore::Domain::TwoValued);
+    value = mlir::UnrealizedConversionCastOp::create(
+                builder, loc, mooreType, ValueRange{value})
+                .getResult(0);
+    if (type == value.getType())
+      return value;
+  }
+
+  // If we are targeting an HW integer type, first convert the value into a
+  // two-valued Moore integer with matching width, then bridge into the HW
+  // world via an unrealized cast.
+  if (auto dstHWInt = dyn_cast<hw::IntType>(type)) {
+    int64_t width = hw::getBitWidth(dstHWInt);
+    if (width < 0) {
+      mlir::emitError(loc) << "unsupported hw.int type " << dstHWInt;
+      return {};
+    }
+    auto targetMoore =
+        moore::IntType::get(getContext(), width, moore::Domain::TwoValued);
+    value = materializeConversion(targetMoore, value, isSigned, loc);
+    if (!value)
+      return {};
+    return mlir::UnrealizedConversionCastOp::create(
+               builder, loc, type, ValueRange{value})
+        .getResult(0);
+  }
 
   // Handle packed types which can be converted to a simple bit vector. This
   // allows us to perform resizing and domain casting on that bit vector.
