@@ -670,9 +670,9 @@ struct StmtVisitor {
       auto expr = context.convertRvalueExpression(*stmt.expr);
       if (!expr)
         return failure();
-      mlir::func::ReturnOp::create(builder, loc, expr);
+      sv::ReturnOp::create(builder, loc, ValueRange{expr});
     } else {
-      mlir::func::ReturnOp::create(builder, loc);
+      sv::ReturnOp::create(builder, loc, ValueRange{});
     }
     setTerminated();
     return success();

@@ -181,6 +181,18 @@ void StripSVPass::runOnOperation() {
   }
   for (auto *op : opsToDelete)
     op->erase();
+
+  // Interface definitions are unused after lowering; drop them entirely.
+  for (auto iface : llvm::make_early_inc_range(
+           mlirModule.getOps<sv::InterfaceOp>())) {
+    if (!iface->use_empty()) {
+      iface.emitError()
+          << "unexpected live interface; sv-lower-interfaces should "
+             "eliminate references before StripSV";
+      return signalPassFailure();
+    }
+    iface.erase();
+  }
 }
 
 std::unique_ptr<Pass> arc::createStripSVPass(bool asyncResetsAsSync) {

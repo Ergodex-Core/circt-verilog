@@ -14,6 +14,7 @@
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/LTL/LTLOps.h"
 #include "circt/Dialect/Moore/MooreOps.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/ConversionPatternSet.h"
@@ -230,24 +231,29 @@ static Value adjustIntegerWidth(OpBuilder &builder, Value value,
   return comb::MuxOp::create(builder, loc, isZero, lo, max, false);
 }
 
-/// Get the ModulePortInfo from a SVModuleOp.
-static FailureOr<hw::ModulePortInfo>
-getModulePortInfo(const TypeConverter &typeConverter, SVModuleOp op) {
+/// Populate `portInfos` with the HW-oriented port description of `op`.
+static void collectModulePortInfo(const TypeConverter &typeConverter,
+                                  SVModuleOp op,
+                                  SmallVectorImpl<hw::PortInfo> &portInfos) {
   size_t inputNum = 0;
   size_t resultNum = 0;
   auto moduleTy = op.getModuleType();
-  SmallVector<hw::PortInfo> ports;
-  ports.reserve(moduleTy.getNumPorts());
+  portInfos.clear();
+  portInfos.reserve(moduleTy.getNumPorts());
 
   for (auto port : moduleTy.getPorts()) {
     Type portTy = typeConverter.convertType(port.type);
-    if (!portTy) {
-      return op.emitOpError("port '")
-             << port.name << "' has unsupported type " << port.type
-             << " that cannot be converted to hardware type";
+    if (!portTy)
+      portTy = port.type;
+    if (auto ioTy = dyn_cast_or_null<hw::InOutType>(portTy)) {
+      portInfos.push_back(hw::PortInfo(
+          {{port.name, ioTy.getElementType(), hw::ModulePort::InOut},
+           inputNum++,
+           {}}));
+      continue;
     }
     if (port.dir == hw::ModulePort::Direction::Output) {
-      ports.push_back(
+      portInfos.push_back(
           hw::PortInfo({{port.name, portTy, port.dir}, resultNum++, {}}));
     } else {
       // FIXME: Once we support net<...>, ref<...> type to represent type of
@@ -255,12 +261,63 @@ getModulePortInfo(const TypeConverter &typeConverter, SVModuleOp op) {
       // port. It can change to generate corresponding types for direction of
       // port or do specified operation to it. Now inout and ref port is treated
       // as input port.
-      ports.push_back(
+      portInfos.push_back(
           hw::PortInfo({{port.name, portTy, port.dir}, inputNum++, {}}));
     }
   }
+}
 
-  return hw::ModulePortInfo(ports);
+static hw::HWModuleOp createHWModuleFromPorts(OpBuilder &builder, Location loc,
+                                              StringAttr name,
+                                              ArrayRef<hw::PortInfo> ports) {
+  OperationState state(loc, hw::HWModuleOp::getOperationName());
+  state.addAttribute(SymbolTable::getSymbolAttrName(), name);
+
+  SmallVector<hw::ModulePort> modulePorts;
+  modulePorts.reserve(ports.size());
+  SmallVector<Attribute> perPortAttrs;
+  perPortAttrs.reserve(ports.size());
+  bool anyPortAttrs = false;
+  for (const auto &port : ports) {
+    modulePorts.push_back({port.name, port.type, port.dir});
+    DictionaryAttr dict = port.attrs;
+    if (!dict)
+      dict = builder.getDictionaryAttr({});
+    else if (!dict.empty())
+      anyPortAttrs = true;
+    perPortAttrs.push_back(dict);
+  }
+
+  auto moduleType =
+      hw::ModuleType::get(builder.getContext(), modulePorts);
+  state.addAttribute(
+      hw::HWModuleOp::getModuleTypeAttrName(state.name),
+      TypeAttr::get(moduleType));
+
+  auto perPortAttrName =
+      hw::HWModuleOp::getPerPortAttrsAttrName(state.name);
+  Attribute perPortAttrValue =
+      anyPortAttrs ? builder.getArrayAttr(perPortAttrs)
+                   : builder.getArrayAttr({});
+  state.addAttribute(perPortAttrName, perPortAttrValue);
+
+  state.addAttribute("parameters", builder.getArrayAttr({}));
+  state.addAttribute("comment", builder.getStringAttr(""));
+
+  auto unknownLocAttr = cast<LocationAttr>(builder.getUnknownLoc());
+  SmallVector<Attribute> resultLocs;
+  resultLocs.reserve(moduleType.getNumOutputs());
+  for (const auto &port : ports) {
+    if (!port.isOutput())
+      continue;
+    resultLocs.push_back(port.loc ? Attribute(port.loc) : unknownLocAttr);
+  }
+  state.addAttribute(hw::HWModuleOp::getResultLocsAttrName(state.name),
+                     builder.getArrayAttr(resultLocs));
+
+  state.addRegion();
+  auto *created = builder.create(state);
+  return cast<hw::HWModuleOp>(created);
 }
 
 //===----------------------------------------------------------------------===//
@@ -276,17 +333,14 @@ struct SVModuleOpConversion : public OpConversionPattern<SVModuleOp> {
     rewriter.setInsertionPoint(op);
 
     // Create the hw.module to replace moore.module
-    auto portInfo = getModulePortInfo(*typeConverter, op);
-    if (failed(portInfo))
-      return failure();
-
-    auto hwModuleOp = hw::HWModuleOp::create(rewriter, op.getLoc(),
-                                             op.getSymNameAttr(), *portInfo);
+    SmallVector<hw::PortInfo> portInfos;
+    collectModulePortInfo(*typeConverter, op, portInfos);
+    auto hwModuleOp = createHWModuleFromPorts(
+        rewriter, op.getLoc(), op.getSymNameAttr(), portInfos);
     // Make hw.module have the same visibility as the moore.module.
     // The entry/top level module is public, otherwise is private.
     SymbolTable::setSymbolVisibility(hwModuleOp,
                                      SymbolTable::getSymbolVisibility(op));
-    rewriter.eraseBlock(hwModuleOp.getBodyBlock());
     if (failed(
             rewriter.convertRegionTypes(&op.getBodyRegion(), *typeConverter)))
       return failure();
@@ -364,15 +418,21 @@ static void getValuesToObserve(Region *region,
 
           OpBuilder::InsertionGuard g(rewriter);
           if (auto remapped = rewriter.getRemappedValue(value)) {
+            if (!hw::isHWValueType(remapped.getType()))
+              continue;
             setInsertionPoint(remapped);
             observeValues.push_back(probeIfSignal(remapped));
-          } else {
-            setInsertionPoint(value);
-            auto type = typeConverter->convertType(value.getType());
-            auto converted = typeConverter->materializeTargetConversion(
-                rewriter, loc, type, value);
-            observeValues.push_back(probeIfSignal(converted));
+            continue;
           }
+
+          auto type = typeConverter->convertType(value.getType());
+          if (!type || !hw::isHWValueType(type))
+            continue;
+
+          setInsertionPoint(value);
+          auto converted = typeConverter->materializeTargetConversion(
+              rewriter, loc, type, value);
+          observeValues.push_back(probeIfSignal(converted));
         }
       });
 }
@@ -558,6 +618,26 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
                                        observeValues, ValueRange{}, checkBlock);
     rewriter.inlineBlockBefore(&clonedOp.getBody().front(), waitOp);
     rewriter.eraseOp(clonedOp);
+
+    // Also observe the values that the wait event itself is tracking. These
+    // have now been materialized in the wait block as `valuesBefore`, so append
+    // them to the wait op's observed operand segment.
+    SmallVector<Value> trackedValues;
+    for (auto value : valuesBefore) {
+      auto type = typeConverter->convertType(value.getType());
+      if (!type || !hw::isHWValueType(type))
+        continue;
+      Value converted = value;
+      if (converted.getType() != type) {
+        OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPoint(waitOp);
+        converted = typeConverter->materializeTargetConversion(
+            rewriter, loc, type, converted);
+      }
+      trackedValues.push_back(converted);
+    }
+    if (!trackedValues.empty())
+      waitOp.getObservedMutable().append(trackedValues);
 
     // Collect a list of all detect ops and inline the `wait_event` body into
     // the check block.
@@ -1048,6 +1128,26 @@ struct ConstantStringOpConv : public OpConversionPattern<ConstantStringOp> {
 
     rewriter.replaceOpWithNewOp<hw::ConstantOp>(
         op, resultType, rewriter.getIntegerAttr(resultType, value));
+    return success();
+  }
+};
+
+struct ReadInterfaceSignalOpConversion
+    : public OpConversionPattern<sv::ReadInterfaceSignalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(sv::ReadInterfaceSignalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto *converter = getTypeConverter();
+    Type newType = converter->convertType(op.getResult().getType());
+    if (!newType)
+      return rewriter.notifyMatchFailure(op, "unable to convert result type");
+
+    auto newOp = rewriter.create<sv::ReadInterfaceSignalOp>(
+        op.getLoc(), newType, adaptor.getIface(), op.getSignalNameAttr());
+
+    rewriter.replaceOp(op, newOp.getResult());
     return success();
   }
 };
@@ -2549,6 +2649,15 @@ static void populateLegality(ConversionTarget &target,
   target.addLegalDialect<verif::VerifDialect>();
   target.addLegalDialect<arith::ArithDialect>();
 
+  target.addLegalOp<sv::InterfaceOp, sv::InterfaceSignalOp,
+                    sv::InterfaceModportOp, sv::InterfaceInstanceOp,
+                    sv::AssignInterfaceSignalOp, sv::GetModportOp>();
+
+  target.addDynamicallyLegalOp<sv::ReadInterfaceSignalOp>(
+      [&](sv::ReadInterfaceSignalOp op) {
+        return converter.isLegal(op.getResult().getType());
+      });
+
   target.addLegalOp<debug::ScopeOp>();
 
   target.addDynamicallyLegalOp<scf::YieldOp, func::CallOp, func::ReturnOp,
@@ -2752,6 +2861,13 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
     return hw::UnionType::get(type.getContext(), fields);
   });
 
+  // Pass SV interface types through unchanged so modules can keep interface
+  // ports all the way to HW/SV dialects.
+  typeConverter.addConversion(
+      [&](sv::InterfaceType type) -> std::optional<Type> { return type; });
+  typeConverter.addConversion(
+      [&](sv::ModportType type) -> std::optional<Type> { return type; });
+
   typeConverter.addTargetMaterialization(
       [&](mlir::OpBuilder &builder, mlir::Type resultType,
           mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
@@ -2829,6 +2945,7 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     YieldOpConversion,
     OutputOpConversion,
     ConstantStringOpConv,
+    ReadInterfaceSignalOpConversion,
 
     // Patterns of unary operations.
     ReduceAndOpConversion,

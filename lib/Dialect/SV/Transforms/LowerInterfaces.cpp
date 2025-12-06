@@ -1,5 +1,4 @@
-//===- LowerInterfaces.cpp - Minimal SV interface lowering
-//------------------===//
+//===- LowerInterfaces.cpp - SV interface lowering -----------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,23 +6,27 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass currently implements the first slice of interface lowering used by
-// the nostub UVM bring-up: it rewrites leaf HW modules so that interface-typed
-// *input* ports become plain HW struct ports.  The conversion deliberately
-// fails if interface-typed outputs or interface operations appear in a body.
-// This keeps the current scope manageable while we bring the rest of the IR
-// into parity with the Arc pipeline.
+// Lower SystemVerilog interfaces/modports to plain HW structs and inouts so
+// that downstream passes (Arc/LLVM) operate without interface types. Ports are
+// upgraded to `hw.inout` when any transitive user writes through them, and
+// instances are rewritten to match the lowered signatures.
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/HW/PortConverter.h"
+#include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include <tuple>
 
 namespace circt {
 namespace sv {
@@ -38,6 +41,22 @@ using namespace circt::sv;
 
 namespace {
 
+static bool isInProceduralRegion(Operation *op) {
+  for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
+       parent = parent->getParentOp()) {
+    if (parent->hasTrait<sv::ProceduralRegion>() ||
+        isa<moore::ProcedureOp>(parent))
+      return true;
+  }
+  return false;
+}
+
+static Value getInterfaceBase(Value v) {
+  while (auto mp = v.getDefiningOp<sv::GetModportOp>())
+    v = mp.getIface();
+  return v;
+}
+
 struct InterfaceInfo {
   struct ModportInfo {
     SmallVector<StringAttr> signalOrder;
@@ -45,295 +64,503 @@ struct InterfaceInfo {
   };
 
   InterfaceOp op;
+  MLIRContext *context = nullptr;
   SmallVector<hw::StructType::FieldInfo> fields;
-  DenseMap<StringRef, unsigned> fieldIndex;
+  DenseMap<StringAttr, unsigned> fieldIndex;
   DenseMap<StringAttr, ModportInfo> modports;
 
   hw::StructType getStructType() const {
-    return hw::StructType::get(op.getContext(), fields);
+    return hw::StructType::get(context, fields);
   }
 
   hw::StructType getModportStructType(StringAttr modportName) const {
-    SmallVector<hw::StructType::FieldInfo> modFields;
     auto it = modports.find(modportName);
     if (it == modports.end())
       return hw::StructType();
+    SmallVector<hw::StructType::FieldInfo> modFields;
     for (auto sig : it->second.signalOrder) {
-      auto fieldIt = fieldIndex.find(sig.getValue());
+      auto fieldIt = fieldIndex.find(sig);
       if (fieldIt == fieldIndex.end())
         continue;
       modFields.push_back(fields[fieldIt->second]);
     }
-    return hw::StructType::get(op.getContext(), modFields);
+    return hw::StructType::get(context, modFields);
   }
 };
 
-struct LowerInterfacesPass
-    : public circt::sv::impl::LowerInterfacesBase<LowerInterfacesPass> {
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    if (failed(populateInterfaceInfo(module)))
-      return signalPassFailure();
+struct InterfacePortPlan {
+  InterfaceInfo *info = nullptr;
+  StringAttr modportName;
+  hw::StructType loweredType;
+  bool needsInOut = false;
+};
 
-    bool changed = false;
-    for (auto hwMod : module.getOps<hw::HWModuleOp>()) {
-      bool moduleChanged = false;
-      if (failed(rewriteModule(hwMod, moduleChanged)))
-        return signalPassFailure();
-      changed |= moduleChanged;
+static bool interfaceValueHasWrite(Value ifaceVal) {
+  SmallVector<Value, 4> worklist{ifaceVal};
+  SmallPtrSet<Value, 8> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    for (Operation *user : current.getUsers()) {
+      if (isa<sv::AssignInterfaceSignalOp>(user))
+        return true;
+      if (auto modport = dyn_cast<sv::GetModportOp>(user))
+        worklist.push_back(modport.getResult());
     }
+  }
+  return false;
+}
 
-    if (!changed)
-      markAllAnalysesPreserved();
+static LogicalResult verifyReadableSignal(InterfaceInfo *info,
+                                          StringAttr modportName,
+                                          StringAttr signal, Operation *diagOp) {
+  if (!modportName)
+    return success();
+  auto mpIt = info->modports.find(modportName);
+  if (mpIt == info->modports.end())
+    return success();
+  auto dirIt = mpIt->second.directions.find(signal);
+  if (dirIt == mpIt->second.directions.end())
+    return success();
+  if (dirIt->second == sv::ModportDirection::output) {
+    diagOp->emitOpError()
+        << "cannot read signal " << signal.getValue() << " from modport "
+        << modportName.getValue() << " because it is declared as output";
+    return failure();
+  }
+  return success();
+}
+
+static LogicalResult verifyWritableSignal(InterfaceInfo *info,
+                                          StringAttr modportName,
+                                          StringAttr signal, Operation *diagOp) {
+  if (!modportName)
+    return success();
+  auto mpIt = info->modports.find(modportName);
+  if (mpIt == info->modports.end())
+    return success();
+  auto dirIt = mpIt->second.directions.find(signal);
+  if (dirIt == mpIt->second.directions.end())
+    return success();
+  if (dirIt->second == sv::ModportDirection::input) {
+    diagOp->emitOpError()
+        << "cannot write signal " << signal.getValue() << " from modport "
+        << modportName.getValue() << " because it is declared as input";
+    return failure();
+  }
+  return success();
+}
+
+class LowerInterfacesPass
+    : public circt::sv::impl::LowerInterfacesBase<LowerInterfacesPass> {
+public:
+  void runOnOperation() override;
+
+  FailureOr<InterfaceInfo *> lookupInterfaceInfo(InterfaceType type,
+                                                 hw::HWModuleOp mod);
+  FailureOr<InterfaceInfo *> lookupInterfaceInfo(ModportType type,
+                                                 hw::HWModuleOp mod,
+                                                 StringAttr &modportName);
+
+  DenseMap<StringAttr, InterfaceInfo> interfaces;
+  DenseMap<Operation *, SmallVector<InterfacePortPlan>> plans;
+  bool encounteredFailure = false;
+
+private:
+  LogicalResult populateInterfaceInfo(ModuleOp module);
+  LogicalResult buildPlans(hw::InstanceGraph &graph);
+  LogicalResult lowerModules(hw::InstanceGraph &graph);
+};
+
+// Port conversion that rewrites interface/modport ports to lowered structs.
+class InterfacePortConversion : public hw::PortConversion {
+public:
+  InterfacePortConversion(hw::PortConverterImpl &converter,
+                          hw::PortInfo origPort, LowerInterfacesPass &pass,
+                          InterfacePortPlan &plan)
+      : PortConversion(converter, origPort), pass(pass), plan(plan) {}
+
+  LogicalResult init() override;
+  void mapInputSignals(OpBuilder &b, Operation *inst, Value instValue,
+                       SmallVectorImpl<Value> &newOperands,
+                       ArrayRef<Backedge> newResults) override;
+  void mapOutputSignals(OpBuilder &b, Operation *inst, Value instValue,
+                        SmallVectorImpl<Value> &newOperands,
+                        ArrayRef<Backedge> newResults) override;
+
+private:
+  void buildInputSignals() override;
+  void buildOutputSignals() override {}
+  LogicalResult lowerInterfaceValue(Value oldValue, Value loweredBase,
+                                    StringAttr directModport);
+
+  LowerInterfacesPass &pass;
+  InterfacePortPlan &plan;
+  hw::PortInfo loweredPort;
+};
+
+class InterfacePortConversionBuilder : public hw::PortConversionBuilder {
+public:
+  InterfacePortConversionBuilder(hw::PortConverterImpl &converter,
+                                 LowerInterfacesPass &pass,
+                                 SmallVector<InterfacePortPlan> &plans)
+      : PortConversionBuilder(converter), pass(pass), plans(plans) {}
+
+  FailureOr<std::unique_ptr<hw::PortConversion>>
+  build(hw::PortInfo port) override {
+    if (port.argNum >= plans.size() || !plans[port.argNum].info)
+      return PortConversionBuilder::build(port);
+    if (port.dir == hw::ModulePort::Direction::Output)
+      return converter.getModule()->emitOpError()
+             << "interface outputs are not supported yet (port "
+             << port.name.getValue() << ")";
+    return {std::make_unique<InterfacePortConversion>(converter, port, pass,
+                                                      plans[port.argNum])};
   }
 
 private:
-  LogicalResult populateInterfaceInfo(ModuleOp module) {
-    for (auto iface : module.getOps<InterfaceOp>()) {
-      InterfaceInfo info;
-      info.op = iface;
-      for (auto sig : iface.getOps<InterfaceSignalOp>()) {
-        hw::StructType::FieldInfo field;
-        field.name = sig.getSymNameAttr();
-        field.type = sig.getType();
-        info.fieldIndex[field.name.getValue()] = info.fields.size();
-        info.fields.push_back(field);
-      }
-      for (auto modport : iface.getOps<InterfaceModportOp>()) {
-        InterfaceInfo::ModportInfo mpInfo;
-        for (Attribute attr : modport.getPortsAttr()) {
-          auto port = cast<ModportStructAttr>(attr);
-          auto sig = port.getSignalAttr();
-          mpInfo.signalOrder.push_back(sig);
-          mpInfo.directions[sig] = port.getDirection();
-        }
-        info.modports[modport.getSymNameAttr()] = std::move(mpInfo);
-      }
-      auto [it, inserted] =
-          interfaces.try_emplace(iface.getSymNameAttr(), std::move(info));
-      if (!inserted)
-        return iface.emitOpError()
-               << "duplicate interface definition named " << iface.getSymName();
-    }
+  LowerInterfacesPass &pass;
+  SmallVector<InterfacePortPlan> &plans;
+};
+
+LogicalResult InterfacePortConversion::init() {
+  if (!plan.info)
     return success();
+  if (!body)
+    return success();
+  BlockArgument arg = body->getArgument(origPort.argNum);
+  if (isa<InterfaceType>(arg.getType()) || isa<ModportType>(arg.getType()))
+    return success();
+  return emitError(arg.getLoc(),
+                   "expected interface-typed argument prior to lowering");
+}
+
+void InterfacePortConversion::buildInputSignals() {
+  auto dir = plan.needsInOut ? hw::ModulePort::Direction::InOut
+                             : hw::ModulePort::Direction::Input;
+  Value newValue = converter.createNewInput(origPort, "", plan.loweredType,
+                                            loweredPort, dir);
+
+  if (!body)
+    return;
+
+  BlockArgument oldArg = body->getArgument(origPort.argNum);
+  if (failed(lowerInterfaceValue(oldArg, newValue, plan.modportName))) {
+    pass.encounteredFailure = true;
+    return;
+  }
+  if (!oldArg.use_empty())
+    oldArg.replaceAllUsesWith(newValue);
+}
+
+void InterfacePortConversion::mapInputSignals(
+    OpBuilder &b, Operation *inst, Value instValue,
+    SmallVectorImpl<Value> &newOperands, ArrayRef<Backedge> newResults) {
+  Type loweredType = plan.needsInOut
+                         ? Type(hw::InOutType::get(plan.loweredType))
+                         : Type(plan.loweredType);
+  if (instValue.getType() != loweredType) {
+    inst->emitOpError("expected operand type ")
+        << loweredType << " after interface lowering, got "
+        << instValue.getType();
+    pass.encounteredFailure = true;
+    return;
+  }
+  newOperands[loweredPort.argNum] = instValue;
+}
+
+void InterfacePortConversion::mapOutputSignals(
+    OpBuilder &, Operation *, Value, SmallVectorImpl<Value> &,
+    ArrayRef<Backedge>) {}
+
+LogicalResult InterfacePortConversion::lowerInterfaceValue(
+    Value oldValue, Value loweredBase, StringAttr directModport) {
+  SmallVector<std::tuple<Value, Value, StringAttr>> worklist;
+  worklist.emplace_back(oldValue, loweredBase, directModport);
+  SmallVector<Operation *> toErase;
+
+  while (!worklist.empty()) {
+    auto [ifaceVal, baseValue, modportName] = worklist.pop_back_val();
+    for (Operation *user :
+         llvm::make_early_inc_range(ifaceVal.getUsers())) {
+      if (auto modport = dyn_cast<sv::GetModportOp>(user)) {
+        worklist.emplace_back(modport.getResult(), baseValue,
+                              modport.getFieldAttr().getAttr());
+        toErase.push_back(modport);
+        continue;
+      }
+
+      if (auto read = dyn_cast<sv::ReadInterfaceSignalOp>(user)) {
+        StringAttr fieldAttr = read.getSignalNameAttr().getAttr();
+        if (failed(verifyReadableSignal(plan.info, plan.modportName, fieldAttr,
+                                        read)) ||
+            failed(verifyReadableSignal(plan.info, modportName, fieldAttr,
+                                        read)))
+          return failure();
+        ImplicitLocOpBuilder builder(read.getLoc(), read);
+        Value replacement;
+        if (auto inout = dyn_cast<hw::InOutType>(baseValue.getType())) {
+          auto structType = dyn_cast<hw::StructType>(inout.getElementType());
+          if (!structType)
+            return read.emitOpError()
+                   << "expected lowered interface to wrap a struct, got "
+                   << baseValue.getType();
+          Value fieldHandle = builder.create<sv::StructFieldInOutOp>(
+              baseValue, fieldAttr);
+          replacement = builder.create<sv::ReadInOutOp>(read.getType(),
+                                                        fieldHandle);
+        } else if (llvm::isa<hw::StructType>(baseValue.getType())) {
+          replacement =
+              builder.create<hw::StructExtractOp>(baseValue, fieldAttr);
+        } else {
+          return read.emitOpError()
+                 << "expected lowered interface value to be a struct or "
+                    "inout struct, got "
+                 << baseValue.getType();
+        }
+        read.replaceAllUsesWith(replacement);
+        read.erase();
+        continue;
+      }
+
+      if (auto assign = dyn_cast<sv::AssignInterfaceSignalOp>(user)) {
+        StringAttr fieldAttr = assign.getSignalNameAttr().getAttr();
+        if (failed(verifyWritableSignal(plan.info, plan.modportName, fieldAttr,
+                                        assign)) ||
+            failed(verifyWritableSignal(plan.info, modportName, fieldAttr,
+                                        assign)))
+          return failure();
+        auto inoutType = dyn_cast<hw::InOutType>(baseValue.getType());
+        if (!inoutType || !llvm::isa<hw::StructType>(inoutType.getElementType()))
+          return assign.emitOpError()
+                 << "cannot assign to flattened interface port because it is "
+                    "not lowered to an inout";
+        ImplicitLocOpBuilder builder(assign.getLoc(), assign);
+        Value fieldHandle =
+            builder.create<sv::StructFieldInOutOp>(baseValue, fieldAttr);
+        if (isInProceduralRegion(assign))
+          builder.create<sv::BPAssignOp>(fieldHandle, assign.getRhs());
+        else
+          builder.create<sv::AssignOp>(fieldHandle, assign.getRhs());
+        assign.erase();
+        continue;
+      }
+
+      return user->emitOpError("unsupported interface use during lowering");
+    }
   }
 
-  LogicalResult rewriteModule(hw::HWModuleOp mod, bool &changed) {
-    ModulePortInfo ports = mod.getPorts();
-    SmallVector<PortInfo> newInputs, newOutputs;
-    bool needsChange = false;
-    DenseMap<Value, InterfaceInfo *> ifaceValueInfo;
-    DenseMap<Value, StringAttr> ifaceValueModport;
-    Block *body = mod.getBodyBlock();
+  for (Operation *op : toErase)
+    op->erase();
+  return success();
+}
 
-    for (const auto &port : ports.getInputs()) {
-      auto updated = port;
-      InterfaceInfo *ifaceInfoPtr = nullptr;
-      StringAttr modportName;
+LogicalResult LowerInterfacesPass::populateInterfaceInfo(ModuleOp module) {
+  for (auto iface : module.getOps<InterfaceOp>()) {
+    InterfaceInfo info;
+    info.op = iface;
+    info.context = iface.getContext();
+    for (auto sig : iface.getOps<InterfaceSignalOp>()) {
+      hw::StructType::FieldInfo field;
+      field.name = sig.getSymNameAttr();
+      field.type = sig.getType();
+      info.fieldIndex[field.name] = info.fields.size();
+      info.fields.push_back(field);
+    }
+    for (auto modport : iface.getOps<InterfaceModportOp>()) {
+      InterfaceInfo::ModportInfo mpInfo;
+      for (Attribute attr : modport.getPortsAttr()) {
+        auto port = cast<ModportStructAttr>(attr);
+        auto sig = port.getSignal().getAttr();
+        auto dirAttr = port.getDirection();
+        mpInfo.signalOrder.push_back(sig);
+        mpInfo.directions[sig] =
+            dirAttr ? dirAttr.getValue() : sv::ModportDirection::inout;
+      }
+      info.modports[modport.getSymNameAttr()] = std::move(mpInfo);
+    }
+    auto [it, inserted] =
+        interfaces.try_emplace(iface.getSymNameAttr(), std::move(info));
+    if (!inserted)
+      return iface.emitOpError()
+             << "duplicate interface definition named " << iface.getSymName();
+  }
+  return success();
+}
 
-      if (auto ifaceType = port.type.dyn_cast<InterfaceType>()) {
+FailureOr<InterfaceInfo *>
+LowerInterfacesPass::lookupInterfaceInfo(InterfaceType type,
+                                         hw::HWModuleOp mod) {
+  auto symName = type.getInterface().getAttr();
+  auto it = interfaces.find(symName);
+  if (it == interfaces.end()) {
+    mod.emitOpError() << "references unknown interface " << symName;
+    return failure();
+  }
+  InterfaceInfo &info = it->second;
+  if (info.fields.empty()) {
+    mod.emitOpError() << "interface " << info.op.getSymName()
+                      << " has no signals; lowering is not meaningful";
+    return failure();
+  }
+  return &info;
+}
+
+FailureOr<InterfaceInfo *>
+LowerInterfacesPass::lookupInterfaceInfo(ModportType type, hw::HWModuleOp mod,
+                                         StringAttr &modportName) {
+  SymbolRefAttr modportRef = type.getModport();
+  modportName = modportRef.getLeafReference();
+  auto symName = modportRef.getRootReference();
+  auto it = interfaces.find(symName);
+  if (it == interfaces.end()) {
+    mod.emitOpError() << "references unknown interface " << symName;
+    return failure();
+  }
+  InterfaceInfo &info = it->second;
+  if (info.fields.empty()) {
+    mod.emitOpError() << "interface " << info.op.getSymName()
+                      << " has no signals; lowering is not meaningful";
+    return failure();
+  }
+  return &info;
+}
+
+LogicalResult LowerInterfacesPass::buildPlans(hw::InstanceGraph &graph) {
+  auto initPlansForModule = [&](hw::HWModuleOp mod) -> LogicalResult {
+    auto &modulePlans = plans[mod.getOperation()];
+    if (!modulePlans.empty())
+      return success();
+    ModulePortInfo ports(mod.getPortList());
+    modulePlans.resize(ports.size());
+    for (auto [idx, port] : llvm::enumerate(ports)) {
+      if (auto ifaceType = dyn_cast<InterfaceType>(port.type)) {
         auto ifaceInfo = lookupInterfaceInfo(ifaceType, mod);
         if (failed(ifaceInfo))
           return failure();
-        ifaceInfoPtr = *ifaceInfo;
-        if (ifaceInfoPtr) {
-          BlockArgument arg = body->getArgument(port.argNum);
-          if (canLowerInterfaceValue(arg)) {
-            updated.type = ifaceInfoPtr->getStructType();
-            ifaceValueInfo[arg] = ifaceInfoPtr;
-            needsChange = true;
-          }
-        }
-      } else if (auto modportType = port.type.dyn_cast<ModportType>()) {
+        modulePlans[idx].info = *ifaceInfo;
+        modulePlans[idx].loweredType = (*ifaceInfo)->getStructType();
+      } else if (auto modportType = dyn_cast<ModportType>(port.type)) {
+        StringAttr modportName;
         auto ifaceInfo = lookupInterfaceInfo(modportType, mod, modportName);
         if (failed(ifaceInfo))
           return failure();
-        ifaceInfoPtr = *ifaceInfo;
-        if (ifaceInfoPtr) {
-          BlockArgument arg = body->getArgument(port.argNum);
-          if (canLowerInterfaceValue(arg)) {
-            auto mpStruct = ifaceInfoPtr->getModportStructType(modportName);
-            if (!mpStruct)
-              return mod.emitOpError()
-                     << "modport " << modportName
-                     << " does not reference any signals";
-            updated.type = mpStruct;
-            ifaceValueInfo[arg] = ifaceInfoPtr;
-            ifaceValueModport[arg] = modportName;
-            needsChange = true;
-          }
-        }
+        modulePlans[idx].info = *ifaceInfo;
+        modulePlans[idx].modportName = modportName;
+        modulePlans[idx].loweredType =
+            (*ifaceInfo)->getModportStructType(modportName);
+        if (!modulePlans[idx].loweredType)
+          return mod.emitOpError()
+                 << "modport " << modportName
+                 << " does not reference any signals";
       }
-
-      newInputs.push_back(updated);
     }
-
-    for (const auto &port : ports.getOutputs()) {
-      if (port.type.isa<InterfaceType>()) {
-        mod.emitOpError()
-            << "interface outputs are not supported by sv-lower-interfaces yet "
-               "(module "
-            << mod.getName() << ", port " << port.name.getValue() << ")";
-        return failure();
-      }
-      newOutputs.push_back(port);
-    }
-
-    if (!needsChange) {
-      changed = false;
-      return success();
-    }
-
-    SmallVector<Type> inputTypes, outputTypes;
-    for (auto &port : newInputs)
-      inputTypes.push_back(port.type);
-    for (auto &port : newOutputs)
-      outputTypes.push_back(port.type);
-
-    auto newType =
-        hw::ModuleType::get(mod.getContext(), inputTypes, outputTypes);
-    mod.setHWModuleType(newType);
-
-    for (auto [idx, port] : llvm::enumerate(newInputs))
-      body->getArgument(idx).setType(port.type);
-
-    if (failed(rewriteInterfaceReads(mod, ifaceValueInfo, ifaceValueModport)))
-      return failure();
-
-    changed = true;
     return success();
-  }
-
-  struct ResolvedInterfaceValue {
-    Value baseValue;
-    InterfaceInfo *info;
-    sv::GetModportOp modportOp;
-    StringAttr directModport;
   };
 
-  FailureOr<ResolvedInterfaceValue>
-  resolveInterfaceValue(Value value,
-                        DenseMap<Value, InterfaceInfo *> &ifaceValueInfo,
-                        DenseMap<Value, StringAttr> &ifaceValueModport) {
-    auto it = ifaceValueInfo.find(value);
-    if (it != ifaceValueInfo.end())
-      return ResolvedInterfaceValue{value,
-                                    it->second,
-                                    sv::GetModportOp(nullptr),
-                                    ifaceValueModport.lookup(value)};
-
-    if (auto modport = value.getDefiningOp<sv::GetModportOp>()) {
-      auto resolved =
-          resolveInterfaceValue(modport.getIface(), ifaceValueInfo,
-                                ifaceValueModport);
-      if (failed(resolved))
+  for (auto *node : graph)
+    if (auto mod = dyn_cast<hw::HWModuleOp>(*node->getModule()))
+      if (failed(initPlansForModule(mod)))
         return failure();
-      resolved->modportOp = modport;
-      return resolved;
-    }
-    return failure();
-  }
 
-  LogicalResult rewriteInterfaceReads(
-      hw::HWModuleOp mod,
-      DenseMap<Value, InterfaceInfo *> &ifaceValueInfo,
-      DenseMap<Value, StringAttr> &ifaceValueModport) {
-    bool changed = false;
-    WalkResult result = mod.walk([&](sv::ReadInterfaceSignalOp op) {
-      auto resolved =
-          resolveInterfaceValue(op.getIface(), ifaceValueInfo,
-                                ifaceValueModport);
-      if (failed(resolved))
-        return WalkResult::advance();
-      InterfaceInfo *info = resolved->info;
-      StringRef fieldName = op.getSignalName().getLeafReference().getValue();
-      auto fieldIt = info->fieldIndex.find(fieldName);
-      if (fieldIt == info->fieldIndex.end()) {
-        op.emitOpError() << "signal " << fieldName
-                         << " not found in interface "
-                         << info->op.getSymName();
-        return WalkResult::interrupt();
-      }
-      auto checkDirection = [&](StringAttr modportName) -> LogicalResult {
-        auto mpIt = info->modports.find(modportName);
-        if (mpIt == info->modports.end())
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    if (failed(graph.walkPostOrder([&](igraph::InstanceGraphNode &node) {
+          auto mod = dyn_cast<hw::HWModuleOp>(*node.getModule());
+          if (!mod)
+            return success();
+          auto &modulePlans = plans[mod.getOperation()];
+          ModulePortInfo ports(mod.getPortList());
+          SmallVector<PortInfo> inputPorts(ports.getInputs().begin(),
+                                           ports.getInputs().end());
+          Block *body = mod.getBodyBlock();
+
+          if (body) {
+            for (auto [idx, port] : llvm::enumerate(inputPorts)) {
+              auto &plan = modulePlans[port.argNum];
+              if (!plan.info)
+                continue;
+              if (!plan.needsInOut &&
+                  interfaceValueHasWrite(body->getArgument(idx))) {
+                plan.needsInOut = true;
+                changed = true;
+              }
+            }
+          }
+
+          // Propagate child write requirements to operands.
+          for (auto *record : node) {
+            auto inst = dyn_cast<hw::InstanceOp>(record->getInstance());
+            if (!inst)
+              continue;
+            auto targetMod =
+                dyn_cast<hw::HWModuleOp>(*record->getTarget()->getModule());
+            if (!targetMod)
+              continue;
+            ModulePortInfo calleePorts(targetMod.getPortList());
+            SmallVector<PortInfo> calleeInputs(calleePorts.getInputs().begin(),
+                                               calleePorts.getInputs().end());
+            auto &calleePlans = plans[targetMod.getOperation()];
+            for (auto [opIdx, operand] : llvm::enumerate(inst.getOperands())) {
+              auto &calleePort = calleeInputs[opIdx];
+              auto &calleePlan = calleePlans[calleePort.argNum];
+              if (!calleePlan.info || !calleePlan.needsInOut)
+                continue;
+              Value base = getInterfaceBase(operand);
+              auto barg = dyn_cast<BlockArgument>(base);
+              if (!barg || barg.getOwner() != inst->getBlock())
+                continue;
+              auto &parentPort = inputPorts[barg.getArgNumber()];
+              auto &parentPlan = modulePlans[parentPort.argNum];
+              if (parentPlan.info && !parentPlan.needsInOut) {
+                parentPlan.needsInOut = true;
+                changed = true;
+              }
+            }
+          }
           return success();
-        auto sigAttr = StringAttr::get(mod.getContext(), fieldName);
-        auto dirIt = mpIt->second.directions.find(sigAttr);
-        if (dirIt != mpIt->second.directions.end() &&
-            dirIt->second == sv::ModportDirection::Output) {
-            op.emitOpError()
-                << "cannot read signal " << fieldName
-                << " from modport " << modportName
-                << " because it is declared as output";
-            return WalkResult::interrupt();
-        }
-        return success();
-      };
-
-      if (resolved->directModport)
-        if (failed(checkDirection(resolved->directModport)))
-          return WalkResult::interrupt();
-
-      if (resolved->modportOp)
-        if (failed(checkDirection(resolved->modportOp.getField())))
-          return WalkResult::interrupt();
-
-      ImplicitLocOpBuilder builder(op.getLoc(), op);
-      auto newVal = builder.create<hw::StructExtractOp>(
-          info->getStructType().getElementType(fieldIt->second),
-          resolved->baseValue, builder.getStringAttr(fieldName));
-      op.replaceAllUsesWith(newVal);
-      op.erase();
-      changed = true;
-      return WalkResult::advance();
-    });
-    if (result.wasInterrupted())
+        })))
       return failure();
-    return success();
   }
 
-  DenseMap<StringAttr, InterfaceInfo> interfaces;
+  return success();
+}
 
-  FailureOr<InterfaceInfo *> lookupInterfaceByName(StringAttr symName,
-                                                   hw::HWModuleOp mod) {
-    auto it = interfaces.find(symName);
-    if (it == interfaces.end()) {
-      mod.emitOpError() << "references unknown interface " << symName;
-      return failure();
-    }
-    InterfaceInfo &info = it->second;
-    if (info.fields.empty()) {
-      mod.emitOpError() << "interface " << info.op.getSymName()
-                        << " has no signals; lowering is not meaningful";
-      return failure();
-    }
-    return &info;
-  }
+LogicalResult LowerInterfacesPass::lowerModules(hw::InstanceGraph &graph) {
+  if (failed(graph.walkInversePostOrder([&](igraph::InstanceGraphNode &node) {
+        igraph::ModuleOpInterface module = node.getModule();
+        if (!module)
+          return success();
+        auto mutableModule =
+            dyn_cast<hw::HWMutableModuleLike>(module.getOperation());
+        if (!mutableModule)
+          return success();
+        auto it = plans.find(mutableModule.getOperation());
+        if (it == plans.end())
+          return success();
+        auto &modulePlans = it->second;
+        hw::PortConverter<InterfacePortConversionBuilder> converter(
+            graph, mutableModule, *this, modulePlans);
+        return converter.run();
+      })))
+    return failure();
+  if (encounteredFailure)
+    return failure();
+  return success();
+}
 
-  FailureOr<InterfaceInfo *> lookupInterfaceInfo(InterfaceType type,
-                                                 hw::HWModuleOp mod) {
-    auto symName =
-        StringAttr::get(mod.getContext(), type.getInterface().getValue());
-    return lookupInterfaceByName(symName, mod);
-  }
-
-  FailureOr<InterfaceInfo *> lookupInterfaceInfo(ModportType type,
-                                                 hw::HWModuleOp mod,
-                                                 StringAttr &modportName) {
-    SymbolRefAttr modportRef = type.getModport();
-    modportName = modportRef.getLeafReference();
-    auto symName =
-        StringAttr::get(mod.getContext(), modportRef.getRootReference());
-    return lookupInterfaceByName(symName, mod);
-  }
-
-  bool canLowerInterfaceValue(Value ifaceVal) {
-    return llvm::all_of(ifaceVal.getUsers(), [](Operation *user) {
-      return isa<sv::ReadInterfaceSignalOp>(user);
-    });
-  }
-};
+void LowerInterfacesPass::runOnOperation() {
+  ModuleOp module = getOperation();
+  auto &instanceGraph = getAnalysis<hw::InstanceGraph>();
+  if (failed(populateInterfaceInfo(module)))
+    return signalPassFailure();
+  if (failed(buildPlans(instanceGraph)))
+    return signalPassFailure();
+  if (failed(lowerModules(instanceGraph)))
+    return signalPassFailure();
+}
 
 } // namespace
 

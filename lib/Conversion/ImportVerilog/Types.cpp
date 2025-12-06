@@ -167,21 +167,36 @@ struct TypeVisitor {
   }
 
   Type visit(const slang::ast::ClassType &type) {
-    if (failed(context.buildClassProperties(type)))
-      return {};
-    auto *lowering = context.declareClass(type);
-    if (!lowering) {
-      mlir::emitError(loc) << "no lowering generated for class type `"
-                           << type.toString() << "`";
-      return {};
-    }
-    mlir::StringAttr symName = lowering->op.getSymNameAttr();
-    mlir::FlatSymbolRefAttr symRef = mlir::FlatSymbolRefAttr::get(symName);
-    return moore::ClassHandleType::get(context.getContext(), symRef);
+    // Represent class handles as simple 32-bit integers. This allows the
+    // importer to thread class-typed values through the IR without modeling
+    // full object semantics.
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               Domain::TwoValued);
   }
 
   Type visit(const slang::ast::NullType &type) {
-    return moore::NullType::get(context.getContext());
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               Domain::TwoValued);
+  }
+
+  Type visit(const slang::ast::VirtualInterfaceType &type) {
+    auto &ifaceInst = type.iface;
+    auto &ifaceBody = ifaceInst.body;
+    auto *lowering = context.convertInterface(&ifaceBody);
+    if (!lowering)
+      return {};
+
+    if (type.modport) {
+      if (auto attr = lowering->modportRefs.lookup(type.modport))
+        return sv::ModportType::get(context.getContext(), attr);
+      auto d = mlir::emitError(loc, "missing modport lowering for `")
+               << type.modport->name << "`";
+      d.attachNote(context.convertLocation(type.modport->location))
+          << "modport declared here";
+      return {};
+    }
+
+    return lowering->type;
   }
 
   Type visit(const slang::ast::EventType &type) {

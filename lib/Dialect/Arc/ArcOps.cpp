@@ -334,9 +334,6 @@ LogicalResult ModelOp::verify() {
   if (auto type = getBodyBlock().getArgument(0).getType();
       !isa<StorageType>(type))
     return emitOpError("argument must be of storage type");
-  for (const hw::ModulePort &port : getIo().getPorts())
-    if (port.dir == hw::ModulePort::Direction::InOut)
-      return emitOpError("inout ports are not supported");
   return success();
 }
 

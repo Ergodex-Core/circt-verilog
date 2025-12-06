@@ -15,6 +15,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LTL/LTLOps.h"
 #include "circt/Dialect/Moore/MooreOps.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Verif/VerifOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -44,6 +45,26 @@ struct ModuleLowering {
   SmallVector<PortLowering> ports;
   DenseMap<const slang::syntax::SyntaxNode *, const slang::ast::PortSymbol *>
       portsBySyntaxNode;
+  struct InterfacePortLowering {
+    const slang::ast::InterfacePortSymbol &ast;
+    Location loc;
+    BlockArgument arg;
+  };
+  struct ModulePortInfo {
+    enum class Kind { Data, Interface } kind;
+    unsigned index;
+  };
+  SmallVector<InterfacePortLowering> interfacePorts;
+  SmallVector<ModulePortInfo> portInfos;
+};
+
+/// Interface lowering information.
+struct InterfaceLowering {
+  sv::InterfaceOp op;
+  sv::InterfaceType type;
+  DenseMap<const slang::ast::ValueSymbol *, FlatSymbolRefAttr> signalRefs;
+  DenseMap<const slang::ast::ModportSymbol *, mlir::SymbolRefAttr> modportRefs;
+  DenseMap<mlir::StringAttr, FlatSymbolRefAttr> signalRefsByName;
 };
 
 /// Function lowering information.
@@ -116,6 +137,8 @@ struct Context {
   ModuleLowering *
   convertModuleHeader(const slang::ast::InstanceBodySymbol *module);
   LogicalResult convertModuleBody(const slang::ast::InstanceBodySymbol *module);
+  InterfaceLowering *
+  convertInterface(const slang::ast::InstanceBodySymbol *interface);
   LogicalResult convertPackage(const slang::ast::PackageSymbol &package);
   FunctionLowering *
   declareFunction(const slang::ast::SubroutineSymbol &subroutine);
@@ -251,6 +274,17 @@ struct Context {
       const slang::ast::SystemSubroutine &subroutine, Location loc, Value value,
       Type originalType);
 
+  FailureOr<InterfaceLowering *>
+  ensureInterfaceLowering(const slang::ast::Scope &scope, Location loc);
+  FailureOr<FlatSymbolRefAttr>
+  lookupInterfaceSignal(const slang::ast::ValueSymbol &symbol, Location loc);
+  FailureOr<mlir::SymbolRefAttr>
+  lookupInterfaceModport(const slang::ast::ModportSymbol &symbol,
+                         Location loc);
+  FailureOr<Value> assignInterfaceMember(
+      const slang::ast::Expression &lhsExpr,
+      const slang::ast::Expression &rhsExpr, Location loc);
+
   /// Evaluate the constant value of an expression.
   slang::ConstantValue evaluateConstant(const slang::ast::Expression &expr);
 
@@ -272,6 +306,10 @@ struct Context {
   DenseMap<const slang::ast::InstanceBodySymbol *,
            std::unique_ptr<ModuleLowering>>
       modules;
+  /// How we have lowered interfaces to MLIR.
+  DenseMap<const slang::ast::InstanceBodySymbol *,
+           std::unique_ptr<InterfaceLowering>>
+      interfaces;
   /// A list of modules for which the header has been created, but the body has
   /// not been converted yet.
   std::queue<const slang::ast::InstanceBodySymbol *> moduleWorklist;
@@ -289,7 +327,7 @@ struct Context {
   /// name in expressions. The expressions use this table to lookup the MLIR
   /// value that was created for a given declaration in the Slang AST node.
   using ValueSymbols =
-      llvm::ScopedHashTable<const slang::ast::ValueSymbol *, Value>;
+      llvm::ScopedHashTable<const slang::ast::Symbol *, Value>;
   using ValueSymbolScope = ValueSymbols::ScopeTy;
   ValueSymbols valueSymbols;
 

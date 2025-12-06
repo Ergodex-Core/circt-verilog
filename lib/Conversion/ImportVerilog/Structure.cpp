@@ -9,7 +9,15 @@
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/symbols/ClassSymbols.h"
+#include "slang/ast/symbols/MemberSymbols.h"
+#include "slang/ast/symbols/PortSymbols.h"
+#include "slang/ast/symbols/VariableSymbols.h"
+#include "slang/ast/types/AllTypes.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "circt/Dialect/HW/HWTypes.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/APInt.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -140,6 +148,12 @@ struct RootVisitor : public BaseVisitor {
   using BaseVisitor::BaseVisitor;
   using BaseVisitor::visit;
 
+  // Ignore standalone class declarations.
+  LogicalResult visit(const slang::ast::ClassType &) { return success(); }
+  LogicalResult visit(const slang::ast::GenericClassDefSymbol &) {
+    return success();
+  }
+
   // Handle packages.
   LogicalResult visit(const slang::ast::PackageSymbol &package) {
     return context.convertPackage(package);
@@ -174,8 +188,21 @@ struct PackageVisitor : public BaseVisitor {
   using BaseVisitor::BaseVisitor;
   using BaseVisitor::visit;
 
+  // Ignore class declarations inside packages. Full class lowering happens
+  // elsewhere; packages often host stubs that do not require importer output.
+  LogicalResult visit(const slang::ast::ClassType &) { return success(); }
+  LogicalResult visit(const slang::ast::GenericClassDefSymbol &) {
+    return success();
+  }
+
   // Handle functions and tasks.
   LogicalResult visit(const slang::ast::SubroutineSymbol &subroutine) {
+    if (const auto *parentScope = subroutine.getParentScope()) {
+      const auto &parentSym = parentScope->asSymbol();
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType ||
+          parentSym.kind == slang::ast::SymbolKind::GenericClassDef)
+        return success();
+    }
     return context.convertFunction(subroutine);
   }
 
@@ -268,6 +295,18 @@ struct ModuleVisitor : public BaseVisitor {
   LogicalResult visit(const slang::ast::PortSymbol &) { return success(); }
   LogicalResult visit(const slang::ast::MultiPortSymbol &) { return success(); }
 
+  // Skip class declarations nested in modules.
+  LogicalResult visit(const slang::ast::ClassType &) { return success(); }
+  LogicalResult visit(const slang::ast::GenericClassDefSymbol &) {
+    return success();
+  }
+
+  // Ignore interface port declarations that appear in module bodies (these
+  // are handled as part of the module header lowering).
+  LogicalResult visit(const slang::ast::InterfacePortSymbol &) {
+    return success();
+  }
+
   // Skip genvars.
   LogicalResult visit(const slang::ast::GenvarSymbol &genvarNode) {
     return success();
@@ -289,6 +328,25 @@ struct ModuleVisitor : public BaseVisitor {
     using slang::ast::MultiPortSymbol;
     using slang::ast::PortSymbol;
 
+    switch (instNode.body.getDefinition().definitionKind) {
+    case slang::ast::DefinitionKind::Interface: {
+      auto *lowering = context.convertInterface(&instNode.body);
+      if (!lowering)
+        return failure();
+      auto inst = builder.create<sv::InterfaceInstanceOp>(loc, lowering->type);
+      inst.getOperation()->setAttr(
+          "name", builder.getStringAttr(Twine(blockNamePrefix) + instNode.name));
+      context.valueSymbols.insert(&instNode, inst.getResult());
+      return success();
+    }
+    case slang::ast::DefinitionKind::Module:
+      break;
+    default:
+      mlir::emitError(loc, "unsupported instance of ")
+          << instNode.body.getDefinition().getKindString();
+      return failure();
+    }
+
     auto *moduleLowering = context.convertModuleHeader(&instNode.body);
     if (!moduleLowering)
       return failure();
@@ -304,6 +362,8 @@ struct ModuleVisitor : public BaseVisitor {
     // ports with their corresponding connection.
     SmallDenseMap<const PortSymbol *, Value> portValues;
     portValues.reserve(moduleType.getNumPorts());
+    SmallDenseMap<const slang::ast::InterfacePortSymbol *, Value>
+        interfacePortValues;
 
     for (const auto *con : instNode.getPortConnections()) {
       const auto *expr = con->getExpression();
@@ -380,6 +440,44 @@ struct ModuleVisitor : public BaseVisitor {
         continue;
       }
 
+      if (const auto *ifacePort =
+              con->port.as_if<slang::ast::InterfacePortSymbol>()) {
+        Value value;
+        if (expr) {
+          value = context.convertRvalueExpression(*expr);
+        } else {
+          auto [connectedSym, modportSym] = ifacePort->getConnection();
+          if (connectedSym)
+            value = context.valueSymbols.lookup(connectedSym);
+          if (!value) {
+            auto portLoc = context.convertLocation(ifacePort->location);
+            return mlir::emitError(portLoc)
+                   << "interface port `" << ifacePort->name
+                   << "` lacks a connection expression";
+          }
+          if (modportSym) {
+            auto modportAttr =
+                context.lookupInterfaceModport(*modportSym, loc);
+            if (failed(modportAttr))
+              return failure();
+            if (!isa<sv::ModportType>(value.getType())) {
+              auto modportType =
+                  sv::ModportType::get(builder.getContext(), *modportAttr);
+              auto fieldAttr = FlatSymbolRefAttr::get(builder.getContext(),
+                                                      modportSym->name);
+              value = builder
+                          .create<sv::GetModportOp>(loc, modportType, value,
+                                                    fieldAttr)
+                          .getResult();
+            }
+          }
+        }
+        if (!value)
+          return failure();
+        interfacePortValues.insert({ifacePort, value});
+        continue;
+      }
+
       // Multi-ports lower the connected expression to an lvalue and then slice
       // it up into multiple sub-values, one for each of the ports in the
       // multi-port.
@@ -422,19 +520,47 @@ struct ModuleVisitor : public BaseVisitor {
     inputValues.reserve(moduleType.getNumInputs());
     outputValues.reserve(moduleType.getNumOutputs());
 
-    for (auto &port : moduleLowering->ports) {
-      auto value = portValues.lookup(&port.ast);
-      if (port.ast.direction == ArgumentDirection::Out)
-        outputValues.push_back(value);
-      else
-        inputValues.push_back(value);
+    for (auto &info : moduleLowering->portInfos) {
+      if (info.kind == ModuleLowering::ModulePortInfo::Kind::Data) {
+        auto &port = moduleLowering->ports[info.index];
+        auto value = portValues.lookup(&port.ast);
+        if (port.ast.direction == ArgumentDirection::Out) {
+          outputValues.push_back(value);
+        } else {
+          if (!value)
+            return mlir::emitError(loc) << "missing connection for port `"
+                                        << port.ast.name << "`";
+          inputValues.push_back(value);
+        }
+        continue;
+      }
+      auto &ifacePort = moduleLowering->interfacePorts[info.index];
+      auto value = interfacePortValues.lookup(&ifacePort.ast);
+      if (!value)
+        value = context.valueSymbols.lookup(&ifacePort.ast);
+      if (!value)
+        return mlir::emitError(loc) << "missing connection for interface port `"
+                                    << ifacePort.ast.name << "`";
+      inputValues.push_back(value);
     }
 
-    // Insert conversions for input ports.
-    for (auto [value, type] :
-         llvm::zip(inputValues, moduleType.getInputTypes()))
+    auto inputTypes = moduleType.getInputTypes();
+    auto inputNameVec = moduleType.getInputNames();
+    auto outputNameVec = moduleType.getOutputNames();
+    for (auto [idx, type] : llvm::enumerate(inputTypes)) {
+      auto &value = inputValues[idx];
+      if (!value) {
+        auto nameAttr = llvm::dyn_cast<StringAttr>(inputNameVec[idx]);
+        auto name = nameAttr ? nameAttr.getValue() : StringRef("<unnamed>");
+        return mlir::emitError(loc)
+               << "missing value for input port `" << name << "`";
+      }
+      if (isa<sv::InterfaceType>(type) || isa<sv::ModportType>(type))
+        continue;
       // TODO: This should honor signedness in the conversion.
-      value = context.materializeConversion(type, value, false, value.getLoc());
+      value =
+          context.materializeConversion(type, value, false, value.getLoc());
+    }
 
     // Here we use the hierarchical value recorded in `Context::valueSymbols`.
     // Then we pass it as the input port with the ref<T> type of the instance.
@@ -444,13 +570,18 @@ struct ModuleVisitor : public BaseVisitor {
         inputValues.push_back(hierValue);
 
     // Create the instance op itself.
-    auto inputNames = builder.getArrayAttr(moduleType.getInputNames());
-    auto outputNames = builder.getArrayAttr(moduleType.getOutputNames());
-    auto inst = moore::InstanceOp::create(
-        builder, loc, moduleType.getOutputTypes(),
-        builder.getStringAttr(Twine(blockNamePrefix) + instNode.name),
-        FlatSymbolRefAttr::get(module.getSymNameAttr()), inputValues,
-        inputNames, outputNames);
+    SmallVector<NamedAttribute> attrs;
+    attrs.push_back(builder.getNamedAttr(
+        "instanceName",
+        builder.getStringAttr(Twine(blockNamePrefix) + instNode.name)));
+    attrs.push_back(builder.getNamedAttr(
+        "moduleName", FlatSymbolRefAttr::get(module.getSymNameAttr())));
+    attrs.push_back(builder.getNamedAttr("inputNames",
+                                         builder.getArrayAttr(inputNameVec)));
+    attrs.push_back(builder.getNamedAttr(
+        "outputNames", builder.getArrayAttr(outputNameVec)));
+    auto inst = builder.create<moore::InstanceOp>(
+        loc, moduleType.getOutputTypes(), inputValues, attrs);
 
     // Record instance's results generated by hierarchical names.
     for (const auto &hierPath : context.hierPaths[&instNode.body])
@@ -526,6 +657,27 @@ struct ModuleVisitor : public BaseVisitor {
   LogicalResult visit(const slang::ast::ContinuousAssignSymbol &assignNode) {
     const auto &expr =
         assignNode.getAssignment().as<slang::ast::AssignmentExpression>();
+    if (const auto *member =
+            expr.left().as_if<slang::ast::MemberAccessExpression>()) {
+      auto ifaceValue = context.convertRvalueExpression(member->value());
+      if (ifaceValue && isa<sv::InterfaceType>(ifaceValue.getType())) {
+        auto assigned =
+            context.assignInterfaceMember(expr.left(), expr.right(), loc);
+        if (failed(assigned))
+          return failure();
+        return success();
+      }
+    } else if (const auto *hier =
+                   expr.left().as_if<slang::ast::HierarchicalValueExpression>()) {
+      if (hier->ref.isViaIfacePort()) {
+        auto assigned =
+            context.assignInterfaceMember(expr.left(), expr.right(), loc);
+        if (failed(assigned))
+          return failure();
+        return success();
+      }
+    }
+
     auto lhs = context.convertLvalueExpression(expr.left());
     if (!lhs)
       return failure();
@@ -700,11 +852,23 @@ LogicalResult Context::convertCompilation() {
     }
   }
 
-  // Prime the root definition worklist by adding all the top-level modules.
-  SmallVector<const slang::ast::InstanceSymbol *> topInstances;
-  for (auto *inst : root.topInstances)
-    if (!convertModuleHeader(&inst->body))
-      return failure();
+  // Prime the root definition worklist by adding all the top-level modules and
+  // materialize interface definitions that may be referenced later.
+  for (auto *inst : root.topInstances) {
+    auto *body = &inst->body;
+    switch (body->getDefinition().definitionKind) {
+    case slang::ast::DefinitionKind::Module:
+      if (!convertModuleHeader(body))
+        return failure();
+      break;
+    case slang::ast::DefinitionKind::Interface:
+      if (!convertInterface(body))
+        return failure();
+      break;
+    default:
+      break;
+    }
+  }
 
   // Convert all the root module definitions.
   while (!moduleWorklist.empty()) {
@@ -741,6 +905,232 @@ LogicalResult Context::convertCompilation() {
   globalVariableWorklist.clear();
 
   return success();
+}
+
+InterfaceLowering *
+Context::convertInterface(const slang::ast::InstanceBodySymbol *interface) {
+  using slang::ast::ArgumentDirection;
+
+  auto &slot = interfaces[interface];
+  if (slot)
+    return slot.get();
+
+  if (interface->getDefinition().definitionKind !=
+      slang::ast::DefinitionKind::Interface) {
+    auto loc = convertLocation(interface->location);
+    mlir::emitError(loc) << "expected interface definition but got "
+                         << interface->getDefinition().getKindString();
+    return {};
+  }
+
+  slot = std::make_unique<InterfaceLowering>();
+  auto &lowering = *slot;
+
+  auto loc = convertLocation(interface->location);
+
+  OpBuilder::InsertionGuard guard(builder);
+  auto it = orderedRootOps.upper_bound(interface->location);
+  if (it == orderedRootOps.end())
+    builder.setInsertionPointToEnd(intoModuleOp.getBody());
+  else
+    builder.setInsertionPoint(it->second);
+
+  auto ifaceOp = sv::InterfaceOp::create(builder, loc, interface->name);
+  orderedRootOps.insert(it, {interface->location, ifaceOp});
+  symbolTable.insert(ifaceOp);
+  lowering.op = ifaceOp;
+  lowering.type = sv::InterfaceType::get(
+      builder.getContext(),
+      FlatSymbolRefAttr::get(builder.getContext(), ifaceOp.getSymNameAttr()));
+
+  auto *bodyBlock = ifaceOp.getBodyBlock();
+  OpBuilder ifaceBuilder(bodyBlock, bodyBlock->begin());
+
+  auto emitSignal = [&](const slang::ast::ValueSymbol &value) -> LogicalResult {
+    if (lowering.signalRefs.contains(&value))
+      return success();
+    auto type = convertType(*value.getDeclaredType());
+    if (!type)
+      return failure();
+    auto sigLoc = convertLocation(value.location);
+    Type signalType;
+    if (auto intType = dyn_cast<moore::IntType>(type)) {
+      unsigned width = intType.getBitSize().value_or(1);
+      if (width == 0)
+        width = 1;
+      auto widthAttr = IntegerAttr::get(
+          IntegerType::get(ifaceBuilder.getContext(), 32), APInt(32, width));
+      signalType = hw::IntType::get(widthAttr);
+    } else {
+      mlir::emitError(sigLoc) << "unsupported interface signal type " << type;
+      return failure();
+    }
+    auto signalOp = ifaceBuilder.create<sv::InterfaceSignalOp>(
+        sigLoc, ifaceBuilder.getStringAttr(value.name), signalType);
+    auto symRef = FlatSymbolRefAttr::get(ifaceBuilder.getContext(),
+                                         signalOp.getSymNameAttr());
+    lowering.signalRefs.try_emplace(&value, symRef);
+    lowering.signalRefsByName.try_emplace(signalOp.getSymNameAttr(), symRef);
+    return success();
+  };
+
+  auto convertDirection = [&](ArgumentDirection direction)
+      -> std::optional<sv::ModportDirection> {
+    switch (direction) {
+    case ArgumentDirection::In:
+      return sv::ModportDirection::input;
+    case ArgumentDirection::Out:
+      return sv::ModportDirection::output;
+    case ArgumentDirection::InOut:
+      return sv::ModportDirection::inout;
+    default:
+      return std::nullopt;
+    }
+  };
+
+  for (auto &member : interface->members()) {
+    if (auto *var = member.as_if<slang::ast::VariableSymbol>()) {
+      if (failed(emitSignal(*var)))
+        return {};
+      continue;
+    }
+    if (auto *net = member.as_if<slang::ast::NetSymbol>()) {
+      if (failed(emitSignal(*net)))
+        return {};
+      continue;
+    }
+    if (auto *port = member.as_if<slang::ast::PortSymbol>()) {
+      if (auto *internal =
+              port->internalSymbol
+                  ? port->internalSymbol->as_if<slang::ast::ValueSymbol>()
+                  : nullptr)
+        if (failed(emitSignal(*internal)))
+          return {};
+      continue;
+    }
+    if (auto *modport = member.as_if<slang::ast::ModportSymbol>()) {
+      SmallVector<Attribute> portEntries;
+      for (auto &mpMember :
+           modport->membersOfType<slang::ast::ModportPortSymbol>()) {
+        auto direction = convertDirection(mpMember.direction);
+        if (!direction) {
+          auto mpLoc = convertLocation(mpMember.location);
+          mlir::emitError(mpLoc)
+              << "unsupported modport direction "
+              << slang::ast::toString(mpMember.direction);
+          return {};
+        }
+        const slang::ast::ValueSymbol *target = nullptr;
+        if (mpMember.internalSymbol)
+          target = mpMember.internalSymbol->as_if<slang::ast::ValueSymbol>();
+        if (!target && mpMember.internalSymbol)
+          if (const auto *portSym =
+                  mpMember.internalSymbol->as_if<slang::ast::PortSymbol>())
+            if (portSym->internalSymbol)
+              target =
+                  portSym->internalSymbol->as_if<slang::ast::ValueSymbol>();
+        FlatSymbolRefAttr symRef;
+        if (!target) {
+          auto mpLoc = convertLocation(mpMember.location);
+          auto nameAttr = ifaceBuilder.getStringAttr(mpMember.name);
+          symRef = lowering.signalRefsByName.lookup(nameAttr);
+          if (!symRef) {
+            mlir::emitError(mpLoc)
+                << "modport member `" << mpMember.name
+                << "` does not reference a value symbol";
+            return {};
+          }
+        } else {
+          if (failed(emitSignal(*target)))
+            return {};
+          symRef = lowering.signalRefs.lookup(target);
+          if (!symRef) {
+            auto mpLoc = convertLocation(mpMember.location);
+            mlir::emitError(mpLoc)
+                << "internal interface signal `" << target->name
+                << "` was not materialized";
+            return {};
+          }
+        }
+        auto dirAttr = sv::ModportDirectionAttr::get(
+            ifaceBuilder.getContext(), *direction);
+        portEntries.push_back(
+            sv::ModportStructAttr::get(ifaceBuilder.getContext(), dirAttr,
+                                       symRef));
+      }
+      auto portsAttr = ifaceBuilder.getArrayAttr(portEntries);
+      auto modportOp = ifaceBuilder.create<sv::InterfaceModportOp>(
+          convertLocation(modport->location),
+          ifaceBuilder.getStringAttr(modport->name), portsAttr);
+      lowering.modportRefs.try_emplace(
+          modport,
+          SymbolRefAttr::get(
+              ifaceBuilder.getContext(), ifaceOp.getSymNameAttr(),
+              FlatSymbolRefAttr::get(ifaceBuilder.getContext(),
+                                     modportOp.getSymNameAttr())));
+      continue;
+    }
+  }
+
+  return &lowering;
+}
+
+FailureOr<InterfaceLowering *>
+Context::ensureInterfaceLowering(const slang::ast::Scope &scope,
+                                 Location loc) {
+  if (auto *instanceBody = scope.getContainingInstance())
+    if (auto *lowering = convertInterface(instanceBody))
+      return lowering;
+
+  auto &scopeSymbol = scope.asSymbol();
+  if (scopeSymbol.kind == slang::ast::SymbolKind::InterfacePort) {
+    if (auto *parentScope = scopeSymbol.getParentScope())
+      if (auto *instanceBody = parentScope->getContainingInstance())
+        if (auto *lowering = convertInterface(instanceBody))
+          return lowering;
+  }
+
+  mlir::emitError(loc)
+      << "expected interface instance scope but found "
+      << slang::ast::toString(scopeSymbol.kind);
+  return failure();
+}
+
+FailureOr<FlatSymbolRefAttr>
+Context::lookupInterfaceSignal(const slang::ast::ValueSymbol &symbol,
+                               Location loc) {
+  auto parentScope = symbol.getParentScope();
+  if (!parentScope)
+    return mlir::emitError(loc)
+           << "interface member `" << symbol.name
+           << "` does not have a parent scope";
+  auto lowering = ensureInterfaceLowering(*parentScope, loc);
+  if (failed(lowering))
+    return failure();
+  if (auto attr = (*lowering)->signalRefs.lookup(&symbol))
+    return attr;
+  auto nameAttr = builder.getStringAttr(symbol.name);
+  if (auto attr = (*lowering)->signalRefsByName.lookup(nameAttr))
+    return attr;
+  return mlir::emitError(loc)
+         << "missing lowered signal for interface member `" << symbol.name
+         << "`";
+}
+
+FailureOr<mlir::SymbolRefAttr>
+Context::lookupInterfaceModport(const slang::ast::ModportSymbol &symbol,
+                                Location loc) {
+  auto parentScope = symbol.getParentScope();
+  if (!parentScope)
+    return mlir::emitError(loc)
+           << "modport `" << symbol.name << "` does not have a parent scope";
+  auto lowering = ensureInterfaceLowering(*parentScope, loc);
+  if (failed(lowering))
+    return failure();
+  if (auto attr = (*lowering)->modportRefs.lookup(&symbol))
+    return attr;
+  return mlir::emitError(loc)
+         << "missing lowered modport for `" << symbol.name << "`";
 }
 
 /// Convert a module and its ports to an empty module op in the IR. Also adds
@@ -835,6 +1225,31 @@ Context::convertModuleHeader(const slang::ast::InstanceBodySymbol *module) {
   // It's used to tag where a hierarchical name is on the port list.
   unsigned int outputIdx = 0, inputIdx = 0;
   for (auto *symbol : module->getPortList()) {
+    if (const auto *ifacePort =
+            symbol->as_if<slang::ast::InterfacePortSymbol>()) {
+      if (!ifacePort->interfaceDef || ifacePort->isGeneric) {
+        auto portLoc = convertLocation(ifacePort->location);
+        mlir::emitError(portLoc)
+            << "unsupported interface port `" << ifacePort->name
+            << "` without concrete interface definition";
+        return {};
+      }
+      auto portLoc = convertLocation(ifacePort->location);
+      auto ifaceRef = FlatSymbolRefAttr::get(builder.getContext(),
+                                             ifacePort->interfaceDef->name);
+      auto ifaceType = sv::InterfaceType::get(builder.getContext(), ifaceRef);
+      auto portName = builder.getStringAttr(ifacePort->name);
+      modulePorts.push_back(
+          {portName, ifaceType, hw::ModulePort::Input});
+      auto arg = block->addArgument(ifaceType, portLoc);
+      lowering.interfacePorts.push_back({*ifacePort, portLoc, arg});
+      lowering.portInfos.push_back(
+          {ModuleLowering::ModulePortInfo::Kind::Interface,
+           static_cast<unsigned>(lowering.interfacePorts.size() - 1)});
+      inputIdx++;
+      continue;
+    }
+
     auto handlePort = [&](const PortSymbol &port) {
       auto portLoc = convertLocation(port.location);
       auto type = convertType(port.getType());
@@ -855,6 +1270,9 @@ Context::convertModuleHeader(const slang::ast::InstanceBodySymbol *module) {
         inputIdx++;
       }
       lowering.ports.push_back({port, portLoc, arg});
+      lowering.portInfos.push_back(
+          {ModuleLowering::ModulePortInfo::Kind::Data,
+           static_cast<unsigned>(lowering.ports.size() - 1)});
       return success();
     };
 
@@ -933,6 +1351,8 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
   builder.setInsertionPointToEnd(lowering.op.getBody());
 
   ValueSymbolScope scope(valueSymbols);
+  for (auto &ifacePort : lowering.interfacePorts)
+    valueSymbols.insert(&ifacePort.ast, ifacePort.arg);
 
   // Keep track of the local time scale. `getTimeScale` automatically looks
   // through parent scopes to find the time scale effective locally.
@@ -1009,6 +1429,12 @@ Context::convertPackage(const slang::ast::PackageSymbol &package) {
   timeScale = package.getTimeScale().value_or(slang::TimeScale());
   llvm::scope_exit timeScaleGuard([&] { timeScale = prevTimeScale; });
 
+  // The lightweight UVM stub package only exists to satisfy preprocessing
+  // requirements. Skip converting its contents so that unsupported class
+  // constructs (and their methods) do not trigger importer crashes.
+  if (package.name == "uvm_pkg")
+    return success();
+
   OpBuilder::InsertionGuard g(builder);
   builder.setInsertionPointToEnd(intoModuleOp.getBody());
   ValueSymbolScope scope(valueSymbols);
@@ -1026,53 +1452,32 @@ FunctionLowering *
 Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
   // Check if there already is a declaration for this function.
   auto &lowering = functions[&subroutine];
-  if (lowering) {
-    if (!lowering->op)
-      return {};
+  if (lowering)
+    return lowering.get();
+
+  // Bring-up mode: class methods (and UVM package subroutines) are treated as
+  // absent and callers may stub them out.
+  if (const auto *parentScope = subroutine.getParentScope()) {
+    const auto &parentSym = parentScope->asSymbol();
+    if (parentSym.kind == slang::ast::SymbolKind::Package &&
+        parentSym.name == "uvm_pkg") {
+      lowering = std::make_unique<FunctionLowering>();
+      lowering->op = nullptr;
+      return lowering.get();
+    }
+  }
+  if (subroutine.thisVar) {
+    lowering = std::make_unique<FunctionLowering>();
+    lowering->op = nullptr;
     return lowering.get();
   }
 
-  if (!subroutine.thisVar) {
+  SmallString<64> name;
+  guessNamespacePrefix(subroutine.getParentScope()->asSymbol(), name);
+  name += subroutine.name;
 
-    SmallString<64> name;
-    guessNamespacePrefix(subroutine.getParentScope()->asSymbol(), name);
-    name += subroutine.name;
-
-    SmallVector<Type, 1> noThis = {};
-    return declareCallableImpl(subroutine, name, noThis);
-  }
-
-  auto loc = convertLocation(subroutine.location);
-
-  // Extract 'this' type and ensure it's a class.
-  const slang::ast::Type &thisTy = subroutine.thisVar->getType();
-  moore::ClassDeclOp ownerDecl;
-
-  if (auto *classTy = thisTy.as_if<slang::ast::ClassType>()) {
-    auto &ownerLowering = classes[classTy];
-    ownerDecl = ownerLowering->op;
-  } else {
-    mlir::emitError(loc) << "expected 'this' to be a class type, got "
-                         << thisTy.toString();
-    return {};
-  }
-
-  // Build qualified name: @"Pkg::Class"::subroutine
-  SmallString<64> qualName;
-  qualName += ownerDecl.getSymName(); // already qualified
-  qualName += "::";
-  qualName += subroutine.name;
-
-  // %this : class<@C>
-  SmallVector<Type, 1> extraParams;
-  {
-    auto classSym = mlir::FlatSymbolRefAttr::get(ownerDecl.getSymNameAttr());
-    auto handleTy = moore::ClassHandleType::get(getContext(), classSym);
-    extraParams.push_back(handleTy);
-  }
-
-  auto *fLowering = declareCallableImpl(subroutine, qualName, extraParams);
-  return fLowering;
+  SmallVector<Type, 1> noThis = {};
+  return declareCallableImpl(subroutine, name, noThis);
 }
 
 /// Helper function to generate the function signature from a SubroutineSymbol
@@ -1214,6 +1619,9 @@ static LogicalResult rewriteCallSitesToPassCaptures(mlir::func::FuncOp callee,
 /// Convert a function.
 LogicalResult
 Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
+  if (subroutine.thisVar)
+    return success();
+
   // Keep track of the local time scale. `getTimeScale` automatically looks
   // through parent scopes to find the time scale effective locally.
   auto prevTimeScale = timeScale;

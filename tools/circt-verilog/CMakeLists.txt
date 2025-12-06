@@ -8,6 +8,8 @@ set(libs
   CIRCTMoore
   CIRCTMooreToCore
   CIRCTMooreTransforms
+  CIRCTSV
+  CIRCTSVTransforms
   CIRCTSeq
   CIRCTSeqTransforms
   CIRCTSim
