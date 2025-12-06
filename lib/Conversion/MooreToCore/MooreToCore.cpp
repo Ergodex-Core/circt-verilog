@@ -18,6 +18,8 @@
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/ConversionPatternSet.h"
+#include <algorithm>
+#include "llvm/Support/raw_ostream.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -1259,6 +1261,80 @@ struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    if (auto fmtTy = dyn_cast<sim::FormatStringType>(resultType)) {
+      if (auto strConst =
+              op.getInput().getDefiningOp<moore::StringConstantOp>()) {
+        rewriter.replaceOpWithNewOp<sim::FormatLitOp>(
+            op, rewriter.getStringAttr(strConst.getValue()));
+        return success();
+      }
+
+      if (auto hwConst =
+              adaptor.getInput().getDefiningOp<hw::ConstantOp>()) {
+        auto value = hwConst.getValue();
+        unsigned numBytes = (value.getBitWidth() + 7) / 8;
+        std::string decoded;
+        decoded.reserve(numBytes);
+        for (unsigned i = 0; i < numBytes; ++i) {
+          auto byte = value.extractBits(8, i * 8).getZExtValue();
+          decoded.push_back(static_cast<char>(byte));
+        }
+        while (!decoded.empty() && decoded.back() == '\0')
+          decoded.pop_back();
+        std::reverse(decoded.begin(), decoded.end());
+        rewriter.replaceOpWithNewOp<sim::FormatLitOp>(
+            op, rewriter.getStringAttr(decoded));
+        return success();
+      }
+
+      if (adaptor.getInput().getType() == fmtTy) {
+        rewriter.replaceOp(op, adaptor.getInput());
+        return success();
+      }
+
+      return failure();
+    }
+
+    if (auto strTy = dyn_cast<hw::StringType>(resultType)) {
+      auto emitLiteral = [&](StringRef text) {
+        rewriter.replaceOpWithNewOp<sv::ConstantStrOp>(
+            op, strTy, rewriter.getStringAttr(text));
+      };
+
+      if (auto strConst =
+              op.getInput().getDefiningOp<moore::StringConstantOp>()) {
+        emitLiteral(strConst.getValue());
+        return success();
+      }
+
+      if (auto hwConst =
+              adaptor.getInput().getDefiningOp<hw::ConstantOp>()) {
+        auto value = hwConst.getValue();
+        unsigned numBytes = (value.getBitWidth() + 7) / 8;
+        std::string decoded;
+        decoded.reserve(numBytes);
+        for (unsigned i = 0; i < numBytes; ++i) {
+          auto byte = value.extractBits(8, i * 8).getZExtValue();
+          decoded.push_back(static_cast<char>(byte));
+        }
+        while (!decoded.empty() && decoded.back() == '\0')
+          decoded.pop_back();
+        std::reverse(decoded.begin(), decoded.end());
+        emitLiteral(decoded);
+        return success();
+      }
+
+      if (adaptor.getInput().getType() == strTy) {
+        rewriter.replaceOp(op, adaptor.getInput());
+        return success();
+      }
+
+      return failure();
+    }
+
     int64_t inputBw = hw::getBitWidth(adaptor.getInput().getType());
     int64_t resultBw = hw::getBitWidth(resultType);
     if (inputBw == -1 || resultBw == -1)
@@ -1809,6 +1885,7 @@ static void populateLegality(ConversionTarget &target,
   target.addLegalDialect<seq::SeqDialect>();
   target.addLegalDialect<llhd::LLHDDialect>();
   target.addLegalDialect<ltl::LTLDialect>();
+  target.addLegalDialect<sv::SVDialect>();
   target.addLegalDialect<mlir::BuiltinDialect>();
   target.addLegalDialect<mlir::math::MathDialect>();
   target.addLegalDialect<sim::SimDialect>();
@@ -1856,6 +1933,9 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
 
   typeConverter.addConversion([&](FormatStringType type) {
     return sim::FormatStringType::get(type.getContext());
+  });
+  typeConverter.addConversion([&](StringType type) {
+    return hw::StringType::get(type.getContext());
   });
 
   typeConverter.addConversion([&](ArrayType type) -> std::optional<Type> {

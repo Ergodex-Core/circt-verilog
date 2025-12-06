@@ -149,6 +149,36 @@ struct RootVisitor : public BaseVisitor {
     return context.convertFunction(subroutine);
   }
 
+  // Handle top-level variables (e.g., global labels used in testbenches).
+  LogicalResult visit(const slang::ast::VariableSymbol &varNode) {
+    auto loweredType = context.convertType(*varNode.getDeclaredType());
+    if (!loweredType)
+      return failure();
+
+    OpBuilder::InsertionGuard guard(builder);
+
+    Value initial;
+    if (const auto *init = varNode.getInitializer()) {
+      initial = context.convertRvalueExpression(*init, loweredType);
+      if (!initial)
+        return failure();
+    }
+
+    auto it = context.orderedRootOps.upper_bound(varNode.location);
+    if (it == context.orderedRootOps.end())
+      builder.setInsertionPointToEnd(context.intoModuleOp.getBody());
+    else
+      builder.setInsertionPoint(it->second);
+
+    auto varOp = moore::VariableOp::create(
+        builder, loc,
+        moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
+        builder.getStringAttr(varNode.name), initial);
+    context.orderedRootOps.insert(it, {varNode.location, varOp});
+    context.valueSymbols.insert(&varNode, varOp);
+    return success();
+  }
+
   // Emit an error for all other members.
   template <typename T>
   LogicalResult visit(T &&node) {
@@ -810,6 +840,10 @@ LogicalResult Context::convertCompilation() {
   auto timeScaleGuard =
       llvm::make_scope_exit([&] { timeScale = prevTimeScale; });
 
+  // Maintain a root scope for value symbols so top-level declarations remain
+  // visible to downstream modules and packages.
+  ValueSymbolScope rootScope(valueSymbols);
+
   // First only to visit the whole AST to collect the hierarchical names without
   // any operation creating.
   for (auto *inst : root.topInstances)
@@ -1422,21 +1456,23 @@ Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
   else
     builder.setInsertionPoint(it->second);
 
-  // Class methods are currently lowered via lightweight stubs instead of
-  // full-fledged functions. Record the declaration as absent so callers can
-  // short-circuit appropriately.
-  if (subroutine.thisVar) {
-    lowering->op = nullptr;
-    return lowering.get();
-  }
-
+  // Class methods (including static ones) are currently lowered via
+  // lightweight stubs instead of full-fledged functions. Record the
+  // declaration as absent so callers can short-circuit appropriately.
   if (const auto *parentScope = subroutine.getParentScope()) {
     const auto &parentSym = parentScope->asSymbol();
+    if (parentSym.kind == slang::ast::SymbolKind::ClassType) {
+      lowering->op = nullptr;
+      return lowering.get();
+    }
     if (parentSym.kind == slang::ast::SymbolKind::Package &&
         parentSym.name == "uvm_pkg") {
       lowering->op = nullptr;
       return lowering.get();
     }
+  } else if (subroutine.thisVar) {
+    lowering->op = nullptr;
+    return lowering.get();
   }
 
   // Determine the function type.
