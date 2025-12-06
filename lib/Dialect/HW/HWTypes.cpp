@@ -82,6 +82,9 @@ bool circt::hw::isHWValueType(Type type) {
   if (isa<IntegerType, IntType, EnumType>(type))
     return true;
 
+  if (isa<StringType>(type))
+    return true;
+
   if (auto array = dyn_cast<ArrayType>(type))
     return isHWValueType(array.getElementType());
 

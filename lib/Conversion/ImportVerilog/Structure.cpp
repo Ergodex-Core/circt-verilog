@@ -164,9 +164,34 @@ struct RootVisitor : public BaseVisitor {
     return context.convertFunction(subroutine);
   }
 
-  // Handle global variables.
-  LogicalResult visit(const slang::ast::VariableSymbol &var) {
-    return context.convertGlobalVariable(var);
+  // Handle top-level variables (e.g., global labels used in testbenches).
+  LogicalResult visit(const slang::ast::VariableSymbol &varNode) {
+    auto loweredType = context.convertType(*varNode.getDeclaredType());
+    if (!loweredType)
+      return failure();
+
+    OpBuilder::InsertionGuard guard(builder);
+
+    Value initial;
+    if (const auto *init = varNode.getInitializer()) {
+      initial = context.convertRvalueExpression(*init, loweredType);
+      if (!initial)
+        return failure();
+    }
+
+    auto it = context.orderedRootOps.upper_bound(varNode.location);
+    if (it == context.orderedRootOps.end())
+      builder.setInsertionPointToEnd(context.intoModuleOp.getBody());
+    else
+      builder.setInsertionPoint(it->second);
+
+    auto varOp = moore::VariableOp::create(
+        builder, loc,
+        moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
+        builder.getStringAttr(varNode.name), initial);
+    context.orderedRootOps.insert(it, {varNode.location, varOp});
+    context.valueSymbols.insert(&varNode, varOp);
+    return success();
   }
 
   // Emit an error for all other members.
@@ -835,6 +860,10 @@ LogicalResult Context::convertCompilation() {
   timeScale = root.getTimeScale().value_or(slang::TimeScale());
   llvm::scope_exit timeScaleGuard([&] { timeScale = prevTimeScale; });
 
+  // Maintain a root scope for value symbols so top-level declarations remain
+  // visible to downstream modules and packages.
+  ValueSymbolScope rootScope(valueSymbols);
+
   // First only to visit the whole AST to collect the hierarchical names without
   // any operation creating.
   for (auto *inst : root.topInstances)
@@ -1459,12 +1488,21 @@ Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
   // absent and callers may stub them out.
   if (const auto *parentScope = subroutine.getParentScope()) {
     const auto &parentSym = parentScope->asSymbol();
+    if (parentSym.kind == slang::ast::SymbolKind::ClassType) {
+      lowering = std::make_unique<FunctionLowering>();
+      lowering->op = nullptr;
+      return lowering.get();
+    }
     if (parentSym.kind == slang::ast::SymbolKind::Package &&
         parentSym.name == "uvm_pkg") {
       lowering = std::make_unique<FunctionLowering>();
       lowering->op = nullptr;
       return lowering.get();
     }
+  } else if (subroutine.thisVar) {
+    lowering = std::make_unique<FunctionLowering>();
+    lowering->op = nullptr;
+    return lowering.get();
   }
   if (subroutine.thisVar) {
     lowering = std::make_unique<FunctionLowering>();
