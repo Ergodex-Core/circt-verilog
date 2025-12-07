@@ -78,11 +78,15 @@ bool circt::hw::isHWEnumType(mlir::Type type) {
 /// the set of types that can be composed together to represent synthesized,
 /// hardware but not marker types like InOutType.
 bool circt::hw::isHWValueType(Type type) {
+  // Resolve through type aliases so we make decisions based on the canonical
+  // form of the type.
+  type = getCanonicalType(type);
+
   // Signless and signed integer types are both valid.
   if (isa<IntegerType, IntType, EnumType>(type))
     return true;
 
-  if (isa<StringType>(type))
+  if (isa<StringType, hw::StringType>(type))
     return true;
 
   if (auto array = dyn_cast<ArrayType>(type))

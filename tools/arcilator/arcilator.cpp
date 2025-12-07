@@ -27,6 +27,7 @@
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
+#include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
@@ -254,6 +255,16 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
   pm.addPass(createLowerVerifSimulationsPass());
+  {
+    // Normalize LLHD procedural constructs into structural form so the Arc
+    // conversion sees SSA values instead of signal/process primitives.
+    pm.addPass(llhd::createProcessLowering());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createDeseqPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
+    pm.addPass(llhd::createHoistSignalsPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
+  }
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
