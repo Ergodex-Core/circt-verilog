@@ -10,10 +10,12 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/LLHDOps.h"
+#include "circt/Dialect/LLHD/LLHDTypes.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Support/ConversionPatternSet.h"
 #include "circt/Support/Namespace.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -547,6 +549,67 @@ static LogicalResult convert(llhd::YieldOp op, llhd::YieldOp::Adaptor adaptor,
   return success();
 }
 
+/// Helper to materialize the converted time struct type used to lower
+/// `llhd.constant_time`. Store the components separately so downstream passes
+/// can preserve delta/epsilon information even before a proper time semantics
+/// layer exists in Arc.
+static hw::StructType getTimeStructType(MLIRContext *ctx) {
+  SmallVector<hw::StructType::FieldInfo> fields = {
+      {StringAttr::get(ctx, "time"), IntegerType::get(ctx, 64)},
+      {StringAttr::get(ctx, "delta"), IntegerType::get(ctx, 32)},
+      {StringAttr::get(ctx, "epsilon"), IntegerType::get(ctx, 32)},
+  };
+  return hw::StructType::get(ctx, fields);
+}
+
+/// `llhd.constant_time` -> `hw.aggregate_constant` (time, delta, epsilon)
+struct ConstantTimeOpConversion
+    : public OpConversionPattern<llhd::ConstantTimeOp> {
+  using OpConversionPattern<llhd::ConstantTimeOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::ConstantTimeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Convert the LLHD time type into the tuple backing we use in Arc.
+    auto convertedType =
+        typeConverter->convertType(op.getResult().getType());
+    auto structTy = dyn_cast_or_null<hw::StructType>(convertedType);
+    if (!structTy)
+      return rewriter.notifyMatchFailure(op, "expected struct type for time");
+
+    // Decode the time attribute into a unified integer value in femtoseconds.
+    auto timeAttr = op.getValue();
+    uint64_t scale = llvm::StringSwitch<uint64_t>(timeAttr.getTimeUnit())
+                         .Case("fs", 1ULL)
+                         .Case("ps", 1000ULL)
+                         .Case("ns", 1000ULL * 1000ULL)
+                         .Case("us", 1000ULL * 1000ULL * 1000ULL)
+                         .Case("ms", 1000ULL * 1000ULL * 1000ULL * 1000ULL)
+                         .Case("s", 1000ULL * 1000ULL * 1000ULL * 1000ULL *
+                                       1000ULL)
+                         .Default(0);
+    if (scale == 0)
+      return rewriter.notifyMatchFailure(op, "unsupported time unit");
+
+    auto timeField = structTy.getFieldType("time");
+    auto deltaField = structTy.getFieldType("delta");
+    auto epsilonField = structTy.getFieldType("epsilon");
+    if (!timeField || !deltaField || !epsilonField)
+      return rewriter.notifyMatchFailure(op, "malformed time struct layout");
+
+    SmallVector<Attribute> fields;
+    fields.push_back(rewriter.getIntegerAttr(
+        timeField, timeAttr.getTime() * scale));
+    fields.push_back(rewriter.getIntegerAttr(deltaField, timeAttr.getDelta()));
+    fields.push_back(
+        rewriter.getIntegerAttr(epsilonField, timeAttr.getEpsilon()));
+
+    auto agg = rewriter.getArrayAttr(fields);
+    rewriter.replaceOpWithNewOp<hw::AggregateConstantOp>(op, structTy, agg);
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass Infrastructure
 //===----------------------------------------------------------------------===//
@@ -574,11 +637,15 @@ void ConvertToArcsPass::runOnOperation() {
       return std::nullopt;
     return type;
   });
+  converter.addConversion([](llhd::TimeType type) -> std::optional<Type> {
+    return getTimeStructType(type.getContext());
+  });
 
   // Gather the conversion patterns.
   ConversionPatternSet patterns(&getContext(), converter);
   patterns.add<llhd::CombinationalOp>(convert);
   patterns.add<llhd::YieldOp>(convert);
+  patterns.add<ConstantTimeOpConversion>(converter, &getContext());
 
   // Setup the legal ops. (Sort alphabetically.)
   ConversionTarget target(getContext());
