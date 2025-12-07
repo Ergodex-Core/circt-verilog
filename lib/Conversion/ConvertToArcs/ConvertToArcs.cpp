@@ -519,9 +519,9 @@ LogicalResult Converter::absorbRegs(HWModuleOp module) {
 
 /// `llhd.combinational` -> `arc.execute`
 static LogicalResult convert(llhd::CombinationalOp op,
-                             llhd::CombinationalOp::Adaptor adaptor,
-                             ConversionPatternRewriter &rewriter,
-                             const TypeConverter &converter) {
+                            llhd::CombinationalOp::Adaptor adaptor,
+                            ConversionPatternRewriter &rewriter,
+                            const TypeConverter &converter) {
   // Convert the result types.
   SmallVector<Type> resultTypes;
   if (failed(converter.convertTypes(op.getResultTypes(), resultTypes)))
@@ -542,12 +542,81 @@ static LogicalResult convert(llhd::CombinationalOp op,
   return success();
 }
 
+/// `llhd.process` -> `arc.execute` (drop scheduling; treat body as comb)
+static LogicalResult convert(llhd::ProcessOp op, llhd::ProcessOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter,
+                             const TypeConverter &converter) {
+  SmallVector<Type> resultTypes;
+  if (failed(converter.convertTypes(op.getResultTypes(), resultTypes)))
+    return failure();
+
+  auto cloneIntoBody = [](Operation *inner) {
+    return inner->hasTrait<OpTrait::ConstantLike>();
+  };
+  auto operands =
+      mlir::makeRegionIsolatedFromAbove(rewriter, op.getBody(), cloneIntoBody);
+
+  auto executeOp =
+      ExecuteOp::create(rewriter, op.getLoc(), resultTypes, operands);
+  executeOp.getBody().takeBody(op.getBody());
+  rewriter.replaceOp(op, executeOp.getResults());
+  return success();
+}
+
 /// `llhd.yield` -> `arc.output`
 static LogicalResult convert(llhd::YieldOp op, llhd::YieldOp::Adaptor adaptor,
                              ConversionPatternRewriter &rewriter) {
   rewriter.replaceOpWithNewOp<arc::OutputOp>(op, adaptor.getOperands());
   return success();
 }
+
+/// `llhd.sig` -> forward the initializer as a plain SSA value (drop inout)
+struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
+  using OpConversionPattern<llhd::SignalOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::SignalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getInit());
+    return success();
+  }
+};
+
+/// `llhd.prb` -> pass-through (signal already converted to plain SSA)
+struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
+  using OpConversionPattern<llhd::PrbOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::PrbOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getSignal());
+    return success();
+  }
+};
+
+/// `llhd.drv` -> pass-through of the driven value (ignore delay/enable for now)
+struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
+  using OpConversionPattern<llhd::DrvOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::DrvOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getValue());
+    return success();
+  }
+};
+
+/// `llhd.wait` -> `arc.output` (surface the yielded values; drop scheduling)
+struct WaitOpConversion : public OpConversionPattern<llhd::WaitOp> {
+  using OpConversionPattern<llhd::WaitOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::WaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<arc::OutputOp>(op, adaptor.getYieldOperands());
+    return success();
+  }
+};
 
 /// Helper to materialize the converted time struct type used to lower
 /// `llhd.constant_time`. Store the components separately so downstream passes
@@ -637,6 +706,10 @@ void ConvertToArcsPass::runOnOperation() {
       return std::nullopt;
     return type;
   });
+  converter.addConversion(
+      [](hw::InOutType type) -> std::optional<Type> {
+        return type.getElementType();
+  });
   converter.addConversion([](llhd::TimeType type) -> std::optional<Type> {
     return getTimeStructType(type.getContext());
   });
@@ -644,12 +717,19 @@ void ConvertToArcsPass::runOnOperation() {
   // Gather the conversion patterns.
   ConversionPatternSet patterns(&getContext(), converter);
   patterns.add<llhd::CombinationalOp>(convert);
+  patterns.add<llhd::ProcessOp>(convert);
   patterns.add<llhd::YieldOp>(convert);
   patterns.add<ConstantTimeOpConversion>(converter, &getContext());
+  patterns.add<SignalOpConversion>(converter, &getContext());
+  patterns.add<ProbeOpConversion>(converter, &getContext());
+  patterns.add<DrvOpConversion>(converter, &getContext());
+  patterns.add<WaitOpConversion>(converter, &getContext());
 
   // Setup the legal ops. (Sort alphabetically.)
   ConversionTarget target(getContext());
   target.addIllegalDialect<llhd::LLHDDialect>();
+  target.addIllegalOp<llhd::DrvOp, llhd::ProcessOp, llhd::SignalOp,
+                      llhd::WaitOp, llhd::PrbOp>();
   target.markUnknownOpDynamicallyLegal(
       [](Operation *op) { return !isa<llhd::LLHDDialect>(op->getDialect()); });
 

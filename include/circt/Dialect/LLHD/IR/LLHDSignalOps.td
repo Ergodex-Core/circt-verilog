@@ -43,7 +43,7 @@ def SignalOp : LLHDOp<"sig", [
   }];
   let arguments = (ins
     OptionalAttr<StrAttr>:$name,
-    HWValueType:$init
+    AnyType:$init
   );
   let results = (outs Res<InOutType, "", [MemAlloc]>:$result);
   let assemblyFormat = [{
