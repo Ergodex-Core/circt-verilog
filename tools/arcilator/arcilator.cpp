@@ -27,6 +27,7 @@
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/LLHD/LLHDDialect.h"
+#include "circt/Dialect/LLHD/LLHDPasses.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
@@ -334,15 +335,37 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // represented as intrinsic ops.
   if (untilReached(UntilPreprocessing))
     return;
-
-  ArcPreprocessingOptions preprocessingOpt;
-  preprocessingOpt.observePorts = observePorts || !jitVcdFile.empty();
-  preprocessingOpt.observeWires = observeWires || !jitVcdFile.empty();
-  preprocessingOpt.observeNamedValues =
-      observeNamedValues || !jitVcdFile.empty();
-  preprocessingOpt.observeMemories = observeMemories;
-  preprocessingOpt.asyncResetsAsSync = asyncResetsAsSync;
-  populateArcPreprocessingPipeline(pm, preprocessingOpt);
+  pm.addPass(om::createStripOMPass());
+  pm.addPass(emit::createStripEmitPass());
+  pm.addPass(createLowerFirMemPass());
+  pm.addPass(createLowerVerifSimulationsPass());
+  {
+    // Normalize LLHD procedural constructs into structural form so the Arc
+    // conversion sees SSA values instead of signal/process primitives.
+    pm.addPass(llhd::createProcessLowering());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createDeseqPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
+    pm.addPass(llhd::createHoistSignalsPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
+  }
+  {
+    arc::AddTapsOptions opts;
+    opts.tapPorts = observePorts;
+    opts.tapWires = observeWires;
+    opts.tapNamedValues = observeNamedValues;
+    pm.addPass(arc::createAddTapsPass(opts));
+  }
+  pm.addPass(arc::createStripSVPass());
+  {
+    arc::InferMemoriesOptions opts;
+    opts.tapPorts = observePorts;
+    opts.tapMemories = observeMemories;
+    pm.addPass(arc::createInferMemoriesPass(opts));
+  }
+  pm.addPass(sim::createLowerDPIFunc());
+  pm.addPass(createCSEPass());
+  pm.addPass(arc::createArcCanonicalizerPass());
 
   // Restructure the input from a `hw.module` hierarchy to a collection of arcs.
   if (untilReached(UntilArcConversion))

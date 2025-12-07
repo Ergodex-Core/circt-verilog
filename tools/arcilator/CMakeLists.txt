@@ -21,6 +21,7 @@ set(libs
   CIRCTExportArc
   CIRCTHWTransforms
   CIRCTLLHD
+  CIRCTLLHDTransforms
   CIRCTOMTransforms
   CIRCTSeqToSV
   CIRCTSeqTransforms
