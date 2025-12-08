@@ -21,11 +21,13 @@ set(libs
   CIRCTSeqToSV
   CIRCTSeqTransforms
   CIRCTSimTransforms
+  CIRCTMooreToCore
   CIRCTSupport
   CIRCTTransforms
   CIRCTVerif
   CIRCTSeq
   CIRCTSV
+  CIRCTSVTransforms
   CIRCTMoore
   MLIRArithDialect
   MLIRBuiltinToLLVMIRTranslation

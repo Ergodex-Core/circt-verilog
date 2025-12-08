@@ -14,6 +14,7 @@
 #include "circt/Conversion/ArcToLLVM.h"
 #include "circt/Conversion/CombToArith.h"
 #include "circt/Conversion/ConvertToArcs.h"
+#include "circt/Conversion/MooreToCore.h"
 #include "circt/Conversion/Passes.h"
 #include "circt/Conversion/SeqToSV.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
@@ -28,12 +29,14 @@
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
+#include "circt/Dialect/Moore/MooreDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Sim/SimPasses.h"
+#include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
@@ -251,6 +254,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // represented as intrinsic ops.
   if (untilReached(UntilPreprocessing))
     return;
+  pm.addPass(createConvertMooreToCorePass());
   pm.addPass(om::createStripOMPass());
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
@@ -265,6 +269,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     pm.addPass(llhd::createHoistSignalsPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
   }
+  pm.addPass(sv::createLowerInterfacesPass());
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
@@ -280,8 +285,6 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     pm.addPass(arc::createInferMemoriesPass(opts));
   }
   pm.addPass(sim::createLowerDPIFunc());
-  pm.addPass(createCSEPass());
-  pm.addPass(arc::createArcCanonicalizerPass());
 
   // Restructure the input from a `hw.module` hierarchy to a collection of arcs.
   if (untilReached(UntilArcConversion))
@@ -595,6 +598,7 @@ static LogicalResult executeArcilator(MLIRContext &context) {
     emit::EmitDialect,
     hw::HWDialect,
     llhd::LLHDDialect,
+    moore::MooreDialect,
     mlir::arith::ArithDialect,
     mlir::cf::ControlFlowDialect,
     mlir::DLTIDialect,
