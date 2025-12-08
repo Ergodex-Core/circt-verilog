@@ -71,6 +71,10 @@ static std::optional<uint64_t> computeLLVMBitWidth(Type type) {
     return llvm::alignToPowerOf2(structWidth, structAlignment);
   }
 
+  // Strings are modeled as opaque pointers in the runtime; use a native word.
+  if (isa<hw::StringType>(type))
+    return 64;
+
   // We don't know anything about any other types.
   return {};
 }

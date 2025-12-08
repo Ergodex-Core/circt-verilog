@@ -16,7 +16,10 @@
 #include "circt/Support/ConversionPatternSet.h"
 #include "circt/Support/Namespace.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -54,6 +57,131 @@ static LogicalResult convertInitialValue(seq::CompRegOp reg,
                                            reg.getInitialValue());
 
   values.push_back(init);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// LLHD pre-lowering
+//===----------------------------------------------------------------------===//
+
+static Value cloneValueIntoModule(Value value, OpBuilder &builder,
+                                  IRMapping &mapping) {
+  if (auto mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  if (auto barg = dyn_cast<BlockArgument>(value)) {
+    auto *owner = barg.getOwner()->getParentOp();
+    auto hwModule = dyn_cast<hw::HWModuleOp>(owner);
+    if (!hwModule)
+      return {};
+    Value moduleArg = hwModule.getBodyBlock()->getArgument(barg.getArgNumber());
+    mapping.map(value, moduleArg);
+    return moduleArg;
+  }
+
+  auto *defOp = value.getDefiningOp();
+  if (!defOp || !isMemoryEffectFree(defOp))
+    return {};
+
+  for (auto operand : defOp->getOperands()) {
+    if (!cloneValueIntoModule(operand, builder, mapping))
+      return {};
+  }
+
+  Operation *cloned = builder.clone(*defOp, mapping);
+  auto opResult = dyn_cast<OpResult>(value);
+  if (!opResult)
+    return {};
+  Value clonedResult = cloned->getResult(opResult.getResultNumber());
+  mapping.map(value, clonedResult);
+  return clonedResult;
+}
+
+/// Collapse the canonical Moore always block emitted through LLHD into an
+/// explicit arc state that triggers on the observed clock. This keeps the
+/// sequential intent intact without relying on the stubby LLHD->Arc patterns
+/// below.
+static LogicalResult lowerProcessToArcState(llhd::ProcessOp proc,
+                                            Namespace &ns) {
+  if (!proc.getResults().empty())
+    return failure();
+
+  auto waits = llvm::to_vector(proc.getOps<llhd::WaitOp>());
+  if (waits.size() != 1)
+    return failure();
+
+  llhd::WaitOp wait = waits.front();
+  if (wait.getDelay() || !wait.getYieldOperands().empty() ||
+      !wait.getDestOperands().empty() || wait.getObserved().size() != 1)
+    return failure();
+
+  Block *resumeBlock = wait.getDest();
+  auto condBr =
+      dyn_cast<mlir::cf::CondBranchOp>(resumeBlock->getTerminator());
+  if (!condBr)
+    return failure();
+
+  auto succHasWait = [](Block *block) {
+    return llvm::any_of(*block,
+                        [](Operation &op) { return isa<llhd::WaitOp>(op); });
+  };
+  Block *bodyBlock = condBr.getTrueDest();
+  if (succHasWait(bodyBlock))
+    bodyBlock = condBr.getFalseDest();
+
+  auto module = proc->getParentOfType<hw::HWModuleOp>();
+  if (!module)
+    return failure();
+  auto parentModule = module->getParentOfType<mlir::ModuleOp>();
+  if (!parentModule)
+    return failure();
+
+  // Create the arc definition that will run on the clock edges.
+  auto *moduleBlock = module.getBodyBlock();
+  SmallVector<Type> argTypes(moduleBlock->getArgumentTypes().begin(),
+                             moduleBlock->getArgumentTypes().end());
+  auto funcType = FunctionType::get(proc.getContext(), argTypes, {});
+
+  SymbolTable symTable(parentModule);
+  auto arcName = ns.newName(module.getModuleName().str() + "_proc");
+  OpBuilder topBuilder(parentModule.getBodyRegion());
+  topBuilder.setInsertionPoint(module);
+  auto defOp = arc::DefineOp::create(topBuilder, proc.getLoc(),
+                                     topBuilder.getStringAttr(arcName),
+                                     funcType);
+  symTable.insert(defOp);
+
+  auto *entry = new Block();
+  for (Type type : argTypes)
+    entry->addArgument(type, proc.getLoc());
+  defOp.getBody().push_back(entry);
+
+  IRMapping mapping;
+  for (auto [idx, arg] : llvm::enumerate(moduleBlock->getArguments()))
+    mapping.map(arg, entry->getArgument(idx));
+
+  OpBuilder bodyBuilder(entry, entry->end());
+  for (Operation &op : bodyBlock->without_terminator())
+    bodyBuilder.clone(op, mapping);
+  bodyBuilder.create<arc::OutputOp>(proc.getLoc());
+
+  // Materialize the clock value in the module body.
+  OpBuilder stateBuilder(module.getBodyBlock()->getTerminator());
+  IRMapping cloned;
+  Value clockValue =
+      cloneValueIntoModule(wait.getObserved().front(), stateBuilder, cloned);
+  if (!clockValue)
+    return failure();
+  if (!isa<seq::ClockType>(clockValue.getType()))
+    clockValue = stateBuilder.create<seq::ToClockOp>(proc.getLoc(), clockValue);
+
+  // Instantiate the arc as a stateful element clocked by the observed signal.
+  auto stateOp = arc::StateOp::create(
+      stateBuilder, proc.getLoc(), defOp, clockValue, Value{},
+      /*latency=*/1, moduleBlock->getArguments(), ValueRange{});
+  stateBuilder.insert(stateOp.getOperation());
+
+  proc.erase();
   return success();
 }
 
@@ -697,6 +825,33 @@ struct ConvertToArcsPass
 } // namespace
 
 void ConvertToArcsPass::runOnOperation() {
+  // First, try to collapse simple LLHD processes that just wait on a single
+  // clock edge into explicit arc states. This avoids the overly conservative
+  // wait-conversion below from stripping the sequential logic entirely.
+  Namespace ns;
+  for (auto &op : getOperation().getOps())
+    if (auto sym =
+            op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
+      ns.newName(sym.getValue());
+  SmallVector<llhd::ProcessOp> processes;
+  getOperation().walk(
+      [&](llhd::ProcessOp proc) { processes.push_back(proc); });
+  for (auto proc : processes) {
+    if (succeeded(lowerProcessToArcState(proc, ns))) {
+      LLVM_DEBUG({
+        if (auto parent = proc->getParentOfType<hw::HWModuleOp>())
+          llvm::dbgs() << "[convert-to-arcs] lowered llhd.process in `"
+                       << parent.getModuleName() << "`\n";
+      });
+    } else {
+      LLVM_DEBUG({
+        if (auto parent = proc->getParentOfType<hw::HWModuleOp>())
+          llvm::dbgs() << "[convert-to-arcs] skipped llhd.process in `"
+                       << parent.getModuleName() << "`\n";
+      });
+    }
+  }
+
   // Setup the type conversion.
   TypeConverter converter;
 
