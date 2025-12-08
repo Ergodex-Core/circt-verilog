@@ -1262,6 +1262,9 @@ void LowerArcToLLVMPass::runOnOperation() {
   converter.addConversion([&](sim::FormatStringType type) {
     return LLVM::LLVMPointerType::get(type.getContext());
   });
+  converter.addConversion([&](hw::StringType type) {
+    return LLVM::LLVMPointerType::get(type.getContext());
+  });
 
   // Setup the conversion patterns.
   ConversionPatternSet patterns(&getContext(), converter);

@@ -5,6 +5,7 @@ module {
     sv.interface.signal @data : i8
     sv.interface.signal @valid : i1
     sv.interface.modport @sink (input @data)
+    sv.interface.modport @source (output @data)
   }
 
   // CHECK-LABEL: hw.module @dut
@@ -57,4 +58,14 @@ module {
   // CHECK:   sv.always posedge %clk {
   // CHECK:     %[[PROC_FIELD:.*]] = sv.struct_field_inout %iface["data"] : !hw.inout<struct<data: i8, valid: i1>>
   // CHECK:     sv.bpassign %[[PROC_FIELD]], %c0_i8 : i8
+
+  // CHECK-LABEL: hw.module @drive_modport
+  // CHECK-SAME: (inout %mp : !hw.struct<data: i8>)
+  hw.module @drive_modport(in %mp : !sv.modport<@chan::@source>) {
+    %c1 = arith.constant 1 : i8
+    sv.interface.signal.assign %mp(@chan::@source::@data) = %c1 : i8
+    hw.output
+  }
+  // CHECK:   %[[MP_FIELD:.*]] = sv.struct_field_inout %mp["data"] : !hw.inout<struct<data: i8>>
+  // CHECK:   sv.assign %[[MP_FIELD]], %c1_i8 : i8
 }

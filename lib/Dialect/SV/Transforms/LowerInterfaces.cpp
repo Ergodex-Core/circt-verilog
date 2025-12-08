@@ -95,6 +95,20 @@ struct InterfacePortPlan {
   bool needsInOut = false;
 };
 
+static bool modportAllowsWrite(InterfaceInfo *info, StringAttr modportName) {
+  if (!modportName)
+    return false;
+  auto mpIt = info->modports.find(modportName);
+  if (mpIt == info->modports.end())
+    return false;
+  for (auto [sig, dir] : mpIt->second.directions) {
+    (void)sig;
+    if (dir != sv::ModportDirection::input)
+      return true;
+  }
+  return false;
+}
+
 static bool interfaceValueHasWrite(Value ifaceVal) {
   SmallVector<Value, 4> worklist{ifaceVal};
   SmallPtrSet<Value, 8> visited;
@@ -191,7 +205,7 @@ public:
 
 private:
   void buildInputSignals() override;
-  void buildOutputSignals() override {}
+  void buildOutputSignals() override;
   LogicalResult lowerInterfaceValue(Value oldValue, Value loweredBase,
                                     StringAttr directModport);
 
@@ -211,10 +225,6 @@ public:
   build(hw::PortInfo port) override {
     if (port.argNum >= plans.size() || !plans[port.argNum].info)
       return PortConversionBuilder::build(port);
-    if (port.dir == hw::ModulePort::Direction::Output)
-      return converter.getModule()->emitOpError()
-             << "interface outputs are not supported yet (port "
-             << port.name.getValue() << ")";
     return {std::make_unique<InterfacePortConversion>(converter, port, pass,
                                                       plans[port.argNum])};
   }
@@ -254,6 +264,43 @@ void InterfacePortConversion::buildInputSignals() {
     oldArg.replaceAllUsesWith(newValue);
 }
 
+void InterfacePortConversion::buildOutputSignals() {
+  if (!plan.info)
+    return;
+  Type outType =
+      plan.needsInOut ? Type(hw::InOutType::get(plan.loweredType))
+                      : Type(plan.loweredType);
+
+  Value outputValue;
+  if (body) {
+    Operation *terminator = body->getTerminator();
+    Value oldValue = terminator->getOperand(origPort.argNum);
+    Type oldTy = oldValue.getType();
+
+    if (isa<InterfaceType>(oldTy) || isa<ModportType>(oldTy)) {
+      terminator->emitOpError()
+          << "interface output " << origPort.name.getValue()
+          << " is not lowered inside module body";
+      pass.encounteredFailure = true;
+      return;
+    }
+
+    if (oldTy != outType) {
+      terminator->emitOpError()
+          << "expected lowered output type " << outType
+          << " for interface port " << origPort.name.getValue() << " but got "
+          << oldTy;
+      pass.encounteredFailure = true;
+      return;
+    }
+
+    terminator->setOperand(origPort.argNum, oldValue);
+    outputValue = oldValue;
+  }
+
+  converter.createNewOutput(origPort, "", outType, outputValue, loweredPort);
+}
+
 void InterfacePortConversion::mapInputSignals(
     OpBuilder &b, Operation *inst, Value instValue,
     SmallVectorImpl<Value> &newOperands, ArrayRef<Backedge> newResults) {
@@ -271,8 +318,12 @@ void InterfacePortConversion::mapInputSignals(
 }
 
 void InterfacePortConversion::mapOutputSignals(
-    OpBuilder &, Operation *, Value, SmallVectorImpl<Value> &,
-    ArrayRef<Backedge>) {}
+    OpBuilder &, Operation *, Value instValue, SmallVectorImpl<Value> &,
+    ArrayRef<Backedge> newResults) {
+  if (!plan.info)
+    return;
+  instValue.replaceAllUsesWith(newResults[loweredPort.argNum]);
+}
 
 LogicalResult InterfacePortConversion::lowerInterfaceValue(
     Value oldValue, Value loweredBase, StringAttr directModport) {
@@ -454,6 +505,8 @@ LogicalResult LowerInterfacesPass::buildPlans(hw::InstanceGraph &graph) {
           return mod.emitOpError()
                  << "modport " << modportName
                  << " does not reference any signals";
+        if (modportAllowsWrite(*ifaceInfo, modportName))
+          modulePlans[idx].needsInOut = true;
       }
     }
     return success();
