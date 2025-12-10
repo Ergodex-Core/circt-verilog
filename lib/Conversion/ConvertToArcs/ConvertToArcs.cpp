@@ -11,6 +11,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/LLHD/LLHDTypes.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Support/ConversionPatternSet.h"
@@ -678,11 +679,32 @@ static LogicalResult convert(llhd::CombinationalOp op,
   };
   auto operands =
       mlir::makeRegionIsolatedFromAbove(rewriter, op.getBody(), cloneIntoBody);
+  SmallVector<Value> convertedOperands;
+  convertedOperands.reserve(operands.size());
+  for (Value operand : operands) {
+    SmallVector<Type> types;
+    if (failed(converter.convertType(operand, types)) || types.size() != 1)
+      return failure();
+    auto convertedType = types.front();
+    if (convertedType == operand.getType())
+      convertedOperands.push_back(operand);
+    else
+      convertedOperands.push_back(rewriter
+                                      .create<mlir::UnrealizedConversionCastOp>(
+                                          op.getLoc(), convertedType, operand)
+                                      .getResult(0));
+  }
 
   // Create a replacement `arc.execute` op.
   auto executeOp =
-      ExecuteOp::create(rewriter, op.getLoc(), resultTypes, operands);
+      ExecuteOp::create(rewriter, op.getLoc(), resultTypes, convertedOperands);
   executeOp.getBody().takeBody(op.getBody());
+  TypeConverter::SignatureConversion signature(convertedOperands.size());
+  for (auto [idx, operand] : llvm::enumerate(convertedOperands))
+    signature.addInputs(idx, operand.getType());
+  if (!rewriter.applySignatureConversion(&executeOp.getBody().front(),
+                                         signature, &converter))
+    return failure();
   rewriter.replaceOp(op, executeOp.getResults());
   return success();
 }
@@ -700,10 +722,31 @@ static LogicalResult convert(llhd::ProcessOp op, llhd::ProcessOp::Adaptor adapto
   };
   auto operands =
       mlir::makeRegionIsolatedFromAbove(rewriter, op.getBody(), cloneIntoBody);
+  SmallVector<Value> convertedOperands;
+  convertedOperands.reserve(operands.size());
+  for (Value operand : operands) {
+    SmallVector<Type> types;
+    if (failed(converter.convertType(operand, types)) || types.size() != 1)
+      return failure();
+    auto convertedType = types.front();
+    if (convertedType == operand.getType())
+      convertedOperands.push_back(operand);
+    else
+      convertedOperands.push_back(rewriter
+                                      .create<mlir::UnrealizedConversionCastOp>(
+                                          op.getLoc(), convertedType, operand)
+                                      .getResult(0));
+  }
 
   auto executeOp =
-      ExecuteOp::create(rewriter, op.getLoc(), resultTypes, operands);
+      ExecuteOp::create(rewriter, op.getLoc(), resultTypes, convertedOperands);
   executeOp.getBody().takeBody(op.getBody());
+  TypeConverter::SignatureConversion signature(convertedOperands.size());
+  for (auto [idx, operand] : llvm::enumerate(convertedOperands))
+    signature.addInputs(idx, operand.getType());
+  if (!rewriter.applySignatureConversion(&executeOp.getBody().front(),
+                                         signature, &converter))
+    return failure();
   rewriter.replaceOp(op, executeOp.getResults());
   return success();
 }
@@ -757,6 +800,18 @@ struct WaitOpConversion : public OpConversionPattern<llhd::WaitOp> {
 
   LogicalResult
   matchAndRewrite(llhd::WaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<arc::OutputOp>(op, adaptor.getYieldOperands());
+    return success();
+  }
+};
+
+/// `llhd.halt` -> `arc.output` (surface the yielded values; drop scheduling)
+struct HaltOpConversion : public OpConversionPattern<llhd::HaltOp> {
+  using OpConversionPattern<llhd::HaltOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::HaltOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOpWithNewOp<arc::OutputOp>(op, adaptor.getYieldOperands());
     return success();
@@ -850,24 +905,33 @@ void ConvertToArcsPass::runOnOperation() {
     if (auto sym =
             op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
       ns.newName(sym.getValue());
+
+  // Drop dead string labels early so they don't leak SV constants through the
+  // pipeline.
+  SmallVector<Operation *> toErase;
+  getOperation().walk([&](llhd::SignalOp sig) {
+    if (sig.getResult().use_empty()) {
+      if (auto inout = dyn_cast<hw::InOutType>(sig.getType()))
+        if (isa<hw::StringType>(inout.getElementType()))
+          toErase.push_back(sig);
+    }
+  });
+  getOperation().walk([&](sv::ConstantStrOp cst) {
+    if (cst.use_empty())
+      toErase.push_back(cst);
+  });
+  for (Operation *op : toErase)
+    op->erase();
+
   SmallVector<llhd::ProcessOp> processes;
   getOperation().walk(
       [&](llhd::ProcessOp proc) { processes.push_back(proc); });
-  for (auto proc : processes) {
-    if (succeeded(lowerProcessToArcState(proc, ns))) {
-      LLVM_DEBUG({
-        if (auto parent = proc->getParentOfType<hw::HWModuleOp>())
-          llvm::dbgs() << "[convert-to-arcs] lowered llhd.process in `"
-                       << parent.getModuleName() << "`\n";
-      });
-    } else {
-      LLVM_DEBUG({
-        if (auto parent = proc->getParentOfType<hw::HWModuleOp>())
-          llvm::dbgs() << "[convert-to-arcs] skipped llhd.process in `"
-                       << parent.getModuleName() << "`\n";
-      });
-    }
-  }
+  for (auto proc : processes)
+    LLVM_DEBUG({
+      if (auto parent = proc->getParentOfType<hw::HWModuleOp>())
+        llvm::dbgs() << "[convert-to-arcs] skipping pre-lowering for llhd.process in `"
+                     << parent.getModuleName() << "`\n";
+    });
 
   // Setup the type conversion.
   TypeConverter converter;
@@ -885,6 +949,37 @@ void ConvertToArcsPass::runOnOperation() {
   converter.addConversion([](llhd::TimeType type) -> std::optional<Type> {
     return getTimeStructType(type.getContext());
   });
+  converter.addSourceMaterialization(
+      [](OpBuilder &builder, Type type, ValueRange inputs,
+         Location loc) -> Value {
+        if (inputs.size() != 1)
+          return {};
+        Value input = inputs.front();
+        if (auto inout = dyn_cast<hw::InOutType>(input.getType())) {
+          if (inout.getElementType() == type)
+            return builder
+                .create<mlir::UnrealizedConversionCastOp>(loc, type, inputs)
+                .getResult(0);
+        }
+        if (auto desiredInOut = dyn_cast<hw::InOutType>(type)) {
+          if (desiredInOut.getElementType() == input.getType())
+            return builder
+                .create<mlir::UnrealizedConversionCastOp>(loc, type, inputs)
+                .getResult(0);
+        }
+        return {};
+      });
+  converter.addTargetMaterialization(
+      [](OpBuilder &builder, hw::InOutType type, ValueRange inputs,
+         Location loc) -> Value {
+        if (inputs.size() != 1)
+          return {};
+        if (inputs.front().getType() != type.getElementType())
+          return {};
+        auto mat = builder.create<mlir::UnrealizedConversionCastOp>(
+            loc, TypeRange{type}, inputs);
+        return mat.getResult(0);
+      });
 
   // Gather the conversion patterns.
   ConversionPatternSet patterns(&getContext(), converter);
@@ -896,6 +991,7 @@ void ConvertToArcsPass::runOnOperation() {
   patterns.add<ProbeOpConversion>(converter, &getContext());
   patterns.add<DrvOpConversion>(converter, &getContext());
   patterns.add<WaitOpConversion>(converter, &getContext());
+  patterns.add<HaltOpConversion>(converter, &getContext());
 
   // Setup the legal ops. (Sort alphabetically.)
   ConversionTarget target(getContext());
@@ -915,6 +1011,34 @@ void ConvertToArcsPass::runOnOperation() {
     emitError(getOperation().getLoc()) << "conversion to arcs failed";
     return signalPassFailure();
   }
+
+  // Collapse trivial inout<->SSA round-trips that may have been introduced as
+  // materializations during conversion.
+  SmallVector<Operation *> materializationsToErase;
+  getOperation().walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
+      return;
+    Value input = cast.getInputs().front();
+    Value result = cast.getResult(0);
+    auto inputInOut = dyn_cast<hw::InOutType>(input.getType());
+    if (!inputInOut || result.getType() != inputInOut.getElementType())
+      return;
+    auto producer =
+        input.getDefiningOp<mlir::UnrealizedConversionCastOp>();
+    if (!producer || producer->getNumOperands() != 1 ||
+        producer->getNumResults() != 1)
+      return;
+    if (producer.getResult(0).getType() != input.getType())
+      return;
+    if (producer.getInputs().front().getType() != result.getType())
+      return;
+    result.replaceAllUsesWith(producer.getInputs().front());
+    materializationsToErase.push_back(cast);
+    if (producer.getResult(0).use_empty())
+      materializationsToErase.push_back(producer);
+  });
+  for (Operation *op : materializationsToErase)
+    op->erase();
 
   // Outline operations into arcs.
   Converter outliner;
