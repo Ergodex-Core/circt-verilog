@@ -250,6 +250,23 @@ LogicalResult Converter::runOnModule(HWModuleOp module) {
   if (module.getBodyBlock()->without_terminator().empty() &&
       isa<hw::OutputOp>(module.getBodyBlock()->getTerminator()))
     return success();
+
+  LLVM_DEBUG(llvm::dbgs() << "[convert-to-arcs] module "
+                          << module.getModuleName() << " breakers="
+                          << arcBreakers.size() << "\n");
+  // Defensive: if we somehow collected an absurd number of breakers, bail out
+  // with a clear diagnostic instead of letting downstream APInt/SmallVector
+  // explode.
+  constexpr size_t kArcBreakerSanityLimit = 1u << 20; // 1M breakers is plenty.
+  if (arcBreakers.size() > kArcBreakerSanityLimit) {
+    module.emitError("convert-to-arcs: collected ")
+        << arcBreakers.size()
+        << " arc-breaking operations in module `"
+        << module.getModuleName().str()
+        << "`; this exceeds the sanity limit and likely indicates a bug in "
+           "arc-breaker detection.";
+    return failure();
+  }
   LLVM_DEBUG(llvm::dbgs() << "Analyzing " << module.getModuleNameAttr() << " ("
                           << arcBreakers.size() << " breakers)\n");
 
