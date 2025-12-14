@@ -38,6 +38,51 @@ static bool allPredecessorTRsKnown(Block *block,
   });
 }
 
+/// Return true if the block has predecessors belonging to different temporal
+/// regions.
+///
+/// For blocks that end with `llhd.wait`, ignore incoming edges from blocks that
+/// resume from a wait (i.e. blocks that have a wait terminator predecessor).
+/// Those edges form the main loop back into the wait block and should not
+/// force the wait block into its own temporal region.
+static bool hasConflictingPredecessorTRs(Block *block,
+                                        const DenseMap<Block *, int> &blockMap) {
+  auto isWaitBlock = [](Block *b) {
+    return isa<llhd::WaitOp>(b->getTerminator());
+  };
+  std::optional<int> seenTR;
+  for (Block *pred : block->getPredecessors()) {
+    if (isWaitBlock(block) && anyPredecessorHasWait(pred))
+      continue;
+    auto it = blockMap.find(pred);
+    if (it == blockMap.end())
+      continue;
+    int tr = it->second;
+    if (!seenTR)
+      seenTR = tr;
+    else if (*seenTR != tr)
+      return true;
+  }
+  return false;
+}
+
+/// Pick a predecessor temporal region to inherit from.
+static int pickPredecessorTR(Block *block,
+                             const DenseMap<Block *, int> &blockMap) {
+  auto isWaitBlock = [](Block *b) {
+    return isa<llhd::WaitOp>(b->getTerminator());
+  };
+  if (isWaitBlock(block)) {
+    for (Block *pred : block->getPredecessors()) {
+      if (anyPredecessorHasWait(pred))
+        continue;
+      if (auto it = blockMap.find(pred); it != blockMap.end())
+        return it->second;
+    }
+  }
+  return blockMap.lookup(*block->pred_begin());
+}
+
 void llhd::TemporalRegionAnalysis::recalculate(Operation *operation) {
   assert(isa<ProcessOp>(operation) &&
          "TemporalRegionAnalysis: operation needs to be llhd::ProcessOp");
@@ -98,15 +143,12 @@ void llhd::TemporalRegionAnalysis::recalculate(Operation *operation) {
       // this might require a bigger change to the algorithm.
     } else if (!allPredecessorTRsKnown(block, workDone) ||
                anyPredecessorHasWait(block) ||
-               !(std::adjacent_find(block->pred_begin(), block->pred_end(),
-                                    [&](Block *pred1, Block *pred2) {
-                                      return blockMap[pred1] != blockMap[pred2];
-                                    }) == block->pred_end())) {
+               hasConflictingPredecessorTRs(block, blockMap)) {
       addBlockToTR(block, ++nextTRnum, blockMap, trMap);
       // If all predecessors have the same TR and none has a wait terminator,
       // inherit the TR
     } else {
-      int tr = blockMap[*block->pred_begin()];
+      int tr = pickPredecessorTR(block, blockMap);
       blockMap.insert(std::make_pair(block, tr));
       trMap[tr].push_back(block);
       trMap[tr].erase(std::unique(trMap[tr].begin(), trMap[tr].end()),

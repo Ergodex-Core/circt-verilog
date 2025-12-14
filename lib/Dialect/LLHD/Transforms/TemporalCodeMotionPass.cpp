@@ -12,12 +12,14 @@
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Region.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/STLExtras.h"
+#include <functional>
 #include <queue>
 
 namespace circt {
@@ -29,6 +31,259 @@ namespace llhd {
 
 using namespace circt;
 using namespace mlir;
+
+/// Find an `llhd.prb` in the parent graph region (outside any process) which
+/// probes `signal`, or create a new one. Returns the probed value.
+static Value getOrCreateGraphProbe(Value signal, Operation *insertBefore,
+                                   Location loc) {
+  auto *parentRegion = signal.getParentRegion();
+  assert(parentRegion && "expected signal to have a parent region");
+
+  // Reuse an existing probe in the parent graph region (module body).
+  for (Operation *user : signal.getUsers()) {
+    auto probe = dyn_cast<llhd::PrbOp>(user);
+    if (!probe)
+      continue;
+    if (probe->getParentRegion() != parentRegion)
+      continue;
+    return probe.getResult();
+  }
+
+  OpBuilder builder(insertBefore);
+  builder.setInsertionPoint(insertBefore);
+  return builder.create<llhd::PrbOp>(loc, signal).getResult();
+}
+
+/// Rewrite the common 2-TR pattern
+///
+///   entry -> waitBlock --wait--> loopBlock -> waitBlock
+///
+/// into a single-block wait loop where the wait targets itself and carries
+/// prior observed values as destination operands. This puts drives into the
+/// same block as the wait and makes the past/present trigger values explicit,
+/// enabling later LLHD lowering passes to convert the process into registers.
+static LogicalResult canonicalizeWaitLoop(llhd::ProcessOp procOp) {
+  if (procOp.getNumResults() != 0)
+    return failure();
+
+  llhd::WaitOp waitOp;
+  for (auto &block : procOp.getBody()) {
+    if (auto candidate = dyn_cast<llhd::WaitOp>(block.getTerminator())) {
+      if (waitOp)
+        return failure();
+      waitOp = candidate;
+    }
+  }
+  if (!waitOp)
+    return failure();
+
+  // Only canonicalize event-driven waits without yields/destination operands.
+  if (!waitOp.getYieldOperands().empty() || waitOp.getDelay() ||
+      !waitOp.getDestOperands().empty())
+    return failure();
+
+  Block *waitBlock = waitOp->getBlock();
+  Block *loopBlock = waitOp.getSuccessor();
+  if (!waitBlock || !loopBlock)
+    return failure();
+
+  // Require the loop block to branch unconditionally back to the wait block
+  // without carrying values. The canonical form will instead end in a wait.
+  auto loopBranch = dyn_cast<cf::BranchOp>(loopBlock->getTerminator());
+  if (!loopBranch || loopBranch.getDest() != waitBlock ||
+      !loopBranch.getDestOperands().empty())
+    return failure();
+
+  // Require the entry block to branch unconditionally to the wait block.
+  Block *entryBlock = &procOp.getBody().front();
+  if (entryBlock == waitBlock)
+    return failure();
+  auto entryBranch = dyn_cast<cf::BranchOp>(entryBlock->getTerminator());
+  if (!entryBranch || entryBranch.getDest() != waitBlock ||
+      !entryBranch.getDestOperands().empty())
+    return failure();
+
+  // Require the wait block to only be reached from entry and the loop back
+  // edge. This ensures it becomes dead after the rewrite.
+  SmallPtrSet<Block *, 4> waitPreds;
+  for (Block *pred : waitBlock->getPredecessors())
+    waitPreds.insert(pred);
+  if (waitPreds.size() != 2 || !waitPreds.contains(entryBlock) ||
+      !waitPreds.contains(loopBlock))
+    return failure();
+
+  // The canonical form requires a loop block with block arguments for the
+  // past observed values.
+  if (!loopBlock->getArguments().empty())
+    return failure();
+  if (!waitBlock->getArguments().empty())
+    return failure();
+
+  // Create/reuse graph probes for the observed signals. These values live
+  // outside the process and can be used as register clocks later.
+  SmallVector<Value> observedValues;
+  SmallVector<Value> observedSignals;
+  observedValues.reserve(waitOp.getObserved().size());
+  observedSignals.reserve(waitOp.getObserved().size());
+  for (Value observed : waitOp.getObserved()) {
+    if (!observed.getType().isSignlessInteger(1))
+      return failure();
+
+    auto probe = observed.getDefiningOp<llhd::PrbOp>();
+    if (!probe)
+      return failure();
+    Value signal = probe.getSignal();
+    if (!signal.getParentRegion()->isProperAncestor(&procOp.getBody()))
+      return failure();
+
+    observedValues.push_back(observed);
+    observedSignals.push_back(signal);
+  }
+
+  // Determine which values need to be cloned out of the old wait block, and
+  // ensure we can do so without mutating the IR.
+  SmallVector<Value> crossValues;
+  for (Operation &op : waitBlock->without_terminator()) {
+    for (Value result : op.getResults()) {
+      bool usedInLoop = false;
+      for (OpOperand &use : result.getUses()) {
+        Block *useBlock = use.getOwner()->getBlock();
+        if (useBlock == waitBlock)
+          continue;
+        if (useBlock != loopBlock)
+          return failure();
+        usedInLoop = true;
+      }
+      if (usedInLoop)
+        crossValues.push_back(result);
+    }
+  }
+
+  SmallPtrSet<Operation *, 16> canCloneStack;
+  DenseSet<Value> observedSet;
+  observedSet.insert(observedValues.begin(), observedValues.end());
+  auto canCloneValue = [&](auto &&self, Value value) -> bool {
+    if (!value)
+      return false;
+    if (observedSet.contains(value))
+      return true;
+    auto *defOp = value.getDefiningOp();
+    if (!defOp || defOp->getBlock() != waitBlock)
+      return true;
+    if (!isMemoryEffectFree(defOp) || defOp->getNumRegions() != 0)
+      return false;
+    if (!canCloneStack.insert(defOp).second)
+      return false;
+    for (Value operand : defOp->getOperands())
+      if (!self(self, operand))
+        return false;
+    canCloneStack.erase(defOp);
+    return true;
+  };
+  for (Value value : crossValues)
+    if (!canCloneValue(canCloneValue, value))
+      return failure();
+
+  // Create/reuse graph probes for the observed signals. These values live
+  // outside the process and can be used as register clocks later.
+  SmallVector<Value> presentTriggers;
+  presentTriggers.reserve(observedSignals.size());
+  for (auto [signal, observed] : llvm::zip(observedSignals, observedValues))
+    presentTriggers.push_back(
+        getOrCreateGraphProbe(signal, procOp, observed.getLoc()));
+
+  // Add block arguments to hold the past observed values.
+  SmallVector<BlockArgument> pastArgs;
+  pastArgs.reserve(presentTriggers.size());
+  for (Value trigger : presentTriggers)
+    pastArgs.push_back(
+        loopBlock->addArgument(trigger.getType(), procOp.getLoc()));
+
+  // Clone any values defined in the wait block which are used in the loop
+  // block, remapping observed values to the newly created past block
+  // arguments.
+  IRMapping mapping;
+  for (auto [observed, past] : llvm::zip(observedValues, pastArgs))
+    mapping.map(observed, past);
+
+  OpBuilder cloneBuilder(procOp.getContext());
+  cloneBuilder.setInsertionPointToStart(loopBlock);
+
+  SmallPtrSet<Operation *, 16> cloneInProgress;
+  auto cloneValue = [&](auto &&self, Value value) -> Value {
+    if (auto mapped = mapping.lookupOrNull(value))
+      return mapped;
+
+    auto *defOp = value.getDefiningOp();
+    if (!defOp || defOp->getBlock() != waitBlock)
+      return value;
+
+    if (!isMemoryEffectFree(defOp) || defOp->getNumRegions() != 0)
+      return Value{};
+
+    if (!cloneInProgress.insert(defOp).second)
+      return Value{};
+
+    SmallVector<Value> newOperands;
+    newOperands.reserve(defOp->getNumOperands());
+    for (Value operand : defOp->getOperands()) {
+      Value mappedOperand = self(self, operand);
+      if (!mappedOperand)
+        return Value{};
+      newOperands.push_back(mappedOperand);
+    }
+
+    Operation *cloned = cloneBuilder.clone(*defOp, mapping);
+    (void)cloned;
+    return mapping.lookup(value);
+  };
+
+  for (Value oldValue : crossValues) {
+    Value newValue = cloneValue(cloneValue, oldValue);
+    if (!newValue)
+      return failure();
+    oldValue.replaceUsesWithIf(newValue, [&](OpOperand &use) {
+      return use.getOwner()->getBlock() == loopBlock;
+    });
+  }
+
+  // Replace any probes of observed signals in the loop block with the graph
+  // probe values, since the wait will observe the graph probe.
+  DenseMap<Value, Value> signalToTrigger;
+  for (auto [signal, trigger] : llvm::zip(observedSignals, presentTriggers))
+    signalToTrigger.insert({signal, trigger});
+  for (auto probe :
+       llvm::make_early_inc_range(loopBlock->getOps<llhd::PrbOp>())) {
+    if (auto it = signalToTrigger.find(probe.getSignal());
+        it != signalToTrigger.end()) {
+      probe.getResult().replaceAllUsesWith(it->second);
+      probe.erase();
+    }
+  }
+
+  // Replace the loop-back branch with a wait that observes the current trigger
+  // values and passes them as destination operands to create past values in the
+  // next iteration.
+  OpBuilder endBuilder(loopBranch);
+  endBuilder.setInsertionPoint(loopBranch);
+  llhd::WaitOp::create(endBuilder, loopBranch.getLoc(), ValueRange{}, Value{},
+                       presentTriggers, presentTriggers, loopBlock);
+  loopBranch.erase();
+
+  // Branch into the loop with the initial past values set to the current
+  // trigger values. This avoids spurious edges on simulation start.
+  OpBuilder entryBuilder(entryBranch);
+  entryBuilder.setInsertionPoint(entryBranch);
+  cf::BranchOp::create(entryBuilder, entryBranch.getLoc(), loopBlock,
+                       presentTriggers);
+  entryBranch.erase();
+
+  // Remove the now-unreachable wait block.
+  IRRewriter rewriter(procOp.getContext());
+  (void)mlir::eraseUnreachableBlocks(rewriter, procOp->getRegions());
+
+  return success();
+}
 
 /// Explore all paths from the 'driveBlock' to the 'dominator' block and
 /// construct a boolean expression at the current insertion point of 'builder'
@@ -124,33 +379,44 @@ void TemporalCodeMotionPass::runOnOperation() {
 }
 
 static LogicalResult checkForCFGLoop(llhd::ProcessOp procOp) {
-  SmallVector<Block *> toCheck(
+  // The temporal region analysis underpinning this pass cannot handle CFG
+  // cycles that do *not* pass through a wait terminator. Detect those by doing
+  // a DFS and tracking the current recursion stack. Shared successors in the
+  // CFG (i.e. join points) are fine and should not be mistaken for loops.
+
+  SmallVector<Block *> roots(
       llvm::map_range(procOp.getOps<llhd::WaitOp>(), [](llhd::WaitOp waitOp) {
         return waitOp.getSuccessor();
       }));
-  toCheck.push_back(&procOp.getBody().front());
+  roots.push_back(&procOp.getBody().front());
 
-  SmallVector<Block *> worklist;
-  DenseSet<Block *> visited;
-  for (auto *block : toCheck) {
-    worklist.clear();
-    visited.clear();
-    worklist.push_back(block);
+  auto isWaitBlock = [](Block *block) {
+    return isa<llhd::WaitOp>(block->getTerminator());
+  };
 
-    while (!worklist.empty()) {
-      Block *curr = worklist.pop_back_val();
-      if (isa<llhd::WaitOp>(curr->getTerminator()))
-        continue;
+  for (Block *root : roots) {
+    SmallPtrSet<Block *, 32> visited;
+    SmallPtrSet<Block *, 32> onStack;
 
-      visited.insert(curr);
+    std::function<bool(Block *)> dfs = [&](Block *block) -> bool {
+      if (isWaitBlock(block))
+        return false;
+      if (onStack.contains(block))
+        return true;
+      if (visited.contains(block))
+        return false;
 
-      for (auto *succ : curr->getSuccessors()) {
-        if (visited.contains(succ))
-          return failure();
+      visited.insert(block);
+      onStack.insert(block);
+      for (Block *succ : block->getSuccessors())
+        if (dfs(succ))
+          return true;
+      onStack.erase(block);
+      return false;
+    };
 
-        worklist.push_back(succ);
-      }
-    }
+    if (dfs(root))
+      return failure();
   }
 
   return success();
@@ -346,6 +612,7 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
   //===--------------------------------------------------------------------===//
 
   trAnalysis = llhd::TemporalRegionAnalysis(procOp);
+  numTRs = trAnalysis.getNumTemporalRegions();
   DominanceInfo dom(procOp);
   for (unsigned currTR = 0; currTR < numTRs; ++currTR) {
     // We ensured this in the previous phase above.
@@ -386,6 +653,11 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
       sigToDrv[sigTimePair] = op;
     }
   }
+
+  // If this pass produced the common "wait block + loop block" pattern, rewrite
+  // it into a single wait loop that is friendlier to drive hoisting and
+  // desequentialization. Ignore processes that do not match the pattern.
+  (void)canonicalizeWaitLoop(procOp);
 
   return success();
 }

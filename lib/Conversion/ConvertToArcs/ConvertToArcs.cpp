@@ -81,7 +81,10 @@ static Value cloneValueIntoModule(Value value, OpBuilder &builder,
   }
 
   auto *defOp = value.getDefiningOp();
-  if (!defOp || !isMemoryEffectFree(defOp))
+  // LLHD probes/signals carry memory effects but are safe to clone when
+  // sinking simple processes into an arc state. Allow those through.
+  bool allowSideEffects = isa<llhd::PrbOp>(defOp) || isa<llhd::SignalOp>(defOp);
+  if (!defOp || (!isMemoryEffectFree(defOp) && !allowSideEffects))
     return {};
 
   for (auto operand : defOp->getOperands()) {
@@ -789,7 +792,11 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
   LogicalResult
   matchAndRewrite(llhd::DrvOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getValue());
+    // `llhd.drv` has no SSA results; the current LLHD shims ignore scheduling
+    // and treat drives as side effects on the corresponding `llhd.sig`. Until
+    // we have a proper LLHD-to-Arc lowering that models signal storage, simply
+    // erase the drive during type legalization.
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -897,15 +904,6 @@ struct ConvertToArcsPass
 } // namespace
 
 void ConvertToArcsPass::runOnOperation() {
-  // First, try to collapse simple LLHD processes that just wait on a single
-  // clock edge into explicit arc states. This avoids the overly conservative
-  // wait-conversion below from stripping the sequential logic entirely.
-  Namespace ns;
-  for (auto &op : getOperation().getOps())
-    if (auto sym =
-            op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
-      ns.newName(sym.getValue());
-
   // Drop dead string labels early so they don't leak SV constants through the
   // pipeline.
   SmallVector<Operation *> toErase;
@@ -923,15 +921,11 @@ void ConvertToArcsPass::runOnOperation() {
   for (Operation *op : toErase)
     op->erase();
 
-  SmallVector<llhd::ProcessOp> processes;
-  getOperation().walk(
-      [&](llhd::ProcessOp proc) { processes.push_back(proc); });
-  for (auto proc : processes)
-    LLVM_DEBUG({
-      if (auto parent = proc->getParentOfType<hw::HWModuleOp>())
-        llvm::dbgs() << "[convert-to-arcs] skipping pre-lowering for llhd.process in `"
-                     << parent.getModuleName() << "`\n";
-    });
+  // NOTE: LLHD `llhd.process` pre-lowering is currently disabled. The existing
+  // heuristic lowering to `arc.state` is incomplete and can lead to non-
+  // terminating type legalization. A proper scheduler/stateful lowering should
+  // live in LLHD transforms (e.g. `llhd-deseq`) or be implemented here as a
+  // dedicated conversion.
 
   // Setup the type conversion.
   TypeConverter converter;

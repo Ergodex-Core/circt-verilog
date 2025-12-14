@@ -25,7 +25,9 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/RegionKindInterface.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -1684,6 +1686,18 @@ LogicalResult AssignInterfaceSignalOp::verify() {
 
 LogicalResult ReadInterfaceSignalOp::verify() {
   return verifySignalExists(getIface(), getSignalNameAttr());
+}
+
+void ReadInterfaceSignalOp::getEffects(
+    SmallVectorImpl<
+        mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>>
+        &effects) {
+  // Within regions that carry SSA dominance (procedural/SSACFG), this op models
+  // sampling a time-varying value. Report a read effect so that generic passes
+  // like ECM/CSE do not merge or hoist reads across temporal boundaries (e.g.,
+  // across `llhd.wait`).
+  if (mlir::mayHaveSSADominance(*getOperation()->getParentRegion()))
+    effects.emplace_back(mlir::MemoryEffects::Read::get(), &getIfaceMutable());
 }
 
 //===----------------------------------------------------------------------===//

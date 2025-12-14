@@ -128,11 +128,27 @@ void ProbeHoister::hoistProbes() {
 
   for (auto &block : region) {
     // We can only hoist probes in blocks where all predecessors have wait
-    // terminators.
-    if (!llvm::all_of(block.getPredecessors(), [](auto *predecessor) {
-          return isa<WaitOp>(predecessor->getTerminator());
+    // terminators, plus the region entry block (for the first iteration).
+    Block *entryBlock = &region.front();
+    if (!llvm::all_of(block.getPredecessors(), [&](auto *predecessor) {
+          return predecessor == entryBlock ||
+                 isa<WaitOp>(predecessor->getTerminator());
         }))
       continue;
+
+    // If this is a resuming block of an `llhd.wait`, do not hoist probes of
+    // any observed signal. Those probes sample values *after* the suspension
+    // point; moving them outside of the process would change which time slice
+    // they observe and can break event detection (e.g. posedge logic).
+    DenseSet<Value> observedSignals;
+    for (auto *predecessor : block.getPredecessors()) {
+      auto wait = dyn_cast<WaitOp>(predecessor->getTerminator());
+      if (!wait)
+        continue;
+      for (Value observed : wait.getObserved())
+        if (auto prb = observed.getDefiningOp<PrbOp>())
+          observedSignals.insert(prb.getSignal());
+    }
 
     for (auto &op : llvm::make_early_inc_range(block)) {
       auto probeOp = dyn_cast<PrbOp>(op);
@@ -151,6 +167,15 @@ void ProbeHoister::hoistProbes() {
       if (liveAcrossWait.contains(probeOp)) {
         LLVM_DEBUG(llvm::dbgs()
                    << "- Skipping (live across wait) " << probeOp << "\n");
+        continue;
+      }
+
+      // Never hoist probes of signals that are observed by a predecessor wait
+      // resuming into this block. Those probes must remain in the resuming
+      // block to preserve timing semantics.
+      if (observedSignals.contains(probeOp.getSignal())) {
+        LLVM_DEBUG(llvm::dbgs() << "- Skipping (observed by wait) " << probeOp
+                                << "\n");
         continue;
       }
 

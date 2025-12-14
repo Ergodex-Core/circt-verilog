@@ -28,6 +28,7 @@
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
+#include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "circt/Dialect/Moore/MooreDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
@@ -264,9 +265,15 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     // conversion sees SSA values instead of signal/process primitives.
     pm.addPass(llhd::createProcessLowering());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createEarlyCodeMotion());
+    // Temporal code motion is sensitive to how many distinct delay constants
+    // show up in a process. CSE helps collapse duplicate `llhd.constant_time`
+    // ops so the temporal region analysis can succeed on typical always blocks.
+    pm.nest<hw::HWModuleOp>().addPass(createCSEPass());
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createTemporalCodeMotion());
+    pm.addPass(llhd::createHoistSignalsPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createDeseqPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
-    pm.addPass(llhd::createHoistSignalsPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
   }
   pm.addPass(sv::createLowerInterfacesPass());

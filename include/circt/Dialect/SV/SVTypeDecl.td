@@ -322,7 +322,9 @@ def AssignInterfaceSignalOp : SVOp<"interface.signal.assign", []> {
   let hasVerifier = 1;
 }
 
-def ReadInterfaceSignalOp : SVOp<"interface.signal.read", [Pure]> {
+def ReadInterfaceSignalOp : SVOp<"interface.signal.read", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let summary = "Access the data in an interface's signal.";
   let description = [{
     This is an expression to access a signal inside of an interface.
