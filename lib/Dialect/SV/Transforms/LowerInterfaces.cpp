@@ -17,6 +17,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/HW/PortConverter.h"
+#include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
@@ -45,6 +46,7 @@ static bool isInProceduralRegion(Operation *op) {
   for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
        parent = parent->getParentOp()) {
     if (parent->hasTrait<sv::ProceduralRegion>() ||
+        parent->hasTrait<circt::llhd::ProceduralRegion>() ||
         isa<moore::ProcedureOp>(parent))
       return true;
   }

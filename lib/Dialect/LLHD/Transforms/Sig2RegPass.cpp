@@ -30,6 +30,21 @@ using namespace circt;
 
 namespace {
 
+static bool isEpsilonDelay(llhd::TimeAttr delay) {
+  return delay.getTime() == 0 && delay.getDelta() == 0 &&
+         delay.getEpsilon() == 1;
+}
+
+static bool isSameConstant(Value a, Value b) {
+  if (a == b)
+    return true;
+  auto aConst = a.getDefiningOp<hw::ConstantOp>();
+  auto bConst = b.getDefiningOp<hw::ConstantOp>();
+  if (aConst && bConst)
+    return aConst.getValue() == bConst.getValue();
+  return false;
+}
+
 /// Represents an offset of an interval relative to a root interval. All values
 /// describe number of bits, not elements.
 struct Offset {
@@ -114,12 +129,22 @@ public:
                   return failure();
                 }
 
+                // Many Moore-to-LLHD lowerings express initialization as an
+                // explicit epsilon drive to the signal's declared init value
+                // (e.g. from an `initial begin ... end` that assigns the same
+                // constant). Treat those drives as redundant so signals with a
+                // single real driver remain promotable.
+                auto delayAttr = timeOp.getValueAttr();
+                if (isEpsilonDelay(delayAttr) &&
+                    isSameConstant(driveOp.getValue(), sigOp.getInit()))
+                  return success();
+
                 auto bw = hw::getBitWidth(driveOp.getValue().getType());
                 if (bw <= 0)
                   return failure();
 
                 intervals.emplace_back(offset, bw, driveOp.getValue(),
-                                       timeOp.getValueAttr());
+                                       delayAttr);
                 return success();
               })
               .Case<llhd::SigExtractOp>([&](llhd::SigExtractOp extractOp) {

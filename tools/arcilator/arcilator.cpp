@@ -28,6 +28,7 @@
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/LLHD/LLHDDialect.h"
+#include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/LLHD/LLHDPasses.h"
 #include "circt/Dialect/Moore/MooreDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
@@ -348,9 +349,10 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     // conversion sees SSA values instead of signal/process primitives.
     pm.addPass(llhd::createProcessLowering());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
+    pm.nest<hw::HWModuleOp>().addPass(createCSEPass());
+    pm.addPass(llhd::createHoistSignalsPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createDeseqPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
-    pm.addPass(llhd::createHoistSignalsPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
   }
   pm.addPass(sv::createLowerInterfacesPass());
