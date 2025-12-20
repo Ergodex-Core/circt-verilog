@@ -2661,8 +2661,13 @@ static LogicalResult convert(SeverityBIOp op, SeverityBIOp::Adaptor adaptor,
 
   auto prefix =
       sim::FormatLiteralOp::create(rewriter, op.getLoc(), severityString);
+  // SystemVerilog severity tasks (`$fatal`, `$error`, `$warning`) emit a
+  // newline, unlike `$write`. Model this by appending a newline fragment.
+  auto newline =
+      sim::FormatLiteralOp::create(rewriter, op.getLoc(), "\n");
   auto message = sim::FormatStringConcatOp::create(
-      rewriter, op.getLoc(), ValueRange{prefix, adaptor.getMessage()});
+      rewriter, op.getLoc(),
+      ValueRange{prefix, adaptor.getMessage(), newline});
   rewriter.replaceOpWithNewOp<sim::PrintFormattedProcOp>(op, message);
   return success();
 }

@@ -32,4 +32,9 @@ def LowerDPIFunc : Pass<"sim-lower-dpi-func", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::func::FuncDialect", "mlir::LLVM::LLVMDialect"];
 }
 
+def LowerSimConsole : Pass<"sim-lower-console", "mlir::ModuleOp"> {
+  let summary = "Lower sim print/terminate ops to LLVM calls";
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+}
+
 #endif // CIRCT_DIALECT_SIM_SEQPASSES

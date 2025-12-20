@@ -30,6 +30,9 @@ static std::optional<uint64_t> computeLLVMBitWidth(Type type) {
   if (isa<seq::ClockType>(type))
     return 1;
 
+  if (auto inoutType = dyn_cast<hw::InOutType>(type))
+    return computeLLVMBitWidth(inoutType.getElementType());
+
   if (auto intType = dyn_cast<IntegerType>(type))
     return intType.getWidth();
 

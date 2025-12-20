@@ -1234,6 +1234,11 @@ void LowerArcToLLVMPass::runOnOperation() {
   LLVMConversionTarget target(getContext());
   target.addLegalOp<mlir::ModuleOp>();
   target.addLegalOp<scf::YieldOp>(); // quirk of SCF dialect conversion
+  // Keep Sim formatting/printing ops around until `sim-lower-console` runs.
+  target.addLegalOp<sim::FormatLitOp, sim::FormatDecOp, sim::FormatHexOp,
+                    sim::FormatBinOp, sim::FormatCharOp,
+                    sim::FormatStringConcatOp, sim::PrintFormattedProcOp,
+                    sim::TerminateOp>();
 
   // Mark sim::Format*Op as legal. These are not converted to LLVM, but the
   // lowering of sim::PrintFormattedOp walks them to build up its format string.

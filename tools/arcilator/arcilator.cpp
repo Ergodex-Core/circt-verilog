@@ -344,6 +344,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
   pm.addPass(createLowerVerifSimulationsPass());
+  pm.addPass(sv::createLowerInterfacesPass());
   {
     // Normalize LLHD procedural constructs into structural form so the Arc
     // conversion sees SSA values instead of signal/process primitives.
@@ -355,7 +356,6 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
   }
-  pm.addPass(sv::createLowerInterfacesPass());
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
@@ -408,6 +408,18 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   allocationOpt.splitFuncsThreshold = splitFuncsThreshold;
   allocationOpt.insertTraceTaps = traceTaps || !jitVcdFile.empty();
   populateArcStateAllocationPipeline(pm, allocationOpt);
+}
+
+/// Populate a pass manager with the Arc to LLVM pipeline for the given
+/// command line options. This pipeline lowers modules to LLVM IR.
+static void populateArcToLLVMPipeline(PassManager &pm) {
+  // Lower the arcs and update functions to LLVM.
+  if (untilReached(UntilLLVMLowering))
+    return;
+  pm.addPass(createLowerArcToLLVMPass());
+  pm.addPass(sim::createLowerSimConsole());
+  pm.addPass(createCSEPass());
+  pm.addPass(arc::createArcCanonicalizerPass());
 }
 
 static LogicalResult processBuffer(

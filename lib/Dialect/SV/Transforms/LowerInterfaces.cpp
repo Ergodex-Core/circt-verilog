@@ -21,6 +21,7 @@
 #include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
+#include "llvm/ADT/SmallString.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -45,9 +46,7 @@ namespace {
 static bool isInProceduralRegion(Operation *op) {
   for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
        parent = parent->getParentOp()) {
-    if (parent->hasTrait<sv::ProceduralRegion>() ||
-        parent->hasTrait<circt::llhd::ProceduralRegion>() ||
-        isa<moore::ProcedureOp>(parent))
+    if (parent->hasTrait<sv::ProceduralRegion>() || isa<moore::ProcedureOp>(parent))
       return true;
   }
   return false;
@@ -96,6 +95,13 @@ struct InterfacePortPlan {
   hw::StructType loweredType;
   bool needsInOut = false;
 };
+
+static Value buildZeroValue(OpBuilder &builder, Location loc, Type type);
+
+static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
+                                            StringAttr declaredModportName,
+                                            Value oldValue, Value loweredBase,
+                                            StringAttr directModport);
 
 static bool modportAllowsWrite(InterfaceInfo *info, StringAttr modportName) {
   if (!modportName)
@@ -181,12 +187,18 @@ public:
 
   DenseMap<StringAttr, InterfaceInfo> interfaces;
   DenseMap<Operation *, SmallVector<InterfacePortPlan>> plans;
+  DenseMap<Value, Value> loweredInterfaceInstances;
   bool encounteredFailure = false;
+
+  FailureOr<Value>
+  getOrCreateLoweredInterfaceInstance(sv::InterfaceInstanceOp inst,
+                                      hw::HWModuleOp parentModule);
 
 private:
   LogicalResult populateInterfaceInfo(ModuleOp module);
   LogicalResult buildPlans(hw::InstanceGraph &graph);
   LogicalResult lowerModules(hw::InstanceGraph &graph);
+  LogicalResult lowerInterfaceInstances(ModuleOp module);
 };
 
 // Port conversion that rewrites interface/modport ports to lowered structs.
@@ -306,17 +318,78 @@ void InterfacePortConversion::buildOutputSignals() {
 void InterfacePortConversion::mapInputSignals(
     OpBuilder &b, Operation *inst, Value instValue,
     SmallVectorImpl<Value> &newOperands, ArrayRef<Backedge> newResults) {
-  Type loweredType = plan.needsInOut
-                         ? Type(hw::InOutType::get(plan.loweredType))
-                         : Type(plan.loweredType);
-  if (instValue.getType() != loweredType) {
+  (void)newResults;
+  Location loc = inst->getLoc();
+  Type expectedType = plan.needsInOut
+                          ? Type(hw::InOutType::get(plan.loweredType))
+                          : Type(plan.loweredType);
+
+  Value mapped = instValue;
+
+  // Allow connecting an inout<struct> value to an input struct port by
+  // implicitly reading it.
+  if (!plan.needsInOut) {
+    if (auto inout = dyn_cast<hw::InOutType>(mapped.getType()))
+      if (inout.getElementType() == expectedType)
+        mapped = llhd::PrbOp::create(b, loc, mapped);
+  }
+
+  // If the operand is still an interface value (e.g. a local
+  // `sv.interface.instance`), materialize a lowered storage signal on-demand.
+  if (mapped.getType() != expectedType &&
+      (isa<InterfaceType>(mapped.getType()) || isa<ModportType>(mapped.getType()))) {
+    Value base = getInterfaceBase(mapped);
+    if (auto ifaceInst = base.getDefiningOp<sv::InterfaceInstanceOp>()) {
+      hw::HWModuleOp parentModule = inst->getParentOfType<hw::HWModuleOp>();
+      if (!parentModule) {
+        inst->emitOpError("cannot lower interface instance outside hw.module");
+        pass.encounteredFailure = true;
+      } else {
+        auto lowered =
+            pass.getOrCreateLoweredInterfaceInstance(ifaceInst, parentModule);
+        if (succeeded(lowered)) {
+          Value loweredInOut = *lowered;
+          if (expectedType == loweredInOut.getType()) {
+            mapped = loweredInOut;
+          } else if (!plan.needsInOut) {
+            if (auto loweredInoutType =
+                    dyn_cast<hw::InOutType>(loweredInOut.getType())) {
+              Type elemType = loweredInoutType.getElementType();
+              if (elemType == expectedType) {
+                mapped = llhd::PrbOp::create(b, loc, loweredInOut);
+              } else if (auto fullStruct = dyn_cast<hw::StructType>(elemType);
+                         fullStruct && isa<hw::StructType>(expectedType)) {
+                // Build a subset struct from the full interface bundle.
+                Value fullValue = llhd::PrbOp::create(b, loc, loweredInOut);
+                auto expectedStruct = cast<hw::StructType>(expectedType);
+                SmallVector<Value> elems;
+                elems.reserve(expectedStruct.getElements().size());
+                for (auto field : expectedStruct.getElements())
+                  elems.push_back(
+                      hw::StructExtractOp::create(b, loc, fullValue, field.name));
+                mapped =
+                    hw::StructCreateOp::create(b, loc, expectedStruct, elems);
+              }
+            }
+          }
+        } else {
+          pass.encounteredFailure = true;
+        }
+      }
+    }
+  }
+
+  if (mapped.getType() != expectedType) {
     inst->emitOpError("expected operand type ")
-        << loweredType << " after interface lowering, got "
+        << expectedType << " after interface lowering, got "
         << instValue.getType();
     pass.encounteredFailure = true;
-    return;
+    mapped = mlir::UnrealizedConversionCastOp::create(b, loc, expectedType,
+                                                      ValueRange{})
+                 .getResult(0);
   }
-  newOperands[loweredPort.argNum] = instValue;
+
+  newOperands[loweredPort.argNum] = mapped;
 }
 
 void InterfacePortConversion::mapOutputSignals(
@@ -327,8 +400,10 @@ void InterfacePortConversion::mapOutputSignals(
   instValue.replaceAllUsesWith(newResults[loweredPort.argNum]);
 }
 
-LogicalResult InterfacePortConversion::lowerInterfaceValue(
-    Value oldValue, Value loweredBase, StringAttr directModport) {
+static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
+                                            StringAttr declaredModportName,
+                                            Value oldValue, Value loweredBase,
+                                            StringAttr directModport) {
   SmallVector<std::tuple<Value, Value, StringAttr>> worklist;
   worklist.emplace_back(oldValue, loweredBase, directModport);
   SmallVector<Operation *> toErase;
@@ -346,10 +421,9 @@ LogicalResult InterfacePortConversion::lowerInterfaceValue(
 
       if (auto read = dyn_cast<sv::ReadInterfaceSignalOp>(user)) {
         StringAttr fieldAttr = read.getSignalNameAttr().getAttr();
-        if (failed(verifyReadableSignal(plan.info, plan.modportName, fieldAttr,
+        if (failed(verifyReadableSignal(info, declaredModportName, fieldAttr,
                                         read)) ||
-            failed(verifyReadableSignal(plan.info, modportName, fieldAttr,
-                                        read)))
+            failed(verifyReadableSignal(info, modportName, fieldAttr, read)))
           return failure();
         ImplicitLocOpBuilder builder(read.getLoc(), read);
         Value replacement;
@@ -361,8 +435,7 @@ LogicalResult InterfacePortConversion::lowerInterfaceValue(
                    << baseValue.getType();
           Value fieldHandle = builder.create<sv::StructFieldInOutOp>(
               baseValue, fieldAttr);
-          replacement = builder.create<sv::ReadInOutOp>(read.getType(),
-                                                        fieldHandle);
+          replacement = llhd::PrbOp::create(builder, read.getLoc(), fieldHandle);
         } else if (llvm::isa<hw::StructType>(baseValue.getType())) {
           replacement =
               builder.create<hw::StructExtractOp>(baseValue, fieldAttr);
@@ -379,13 +452,13 @@ LogicalResult InterfacePortConversion::lowerInterfaceValue(
 
       if (auto assign = dyn_cast<sv::AssignInterfaceSignalOp>(user)) {
         StringAttr fieldAttr = assign.getSignalNameAttr().getAttr();
-        if (failed(verifyWritableSignal(plan.info, plan.modportName, fieldAttr,
+        if (failed(verifyWritableSignal(info, declaredModportName, fieldAttr,
                                         assign)) ||
-            failed(verifyWritableSignal(plan.info, modportName, fieldAttr,
-                                        assign)))
+            failed(verifyWritableSignal(info, modportName, fieldAttr, assign)))
           return failure();
         auto inoutType = dyn_cast<hw::InOutType>(baseValue.getType());
-        if (!inoutType || !llvm::isa<hw::StructType>(inoutType.getElementType()))
+        if (!inoutType ||
+            !llvm::isa<hw::StructType>(inoutType.getElementType()))
           return assign.emitOpError()
                  << "cannot assign to flattened interface port because it is "
                     "not lowered to an inout";
@@ -407,6 +480,12 @@ LogicalResult InterfacePortConversion::lowerInterfaceValue(
   for (Operation *op : toErase)
     op->erase();
   return success();
+}
+
+LogicalResult InterfacePortConversion::lowerInterfaceValue(
+    Value oldValue, Value loweredBase, StringAttr directModport) {
+  return lowerInterfaceValueImpl(plan.info, plan.modportName, oldValue,
+                                 loweredBase, directModport);
 }
 
 LogicalResult LowerInterfacesPass::populateInterfaceInfo(ModuleOp module) {
@@ -606,6 +685,79 @@ LogicalResult LowerInterfacesPass::lowerModules(hw::InstanceGraph &graph) {
   return success();
 }
 
+FailureOr<Value> LowerInterfacesPass::getOrCreateLoweredInterfaceInstance(
+    sv::InterfaceInstanceOp inst, hw::HWModuleOp parentModule) {
+  Value key = inst.getResult();
+  auto it = loweredInterfaceInstances.find(key);
+  if (it != loweredInterfaceInstances.end())
+    return it->second;
+
+  auto ifaceInfo = lookupInterfaceInfo(inst.getInterfaceType(), parentModule);
+  if (failed(ifaceInfo))
+    return failure();
+
+  InterfaceInfo *info = *ifaceInfo;
+  hw::StructType structTy = info->getStructType();
+
+  OpBuilder builder(inst);
+  builder.setInsertionPointAfter(inst);
+  Value init = buildZeroValue(builder, inst.getLoc(), structTy);
+  if (!init) {
+    inst.emitOpError("unsupported interface instance type for lowering: ")
+        << structTy;
+    return failure();
+  }
+
+  Value lowered =
+      llhd::SignalOp::create(builder, inst.getLoc(),
+                             builder.getStringAttr(inst.getName()), init);
+  loweredInterfaceInstances[key] = lowered;
+  return lowered;
+}
+
+static Value buildZeroValue(OpBuilder &builder, Location loc, Type type) {
+  int64_t width = hw::getBitWidth(type);
+  if (width < 0)
+    return {};
+  Value constZero = hw::ConstantOp::create(builder, loc, APInt(width, 0));
+  return builder.createOrFold<hw::BitcastOp>(loc, type, constZero);
+}
+
+LogicalResult LowerInterfacesPass::lowerInterfaceInstances(ModuleOp module) {
+  for (auto mod : module.getOps<hw::HWModuleOp>()) {
+    if (!mod.getBodyBlock())
+      continue;
+
+    SmallVector<sv::InterfaceInstanceOp> instances;
+    for (auto inst : mod.getOps<sv::InterfaceInstanceOp>())
+      instances.push_back(inst);
+    if (instances.empty())
+      continue;
+
+    for (auto inst : instances) {
+      auto ifaceInfo = lookupInterfaceInfo(inst.getInterfaceType(), mod);
+      if (failed(ifaceInfo))
+        return failure();
+      auto loweredOr = getOrCreateLoweredInterfaceInstance(inst, mod);
+      if (failed(loweredOr))
+        return failure();
+      Value lowered = *loweredOr;
+
+      if (failed(lowerInterfaceValueImpl(*ifaceInfo, /*declaredModportName=*/{},
+                                         inst.getResult(), lowered,
+                                         /*directModport=*/{})))
+        return failure();
+
+      if (!inst->use_empty()) {
+        inst.emitOpError("unsupported uses remain after instance lowering");
+        return failure();
+      }
+      inst.erase();
+    }
+  }
+  return success();
+}
+
 void LowerInterfacesPass::runOnOperation() {
   ModuleOp module = getOperation();
   auto &instanceGraph = getAnalysis<hw::InstanceGraph>();
@@ -614,6 +766,8 @@ void LowerInterfacesPass::runOnOperation() {
   if (failed(buildPlans(instanceGraph)))
     return signalPassFailure();
   if (failed(lowerModules(instanceGraph)))
+    return signalPassFailure();
+  if (failed(lowerInterfaceInstances(module)))
     return signalPassFailure();
 }
 

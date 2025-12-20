@@ -544,6 +544,7 @@ void DriveHoister::hoistDrives() {
   // A builder to construct constant values outside the region.
   OpBuilder builder(processOp);
   SmallDenseMap<Attribute, Value> materializedConstants;
+  const unsigned oldNumResults = processOp->getNumResults();
 
   auto materialize = [&](DriveValue driveValue) -> Value {
     OpBuilder builder(processOp);
@@ -586,34 +587,104 @@ void DriveHoister::hoistDrives() {
   for (auto *suspendOp : suspendOps) {
     LLVM_DEBUG(llvm::dbgs()
                << "- Adding yield operands to " << *suspendOp << "\n");
-    MutableOperandRange yieldOperands =
-        TypeSwitch<Operation *, MutableOperandRange>(suspendOp)
-            .Case<WaitOp, HaltOp>(
-                [](auto op) { return op.getYieldOperandsMutable(); });
-
-    auto addYieldOperand = [&](DriveValue uniform, DriveValue nonUniform) {
-      if (!uniform)
-        yieldOperands.append(materialize(nonUniform));
-    };
-
+    SmallVector<Value, 16> extraYieldOperands;
     for (auto slot : slots) {
-      auto &driveSet = driveSets[slot];
+      auto it = driveSets.find(slot);
+      if (it == driveSets.end())
+        continue;
+      auto &driveSet = it->second;
       auto operands = driveSet.operands.lookup(suspendOp);
-      addYieldOperand(driveSet.uniform.value, operands.value);
-      addYieldOperand(driveSet.uniform.delay, operands.delay);
-      addYieldOperand(driveSet.uniform.enable, operands.enable);
+      if (!driveSet.uniform.value)
+        extraYieldOperands.push_back(materialize(operands.value));
+      if (!driveSet.uniform.delay)
+        extraYieldOperands.push_back(materialize(operands.delay));
+      if (!driveSet.uniform.enable)
+        extraYieldOperands.push_back(materialize(operands.enable));
     }
+
+    if (extraYieldOperands.empty())
+      continue;
+
+    if (auto waitOp = dyn_cast<WaitOp>(suspendOp)) {
+      // Create a replacement `llhd.wait` op with the extra yield operands. We
+      // avoid mutating operands in-place since the MLIR ODS segment properties
+      // may be out of sync when upstream transformations forget to update them.
+      //
+      // Operand layout:
+      //   [yieldOperands...], [delay?], [observed...], [destOperands...]
+      unsigned numOperands = waitOp->getNumOperands();
+      unsigned destSize = waitOp.getDest()->getNumArguments();
+      if (LLVM_UNLIKELY(destSize > numOperands)) {
+        LLVM_DEBUG(llvm::dbgs() << "  - Skipping: dest operands larger than "
+                                   "operand list\n");
+        continue;
+      }
+      unsigned destStart = numOperands - destSize;
+
+      if (LLVM_UNLIKELY(oldNumResults > destStart)) {
+        LLVM_DEBUG(llvm::dbgs() << "  - Skipping: process has " << oldNumResults
+                                << " results, but wait yield segment would "
+                                   "overlap successor operands\n");
+        continue;
+      }
+
+      ValueRange oldYieldOperands =
+          waitOp->getOperands().slice(0, oldNumResults);
+
+      bool hasDelay =
+          (oldNumResults < destStart) &&
+          isa<TimeType>(waitOp->getOperand(oldNumResults).getType());
+      Value delay = hasDelay ? waitOp->getOperand(oldNumResults) : Value{};
+      unsigned observedStart = oldNumResults + (hasDelay ? 1 : 0);
+      if (LLVM_UNLIKELY(observedStart > destStart)) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "  - Skipping: invalid wait operand segmentation\n");
+        continue;
+      }
+      ValueRange observed =
+          waitOp->getOperands().slice(observedStart, destStart - observedStart);
+      ValueRange destOperands =
+          waitOp->getOperands().slice(destStart, destSize);
+
+      SmallVector<Value, 16> newYieldOperands;
+      newYieldOperands.reserve(oldYieldOperands.size() + extraYieldOperands.size());
+      llvm::append_range(newYieldOperands, oldYieldOperands);
+      llvm::append_range(newYieldOperands, extraYieldOperands);
+
+      OpBuilder termBuilder(waitOp);
+      termBuilder.setInsertionPoint(waitOp);
+      WaitOp::create(termBuilder, waitOp.getLoc(), newYieldOperands, delay,
+                     observed, destOperands, waitOp.getDest());
+      waitOp.erase();
+      continue;
+    }
+
+    if (auto haltOp = dyn_cast<HaltOp>(suspendOp)) {
+      SmallVector<Value, 16> newYieldOperands;
+      newYieldOperands.reserve(haltOp->getNumOperands() + extraYieldOperands.size());
+      llvm::append_range(newYieldOperands, haltOp.getYieldOperands());
+      llvm::append_range(newYieldOperands, extraYieldOperands);
+      OpBuilder termBuilder(haltOp);
+      termBuilder.setInsertionPoint(haltOp);
+      HaltOp::create(termBuilder, haltOp.getLoc(), newYieldOperands);
+      haltOp.erase();
+      continue;
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "  - Skipping: unsupported suspend op\n");
   }
 
   // Add process results corresponding to the added yield operands.
   SmallVector<Type> resultTypes(processOp->getResultTypes());
-  auto oldNumResults = resultTypes.size();
   auto addResultType = [&](DriveValue uniform, DriveValue nonUniform) {
     if (!uniform)
       resultTypes.push_back(nonUniform.getType());
   };
   for (auto slot : slots) {
-    auto &driveSet = driveSets[slot];
+    auto it = driveSets.find(slot);
+    if (it == driveSets.end())
+      continue;
+    auto &driveSet = it->second;
     auto operands = driveSet.operands.begin()->second;
     addResultType(driveSet.uniform.value, operands.value);
     addResultType(driveSet.uniform.delay, operands.delay);
@@ -649,7 +720,10 @@ void DriveHoister::hoistDrives() {
 
   auto trueAttr = builder.getBoolAttr(true);
   for (auto slot : slots) {
-    auto &driveSet = driveSets[slot];
+    auto it = driveSets.find(slot);
+    if (it == driveSets.end())
+      continue;
+    auto &driveSet = it->second;
 
     // Create the new drive outside of the process.
     auto value = useResultValue(driveSet.uniform.value);
