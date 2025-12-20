@@ -465,10 +465,21 @@ static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
         ImplicitLocOpBuilder builder(assign.getLoc(), assign);
         Value fieldHandle =
             builder.create<sv::StructFieldInOutOp>(baseValue, fieldAttr);
-        if (isInProceduralRegion(assign))
+        bool inProceduralRegion = isInProceduralRegion(assign);
+        bool inModuleBody = isa<hw::HWModuleOp>(assign->getParentOp());
+        if (inProceduralRegion) {
           builder.create<sv::BPAssignOp>(fieldHandle, assign.getRhs());
-        else
+        } else if (inModuleBody) {
+          // Structural assigns are equivalent to a continuous drive. Represent
+          // them as an epsilon-delayed LLHD drive to avoid leaving SV assigns
+          // to non-wire destinations for downstream passes.
+          auto epsilonDelay = llhd::ConstantTimeOp::create(
+              builder, assign.getLoc(), 0, "ns", 0, 1);
+          llhd::DrvOp::create(builder, assign.getLoc(), fieldHandle,
+                              assign.getRhs(), epsilonDelay, Value{});
+        } else {
           builder.create<sv::AssignOp>(fieldHandle, assign.getRhs());
+        }
         assign.erase();
         continue;
       }

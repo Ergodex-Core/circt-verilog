@@ -1160,6 +1160,48 @@ struct SigExtractOpConversion : public OpConversionPattern<llhd::SigExtractOp> {
   }
 };
 
+/// `sv.struct_field_inout` -> `hw.struct_extract` (drop inout semantics)
+struct StructFieldInOutOpConversion
+    : public OpConversionPattern<sv::StructFieldInOutOp> {
+  using OpConversionPattern<sv::StructFieldInOutOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(sv::StructFieldInOutOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<hw::StructType>(adaptor.getInput().getType()))
+      return rewriter.notifyMatchFailure(op, "expected struct input after conversion");
+    rewriter.replaceOpWithNewOp<hw::StructExtractOp>(op, adaptor.getInput(),
+                                                     op.getFieldAttr());
+    return success();
+  }
+};
+
+/// `sv.assign` -> erase (drop inout storage semantics)
+struct SVAssignOpConversion : public OpConversionPattern<sv::AssignOp> {
+  using OpConversionPattern<sv::AssignOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(sv::AssignOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// `sv.bpassign` -> erase (drop inout storage semantics)
+struct SVBPAssignOpConversion : public OpConversionPattern<sv::BPAssignOp> {
+  using OpConversionPattern<sv::BPAssignOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(sv::BPAssignOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 /// `llhd.wait` -> `arc.output` (surface the yielded values; drop scheduling)
 struct WaitOpConversion : public OpConversionPattern<llhd::WaitOp> {
   using OpConversionPattern<llhd::WaitOp>::OpConversionPattern;
@@ -1364,6 +1406,9 @@ void ConvertToArcsPass::runOnOperation() {
   patterns.add<ProbeOpConversion>(converter, &getContext());
   patterns.add<DrvOpConversion>(converter, &getContext());
   patterns.add<SigExtractOpConversion>(converter, &getContext());
+  patterns.add<StructFieldInOutOpConversion>(converter, &getContext());
+  patterns.add<SVAssignOpConversion>(converter, &getContext());
+  patterns.add<SVBPAssignOpConversion>(converter, &getContext());
   patterns.add<WaitOpConversion>(converter, &getContext());
   patterns.add<HaltOpConversion>(converter, &getContext());
 
@@ -1371,7 +1416,8 @@ void ConvertToArcsPass::runOnOperation() {
   ConversionTarget target(getContext());
   target.addIllegalDialect<llhd::LLHDDialect>();
   target.addIllegalOp<llhd::DrvOp, llhd::ProcessOp, llhd::SignalOp,
-                      llhd::WaitOp, llhd::PrbOp>();
+                      llhd::WaitOp, llhd::PrbOp, sv::StructFieldInOutOp,
+                      sv::AssignOp, sv::BPAssignOp>();
   target.markUnknownOpDynamicallyLegal(
       [](Operation *op) { return !isa<llhd::LLHDDialect>(op->getDialect()); });
 
