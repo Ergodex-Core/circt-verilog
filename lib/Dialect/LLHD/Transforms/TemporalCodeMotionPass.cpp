@@ -11,6 +11,7 @@
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
@@ -31,6 +32,464 @@ namespace llhd {
 
 using namespace circt;
 using namespace mlir;
+
+static bool isSimProcPrint(Operation *op) {
+  return op && op->getName().getStringRef() == "sim.proc.print";
+}
+
+static bool isSimTerminate(Operation *op) {
+  return op && op->getName().getStringRef() == "sim.terminate";
+}
+
+static bool isSimSideEffectOp(Operation *op) {
+  return isSimProcPrint(op) || isSimTerminate(op);
+}
+
+/// Return the `hw.constant` i1 value for `bit`.
+static Value getOrCreateI1Constant(OpBuilder &builder, Location loc, bool bit) {
+  return hw::ConstantOp::create(builder, loc, APInt(1, bit ? 1 : 0));
+}
+
+static bool isI1Constant(Value value, bool &bitOut) {
+  auto cst = value.getDefiningOp<hw::ConstantOp>();
+  if (!cst)
+    return false;
+  auto attr = dyn_cast<IntegerAttr>(cst.getValueAttr());
+  if (!attr)
+    return false;
+  auto intTy = dyn_cast<IntegerType>(attr.getType());
+  if (!intTy || intTy.getWidth() != 1)
+    return false;
+  bitOut = attr.getValue().isAllOnes();
+  return true;
+}
+
+/// Match `comb.xor(x, true)` (i.e. boolean NOT).
+static bool matchI1Not(Value maybeNot, Value &baseOut) {
+  auto xorOp = maybeNot.getDefiningOp<comb::XorOp>();
+  if (!xorOp)
+    return false;
+  SmallVector<Value, 2> inputs(xorOp.getInputs().begin(),
+                               xorOp.getInputs().end());
+  if (inputs.size() != 2)
+    return false;
+
+  bool bit = false;
+  if (isI1Constant(inputs[0], bit) && bit) {
+    baseOut = inputs[1];
+    return true;
+  }
+  if (isI1Constant(inputs[1], bit) && bit) {
+    baseOut = inputs[0];
+    return true;
+  }
+  return false;
+}
+
+/// Match `comb.and(not x, x)` / `comb.and(x, not x)` which is semantically
+/// false, but may arise when we lose edge-detection structure after rewriting
+/// waits/probes.
+static bool matchI1AndNotSelf(Value cond) {
+  auto andOp = cond.getDefiningOp<comb::AndOp>();
+  if (!andOp)
+    return false;
+  SmallVector<Value, 2> inputs(andOp.getInputs().begin(),
+                               andOp.getInputs().end());
+  if (inputs.size() != 2)
+    return false;
+
+  Value base;
+  if (matchI1Not(inputs[0], base) && base == inputs[1])
+    return true;
+  if (matchI1Not(inputs[1], base) && base == inputs[0])
+    return true;
+  return false;
+}
+
+/// Rewrite a boolean expression by treating any `~x & x` sub-expression as
+/// `true`. This is intentionally imprecise, and only used to keep sim side
+/// effects from being deleted due to wait/probe canonicalization artifacts.
+static Value rewriteBrokenEdgeCondition(Value value, Location loc,
+                                        OpBuilder &builder,
+                                        DenseMap<Value, Value> &memo) {
+  if (!value)
+    return {};
+
+  if (auto it = memo.find(value); it != memo.end())
+    return it->second;
+
+  // Only handle i1 expressions.
+  if (!value.getType().isSignlessInteger(1)) {
+    memo[value] = value;
+    return value;
+  }
+
+  if (matchI1AndNotSelf(value)) {
+    Value trueVal = getOrCreateI1Constant(builder, loc, /*bit=*/true);
+    memo[value] = trueVal;
+    return trueVal;
+  }
+
+  if (auto andOp = value.getDefiningOp<comb::AndOp>()) {
+    // AND: drop `true` operands, short-circuit on `false`.
+    SmallVector<Value, 4> filtered;
+    for (Value input : andOp.getInputs()) {
+      Value rewritten = rewriteBrokenEdgeCondition(input, loc, builder, memo);
+      bool bit = false;
+      if (isI1Constant(rewritten, bit)) {
+        if (!bit) {
+          Value falseVal = getOrCreateI1Constant(builder, loc, /*bit=*/false);
+          memo[value] = falseVal;
+          return falseVal;
+        }
+        continue;
+      }
+      filtered.push_back(rewritten);
+    }
+    if (filtered.empty()) {
+      Value trueVal = getOrCreateI1Constant(builder, loc, /*bit=*/true);
+      memo[value] = trueVal;
+      return trueVal;
+    }
+    Value acc = filtered[0];
+    for (Value v : llvm::drop_begin(filtered, 1))
+      acc = comb::AndOp::create(builder, loc, acc, v).getResult();
+    memo[value] = acc;
+    return acc;
+  }
+
+  if (auto orOp = value.getDefiningOp<comb::OrOp>()) {
+    // OR: drop `false` operands, short-circuit on `true`.
+    SmallVector<Value, 4> filtered;
+    for (Value input : orOp.getInputs()) {
+      Value rewritten = rewriteBrokenEdgeCondition(input, loc, builder, memo);
+      bool bit = false;
+      if (isI1Constant(rewritten, bit)) {
+        if (bit) {
+          Value trueVal = getOrCreateI1Constant(builder, loc, /*bit=*/true);
+          memo[value] = trueVal;
+          return trueVal;
+        }
+        continue;
+      }
+      filtered.push_back(rewritten);
+    }
+    if (filtered.empty()) {
+      Value falseVal = getOrCreateI1Constant(builder, loc, /*bit=*/false);
+      memo[value] = falseVal;
+      return falseVal;
+    }
+    Value acc = filtered[0];
+    for (Value v : llvm::drop_begin(filtered, 1))
+      acc = comb::OrOp::create(builder, loc, acc, v).getResult();
+    memo[value] = acc;
+    return acc;
+  }
+
+  if (auto xorOp = value.getDefiningOp<comb::XorOp>()) {
+    // XOR: fold constants where possible (binary/variadic).
+    SmallVector<Value, 4> inputs;
+    bool parity = false;
+    for (Value input : xorOp.getInputs()) {
+      Value rewritten = rewriteBrokenEdgeCondition(input, loc, builder, memo);
+      bool bit = false;
+      if (isI1Constant(rewritten, bit)) {
+        parity ^= bit;
+        continue;
+      }
+      inputs.push_back(rewritten);
+    }
+    if (inputs.empty()) {
+      Value cst = getOrCreateI1Constant(builder, loc, parity);
+      memo[value] = cst;
+      return cst;
+    }
+    Value acc = inputs[0];
+    for (Value v : llvm::drop_begin(inputs, 1))
+      acc = comb::XorOp::create(builder, loc, acc, v).getResult();
+    if (parity) {
+      Value one = getOrCreateI1Constant(builder, loc, /*bit=*/true);
+      acc = comb::XorOp::create(builder, loc, acc, one).getResult();
+    }
+    memo[value] = acc;
+    return acc;
+  }
+
+  memo[value] = value;
+  return value;
+}
+
+struct ClockStripInfo {
+  Value simplified;
+  bool onlyObserved = false;
+  bool hasObserved = false;
+};
+
+/// Simplify a boolean (i1) expression by replacing any sub-expression that
+/// depends *only* on `observedValues` (and constants) with `true`.
+///
+/// This is used to drop time/clock gating when preserving sim side effects
+/// inside monitor-only processes, since arcilator's current LLHD->Arc
+/// conversion does not model `llhd.wait` scheduling.
+static ClockStripInfo stripClockOnlyConditions(
+    Value value, const DenseSet<Value> &observedValues, OpBuilder &builder,
+    DenseMap<Value, ClockStripInfo> &memo) {
+  if (!value)
+    return {};
+
+  if (auto it = memo.find(value); it != memo.end())
+    return it->second;
+
+  ClockStripInfo result;
+
+  // Constants are "onlyObserved" (depend on no non-observed values), but do not
+  // count as observed-dependent.
+  bool cstBit = false;
+  if (isI1Constant(value, cstBit)) {
+    result.simplified = value;
+    result.onlyObserved = true;
+    result.hasObserved = false;
+    memo[value] = result;
+    return result;
+  }
+
+  // Treat the values we explicitly tracked (wait observed signals and their
+  // loop-carried block arguments) as clock-only sources.
+  if (observedValues.contains(value)) {
+    result.simplified = value;
+    result.onlyObserved = true;
+    result.hasObserved = true;
+    memo[value] = result;
+    return result;
+  }
+
+  // For non-tracked block arguments, conservatively assume non-clock data.
+  if (isa<BlockArgument>(value)) {
+    result.simplified = value;
+    result.onlyObserved = false;
+    result.hasObserved = false;
+    memo[value] = result;
+    return result;
+  }
+
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp) {
+    result.simplified = value;
+    result.onlyObserved = false;
+    result.hasObserved = false;
+    memo[value] = result;
+    return result;
+  }
+
+  auto simplifyBinaryBool =
+      [&](Value lhs, Value rhs,
+          function_ref<Value(Location, Value, Value)> mkOp) -> ClockStripInfo {
+    auto lhsInfo = stripClockOnlyConditions(lhs, observedValues, builder, memo);
+    auto rhsInfo = stripClockOnlyConditions(rhs, observedValues, builder, memo);
+
+    bool onlyObserved = lhsInfo.onlyObserved && rhsInfo.onlyObserved;
+    bool hasObserved = lhsInfo.hasObserved || rhsInfo.hasObserved;
+
+    Value simplifiedLhs = lhsInfo.simplified;
+    Value simplifiedRhs = rhsInfo.simplified;
+
+    // If the entire subtree depends only on observed values, drop it.
+    if (onlyObserved && hasObserved) {
+      ClockStripInfo info;
+      info.simplified =
+          getOrCreateI1Constant(builder, defOp->getLoc(), /*bit=*/true);
+      info.onlyObserved = true;
+      info.hasObserved = false;
+      return info;
+    }
+
+    // Fold simple boolean constants.
+    bool lhsBit = false, rhsBit = false;
+    if (isI1Constant(simplifiedLhs, lhsBit) &&
+        isI1Constant(simplifiedRhs, rhsBit)) {
+      // Let MLIR fold it via mkOp so we don't duplicate truth tables.
+      ClockStripInfo info;
+      info.simplified = mkOp(defOp->getLoc(), simplifiedLhs, simplifiedRhs);
+      info.onlyObserved = true;
+      info.hasObserved = false;
+      return info;
+    }
+
+    ClockStripInfo info;
+    info.simplified = mkOp(defOp->getLoc(), simplifiedLhs, simplifiedRhs);
+    info.onlyObserved = onlyObserved;
+    info.hasObserved = hasObserved;
+    return info;
+  };
+
+  if (auto andOp = dyn_cast<comb::AndOp>(defOp)) {
+    SmallVector<Value, 2> inputs(andOp.getInputs().begin(),
+                                 andOp.getInputs().end());
+    if (inputs.size() != 2) {
+      result.simplified = value;
+      result.onlyObserved = false;
+      result.hasObserved = false;
+      memo[value] = result;
+      return result;
+    }
+    result = simplifyBinaryBool(
+        inputs[0], inputs[1],
+        [&](Location loc, Value lhs, Value rhs) -> Value {
+          // AND identity/annihilator
+          bool lhsBit = false, rhsBit = false;
+          if (isI1Constant(lhs, lhsBit)) {
+            if (!lhsBit)
+              return getOrCreateI1Constant(builder, loc, false);
+            return rhs;
+          }
+          if (isI1Constant(rhs, rhsBit)) {
+            if (!rhsBit)
+              return getOrCreateI1Constant(builder, loc, false);
+            return lhs;
+          }
+          return comb::AndOp::create(builder, loc, lhs, rhs).getResult();
+        });
+    memo[value] = result;
+    return result;
+  }
+
+  if (auto orOp = dyn_cast<comb::OrOp>(defOp)) {
+    SmallVector<Value, 2> inputs(orOp.getInputs().begin(), orOp.getInputs().end());
+    if (inputs.size() != 2) {
+      result.simplified = value;
+      result.onlyObserved = false;
+      result.hasObserved = false;
+      memo[value] = result;
+      return result;
+    }
+    result = simplifyBinaryBool(
+        inputs[0], inputs[1],
+        [&](Location loc, Value lhs, Value rhs) -> Value {
+          // OR identity/annihilator
+          bool lhsBit = false, rhsBit = false;
+          if (isI1Constant(lhs, lhsBit)) {
+            if (lhsBit)
+              return getOrCreateI1Constant(builder, loc, true);
+            return rhs;
+          }
+          if (isI1Constant(rhs, rhsBit)) {
+            if (rhsBit)
+              return getOrCreateI1Constant(builder, loc, true);
+            return lhs;
+          }
+          return comb::OrOp::create(builder, loc, lhs, rhs).getResult();
+        });
+    memo[value] = result;
+    return result;
+  }
+
+  if (auto xorOp = dyn_cast<comb::XorOp>(defOp)) {
+    SmallVector<Value, 2> inputs(xorOp.getInputs().begin(),
+                                 xorOp.getInputs().end());
+    if (inputs.size() != 2) {
+      result.simplified = value;
+      result.onlyObserved = false;
+      result.hasObserved = false;
+      memo[value] = result;
+      return result;
+    }
+    result = simplifyBinaryBool(
+        inputs[0], inputs[1],
+        [&](Location loc, Value lhs, Value rhs) -> Value {
+          bool rhsBit = false;
+          if (isI1Constant(rhs, rhsBit)) {
+            if (!rhsBit)
+              return lhs;
+            return comb::XorOp::create(builder, loc, lhs,
+                                       getOrCreateI1Constant(builder, loc, true))
+                .getResult();
+          }
+          bool lhsBit = false;
+          if (isI1Constant(lhs, lhsBit)) {
+            if (!lhsBit)
+              return rhs;
+            return comb::XorOp::create(builder, loc, rhs,
+                                       getOrCreateI1Constant(builder, loc, true))
+                .getResult();
+          }
+          return comb::XorOp::create(builder, loc, lhs, rhs).getResult();
+        });
+    memo[value] = result;
+    return result;
+  }
+
+  // Conservatively keep unknown boolean producers.
+  result.simplified = value;
+  result.onlyObserved = false;
+  result.hasObserved = false;
+  memo[value] = result;
+  return result;
+}
+
+/// Clone a value into the target block if it is defined in a different block
+/// of the same region. This is a best-effort helper for preserving the
+/// definitions of branch conditions when structuralizing a process.
+static Value cloneValueIntoBlock(Value value, OpBuilder &builder,
+                                 Block *targetBlock, IRMapping &mapping,
+                                 SmallPtrSetImpl<Operation *> &onStack) {
+  if (!value)
+    return {};
+
+  if (auto mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  // Block arguments dominate all blocks in the region.
+  if (isa<BlockArgument>(value))
+    return value;
+
+  auto *defOp = value.getDefiningOp();
+  if (!defOp)
+    return value;
+
+  // Only clone values defined in the same region. Values defined outside the
+  // region already dominate the region.
+  if (defOp->getParentRegion() != targetBlock->getParent())
+    return value;
+
+  // If already in the target block, nothing to do.
+  if (defOp->getBlock() == targetBlock)
+    return value;
+
+  // Do not clone ops with regions; this is intended for leaf, SSA-based
+  // computations such as comb/hw/llhd probes.
+  if (defOp->getNumRegions() != 0)
+    return {};
+
+  // LLHD probes/signals carry memory effects but are safe to clone for branch
+  // condition reconstruction. Allow those through.
+  bool allowSideEffects =
+      isa<llhd::PrbOp>(defOp) || isa<llhd::SignalOp>(defOp);
+  if (!isMemoryEffectFree(defOp) && !allowSideEffects)
+    return {};
+
+  // Cycle breaker.
+  if (!onStack.insert(defOp).second)
+    return {};
+
+  // Clone operands first.
+  for (Value operand : defOp->getOperands()) {
+    Value mappedOperand =
+        cloneValueIntoBlock(operand, builder, targetBlock, mapping, onStack);
+    if (!mappedOperand)
+      return {};
+    mapping.map(operand, mappedOperand);
+  }
+
+  Operation *cloned = builder.clone(*defOp, mapping);
+  onStack.erase(defOp);
+
+  auto opResult = dyn_cast<OpResult>(value);
+  if (!opResult)
+    return {};
+  Value clonedResult = cloned->getResult(opResult.getResultNumber());
+  mapping.map(value, clonedResult);
+  return clonedResult;
+}
 
 /// Find an `llhd.prb` in the parent graph region (outside any process) which
 /// probes `signal`, or create a new one. Returns the probed value.
@@ -291,7 +750,9 @@ static LogicalResult canonicalizeWaitLoop(llhd::ProcessOp procOp) {
 static Value
 getBranchDecisionsFromDominatorToTarget(OpBuilder &builder, Block *driveBlock,
                                         Block *dominator,
-                                        DenseMap<Block *, Value> &mem) {
+                                        DenseMap<Block *, Value> &mem,
+                                        IRMapping &clonedValues,
+                                        SmallPtrSetImpl<Operation *> &onStack) {
   Location loc = driveBlock->getTerminator()->getLoc();
   if (mem.count(driveBlock))
     return mem[driveBlock];
@@ -325,7 +786,11 @@ getBranchDecisionsFromDominatorToTarget(OpBuilder &builder, Block *driveBlock,
     for (auto *predBlock : curr->getPredecessors()) {
       if (predBlock->getTerminator()->getNumSuccessors() != 1) {
         auto condBr = cast<cf::CondBranchOp>(predBlock->getTerminator());
-        Value cond = condBr.getCondition();
+        Value cond = cloneValueIntoBlock(condBr.getCondition(), builder,
+                                         builder.getBlock(), clonedValues,
+                                         onStack);
+        if (!cond)
+          cond = condBr.getCondition();
         if (condBr.getFalseDest() == curr) {
           Value trueVal = hw::ConstantOp::create(builder, loc, APInt(1, 1));
           cond = comb::XorOp::create(builder, loc, cond, trueVal);
@@ -347,7 +812,9 @@ getBranchDecisionsFromDominatorToTarget(OpBuilder &builder, Block *driveBlock,
 /// the 'enable' operand.
 static void moveDriveOpBefore(llhd::DrvOp drvOp, Block *dominator,
                               Operation *moveBefore,
-                              DenseMap<Block *, Value> &mem) {
+                              DenseMap<Block *, Value> &mem,
+                              IRMapping &clonedValues,
+                              SmallPtrSetImpl<Operation *> &onStack) {
   OpBuilder builder(drvOp);
   builder.setInsertionPoint(moveBefore);
   Block *drvParentBlock = drvOp->getBlock();
@@ -355,7 +822,7 @@ static void moveDriveOpBefore(llhd::DrvOp drvOp, Block *dominator,
   // Find sequence of branch decisions and add them as a sequence of
   // instructions to the TR exiting block
   Value finalValue = getBranchDecisionsFromDominatorToTarget(
-      builder, drvParentBlock, dominator, mem);
+      builder, drvParentBlock, dominator, mem, clonedValues, onStack);
 
   if (drvOp.getEnable())
     finalValue = comb::AndOp::create(builder, drvOp.getLoc(), drvOp.getEnable(),
@@ -423,6 +890,19 @@ static LogicalResult checkForCFGLoop(llhd::ProcessOp procOp) {
 }
 
 LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
+  // Collect simulation side-effect ops (e.g. from `$display/$fatal/$error`)
+  // that we may want to preserve when a process has no drives and would
+  // otherwise be optimized away.
+  SmallVector<Operation *> simSideEffectOps;
+  bool hasDrv = false;
+  procOp.walk([&](Operation *op) {
+    if (isa<llhd::DrvOp>(op))
+      hasDrv = true;
+    if (isSimSideEffectOp(op))
+      simSideEffectOps.push_back(op);
+  });
+  bool preserveSimSideEffects = !hasDrv && !simSideEffectOps.empty();
+
   // Make sure there are no CFG loops that don't contain a block with a wait
   // terminator in the cycle because that's currently not supported by the
   // temporal region analysis and this pass.
@@ -482,7 +962,7 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
     (void)numTRSuccs;
     // NOTE: Above error checks make this impossible to trigger, but the above
     // are changed this one might have to be promoted to a proper error message.
-    assert((numTRSuccs == 1 ||
+    assert((numTRSuccs == 0 || numTRSuccs == 1 ||
             (numTRSuccs == 2 && trAnalysis.isOwnTRSuccessor(currTR))) &&
            "only TRs with a single TR as possible successor are "
            "supported for now.");
@@ -534,6 +1014,8 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
 
   for (unsigned currTR = 0; currTR < numTRs; ++currTR) {
     DenseMap<Block *, Value> mem;
+    IRMapping clonedValues;
+    SmallPtrSet<Operation *, 32> cloneStack;
 
     // We ensured this in the previous phase above.
     assert(trAnalysis.getExitingBlocksInTR(currTR).size() == 1);
@@ -582,7 +1064,8 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
       builder.setInsertionPoint(moveBefore);
       SmallVector<llhd::DrvOp> drives(block->getOps<llhd::DrvOp>());
       for (auto drive : drives)
-        moveDriveOpBefore(drive, dominator, moveBefore, mem);
+        moveDriveOpBefore(drive, dominator, moveBefore, mem, clonedValues,
+                          cloneStack);
 
       for (Block *succ : block->getSuccessors()) {
         if (succ == exitingBlock ||
@@ -594,6 +1077,94 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
             }))
           workQueue.push(succ);
       }
+    }
+
+    // If this process has no drives, preserve simulation side-effect ops by
+    // cloning them into the current TR's exit block under the reachability
+    // condition from the TR entry. This prevents `$display/$fatal/$error`
+    // statements in "monitor-only" always blocks from being dropped.
+    if (preserveSimSideEffects) {
+      SmallVector<Operation *> toErase;
+      OpBuilder seBuilder(procOp.getContext());
+      seBuilder.setInsertionPoint(moveBefore);
+
+      // Use the TR entry as dominator when reconstructing reachability.
+      Block *reachDominator = entryBlock;
+
+      // Collect wait-observed values (and their loop-carried block args) as
+      // "clock-only" inputs; we will strip them from the enable conditions.
+      DenseSet<Value> observedValues;
+      DenseSet<Value> observedSignals;
+      procOp.walk([&](llhd::WaitOp waitOp) {
+        for (Value observed : waitOp.getObserved()) {
+          observedValues.insert(observed);
+          if (auto prb = observed.getDefiningOp<llhd::PrbOp>())
+            observedSignals.insert(prb.getSignal());
+        }
+        Block *succ = waitOp.getSuccessor();
+        if (!succ)
+          return;
+        for (BlockArgument arg : succ->getArguments())
+          observedValues.insert(arg);
+      });
+      // Also treat *all* probes of the observed signals as clock-only. This
+      // ensures edge-detection patterns like `~old & new` (which use multiple
+      // probes of the same signal) get stripped before later rewrites (such as
+      // canonicalizeWaitLoop) fold them into an impossible `~x & x` predicate.
+      if (!observedSignals.empty()) {
+        procOp.walk([&](llhd::PrbOp prb) {
+          if (observedSignals.contains(prb.getSignal()))
+            observedValues.insert(prb.getResult());
+        });
+      }
+      DenseMap<Value, ClockStripInfo> clockStripMemo;
+
+      for (Operation *sideOp : simSideEffectOps) {
+        if (!sideOp || sideOp->getParentOp() != procOp)
+          continue;
+        if (trAnalysis.getBlockTR(sideOp->getBlock()) !=
+            static_cast<int>(currTR))
+          continue;
+
+        Value enable = getBranchDecisionsFromDominatorToTarget(
+            seBuilder, sideOp->getBlock(), reachDominator, mem, clonedValues,
+            cloneStack);
+
+        // Drop any gating that depends only on the wait-observed values. This
+        // effectively treats sys tasks as being evaluated on each `eval()` step
+        // in the current arcilator model, which is sufficient for interactive
+        // debugging and avoids clock-gating being folded to false.
+        auto stripped =
+            stripClockOnlyConditions(enable, observedValues, seBuilder,
+                                     clockStripMemo);
+        if (stripped.simplified)
+          enable = stripped.simplified;
+
+        // Clone side-op operands into the exit block so they stay live after
+        // we drop intermediate blocks.
+        for (Value operand : sideOp->getOperands()) {
+          Value cloned = cloneValueIntoBlock(operand, seBuilder,
+                                             seBuilder.getBlock(), clonedValues,
+                                             cloneStack);
+          if (!cloned)
+            cloned = operand;
+          if (!clonedValues.lookupOrNull(operand))
+            clonedValues.map(operand, cloned);
+        }
+
+        // Create `scf.if` guarding the cloned side effect.
+        auto ifOp =
+            scf::IfOp::create(seBuilder, sideOp->getLoc(), enable, false);
+        Block &thenBlock = ifOp.getThenRegion().front();
+        OpBuilder thenBuilder(&thenBlock,
+                              thenBlock.getTerminator()->getIterator());
+
+        thenBuilder.clone(*sideOp, clonedValues);
+        toErase.push_back(sideOp);
+      }
+
+      for (Operation *op : toErase)
+        op->erase();
     }
 
     // Merge entry and exit block of each TR, remove all other blocks
@@ -658,6 +1229,31 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
   // it into a single wait loop that is friendlier to drive hoisting and
   // desequentialization. Ignore processes that do not match the pattern.
   (void)canonicalizeWaitLoop(procOp);
+
+  // canonicalizeWaitLoop replaces multiple `llhd.prb` ops of an observed signal
+  // with a single graph probe. If we already cloned sim side effects into a
+  // unified exit block and structuralized control flow with `scf.if`, this can
+  // collapse edge-detection predicates into an impossible `~x & x` form. For
+  // interactive `$display/$fatal/$error`, prefer executing the side effect
+  // rather than dropping it.
+  procOp.walk([&](scf::IfOp ifOp) {
+    bool hasSimSideEffects = false;
+    ifOp.getThenRegion().walk([&](Operation *op) {
+      if (isSimSideEffectOp(op))
+        hasSimSideEffects = true;
+    });
+    if (!hasSimSideEffects)
+      return;
+
+    OpBuilder builder(ifOp);
+    builder.setInsertionPoint(ifOp);
+    DenseMap<Value, Value> memo;
+    Value newCond =
+        rewriteBrokenEdgeCondition(ifOp.getCondition(), ifOp.getLoc(), builder,
+                                   memo);
+    if (newCond && newCond != ifOp.getCondition())
+      ifOp.getConditionMutable().assign(newCond);
+  });
 
   return success();
 }

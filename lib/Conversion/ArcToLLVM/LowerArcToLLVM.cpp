@@ -14,6 +14,7 @@
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Support/ConversionPatternSet.h"
 #include "circt/Support/Namespace.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -695,6 +696,11 @@ void LowerArcToLLVMPass::runOnOperation() {
   LLVMConversionTarget target(getContext());
   target.addLegalOp<mlir::ModuleOp>();
   target.addLegalOp<scf::YieldOp>(); // quirk of SCF dialect conversion
+  // Keep Sim formatting/printing ops around until `sim-lower-console` runs.
+  target.addLegalOp<sim::FormatLitOp, sim::FormatDecOp, sim::FormatHexOp,
+                    sim::FormatBinOp, sim::FormatCharOp,
+                    sim::FormatStringConcatOp, sim::PrintFormattedProcOp,
+                    sim::TerminateOp>();
 
   // Setup the arc dialect type conversion.
   LLVMTypeConverter converter(&getContext());

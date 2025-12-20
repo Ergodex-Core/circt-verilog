@@ -732,6 +732,9 @@ void circt::populateHWToLLVMTypeConversions(LLVMTypeConverter &converter) {
       [&](hw::ArrayType arr) { return convertArrayType(arr, converter); });
   converter.addConversion(
       [&](hw::StructType tup) { return convertStructType(tup, converter); });
+  converter.addConversion([&](hw::InOutType inout) {
+    return converter.convertType(inout.getElementType());
+  });
 }
 
 void HWToLLVMLoweringPass::runOnOperation() {

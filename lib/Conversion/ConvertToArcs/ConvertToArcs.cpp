@@ -8,6 +8,7 @@
 
 #include "circt/Conversion/ConvertToArcs.h"
 #include "circt/Dialect/Arc/ArcOps.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDTypes.h"
@@ -18,6 +19,7 @@
 #include "circt/Support/Namespace.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
@@ -64,6 +66,329 @@ static LogicalResult convertInitialValue(seq::CompRegOp reg,
 //===----------------------------------------------------------------------===//
 // LLHD pre-lowering
 //===----------------------------------------------------------------------===//
+
+static bool isEpsilonTime(Value time) {
+  auto timeOp = time.getDefiningOp<llhd::ConstantTimeOp>();
+  if (!timeOp)
+    return false;
+  auto delay = timeOp.getValueAttr();
+  return delay.getTime() == 0 && delay.getDelta() == 0 && delay.getEpsilon() == 1;
+}
+
+static std::optional<uint64_t> getConstantLowBit(Value value) {
+  if (auto cst = value.getDefiningOp<hw::ConstantOp>())
+    return cst.getValue().getZExtValue();
+  return std::nullopt;
+}
+
+static bool isCloneableConstant(Value value) {
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp || !defOp->hasTrait<OpTrait::ConstantLike>())
+    return false;
+  if (defOp->getNumOperands() != 0 || defOp->getNumRegions() != 0)
+    return false;
+  return true;
+}
+
+static LogicalResult
+cloneExternalConstantsIntoProcess(llhd::ProcessOp proc,
+                                  ArrayRef<Value> externalValues) {
+  if (externalValues.empty())
+    return success();
+  if (proc.getBody().empty())
+    return failure();
+
+  Block &entry = proc.getBody().front();
+  OpBuilder builder(&entry, entry.begin());
+
+  DenseMap<Operation *, Operation *> clonedOps;
+  DenseMap<Value, Value> valueMap;
+  for (Value value : externalValues) {
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      return failure();
+    Operation *&clonedOp = clonedOps[defOp];
+    if (!clonedOp) {
+      clonedOp = builder.clone(*defOp);
+      for (auto [from, to] :
+           llvm::zip(defOp->getResults(), clonedOp->getResults()))
+        valueMap.try_emplace(from, to);
+    }
+  }
+
+  proc.getBody().walk([&](Operation *op) {
+    for (OpOperand &operand : op->getOpOperands()) {
+      auto it = valueMap.find(operand.get());
+      if (it != valueMap.end())
+        operand.set(it->second);
+    }
+  });
+
+  return success();
+}
+
+static LogicalResult convertOneShotProcessToInitial(llhd::ProcessOp proc) {
+  if (proc.getNumResults() != 0)
+    return failure();
+  if (!proc.getOps<llhd::WaitOp>().empty())
+    return failure();
+
+  // `seq.initial` cannot capture arbitrary values from above. Only convert this
+  // process if it depends solely on constant-like values (which we can clone
+  // into the region).
+  SetVector<Value> externalValues;
+  mlir::getUsedValuesDefinedAbove(proc.getBody(), externalValues);
+  for (Value v : externalValues)
+    if (!isCloneableConstant(v))
+      return failure();
+
+  // All exit paths must be a `llhd.halt` without yields.
+  for (auto halt : proc.getOps<llhd::HaltOp>())
+    if (!halt.getYieldOperands().empty())
+      return failure();
+
+  if (failed(cloneExternalConstantsIntoProcess(proc, externalValues.getArrayRef())))
+    return failure();
+
+  // Ensure no external values remain after cloning constants.
+  externalValues.clear();
+  mlir::getUsedValuesDefinedAbove(proc.getBody(), externalValues);
+  if (!externalValues.empty())
+    return failure();
+
+  OpBuilder builder(proc);
+  auto loc = proc.getLoc();
+  seq::InitialOp::create(builder, loc, TypeRange{}, [&]() {
+    auto exec = mlir::scf::ExecuteRegionOp::create(builder, loc, TypeRange{});
+    exec.getRegion().takeBody(proc.getBody());
+    SmallVector<llhd::HaltOp> halts;
+    exec.walk([&](llhd::HaltOp halt) { halts.push_back(halt); });
+    for (auto halt : halts) {
+      OpBuilder b(halt);
+      mlir::scf::YieldOp::create(b, halt.getLoc());
+      halt.erase();
+    }
+    seq::YieldOp::create(builder, loc);
+  });
+
+  proc.erase();
+  return success();
+}
+
+/// Best-effort lowering for "simple" LLHD signal semantics within a single
+/// `llhd.process` (commonly used for `initial` blocks without delays). This
+/// rewrites `llhd.prb`/`llhd.drv`/`llhd.sig.extract` to pure SSA updates within
+/// the process region so that later conversions do not have to model inout
+/// storage for these cases.
+static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
+  if (!proc.getBody().hasOneBlock())
+    return failure();
+
+  Block &block = proc.getBody().front();
+  if (!proc.getOps<llhd::WaitOp>().empty())
+    return failure();
+
+  auto module = proc->getParentOfType<hw::HWModuleOp>();
+  if (!module)
+    return failure();
+
+  DenseMap<Value, llhd::SignalOp> signalOps;
+  for (auto sig : module.getOps<llhd::SignalOp>())
+    signalOps.try_emplace(sig.getResult(), sig);
+
+  // Collect LLHD signal values used in this process and ensure they are not
+  // referenced elsewhere. This transformation does not model cross-process
+  // storage semantics.
+  llvm::SmallDenseSet<Value, 8> baseSignals;
+  SmallVector<llhd::SigExtractOp> extracts;
+  SmallVector<llhd::DrvOp> drives;
+  SmallVector<llhd::PrbOp> probes;
+  SmallVector<llhd::ConstantTimeOp> times;
+
+  for (Operation &op : block) {
+    if (auto ex = dyn_cast<llhd::SigExtractOp>(op)) {
+      extracts.push_back(ex);
+      baseSignals.insert(ex.getInput());
+    } else if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
+      drives.push_back(drv);
+      if (auto timeOp = drv.getTime().getDefiningOp<llhd::ConstantTimeOp>())
+        times.push_back(timeOp);
+    } else if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
+      probes.push_back(prb);
+    } else if (isa<llhd::WaitOp>(op)) {
+      return failure();
+    }
+  }
+
+  struct AliasInfo {
+    Value base;
+    uint64_t offset = 0;
+    unsigned width = 0;
+  };
+  DenseMap<Value, AliasInfo> aliasInfo;
+
+  for (llhd::SigExtractOp ex : extracts) {
+    for (OpOperand &use : ex.getResult().getUses()) {
+      if (!proc->isAncestor(use.getOwner()))
+        return failure();
+      if (!isa<llhd::PrbOp, llhd::DrvOp>(use.getOwner()))
+        return failure();
+    }
+
+    auto lowBit = getConstantLowBit(ex.getLowBit());
+    if (!lowBit)
+      return failure();
+
+    auto inoutTy = dyn_cast<hw::InOutType>(ex.getResult().getType());
+    if (!inoutTy)
+      return failure();
+    auto elemTy = dyn_cast<IntegerType>(inoutTy.getElementType());
+    if (!elemTy)
+      return failure();
+
+    aliasInfo[ex.getResult()] = {ex.getInput(), *lowBit,
+                                 static_cast<unsigned>(elemTy.getWidth())};
+  }
+
+  // Now that aliasInfo is known, collect base signal references.
+  for (llhd::SigExtractOp ex : extracts)
+    baseSignals.insert(ex.getInput());
+  for (llhd::DrvOp drv : drives) {
+    Value sig = drv.getSignal();
+    if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end())
+      baseSignals.insert(alias->second.base);
+    else
+      baseSignals.insert(sig);
+  }
+  for (llhd::PrbOp prb : probes) {
+    Value sig = prb.getSignal();
+    if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end())
+      baseSignals.insert(alias->second.base);
+    else
+      baseSignals.insert(sig);
+  }
+
+  for (Value base : baseSignals) {
+    auto it = signalOps.find(base);
+    if (it == signalOps.end())
+      return failure();
+
+    for (OpOperand &use : base.getUses()) {
+      if (!proc->isAncestor(use.getOwner()))
+        return failure();
+      if (!isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp>(use.getOwner()))
+        return failure();
+    }
+  }
+
+  for (llhd::DrvOp drv : drives) {
+    if (drv.getEnable())
+      return failure();
+    if (!isEpsilonTime(drv.getTime()))
+      return failure();
+  }
+
+  DenseMap<Value, Value> current;
+  auto getCurrent = [&](OpBuilder &builder, Location loc, Value base) -> Value {
+    if (auto it = current.find(base); it != current.end())
+      return it->second;
+    auto sigIt = signalOps.find(base);
+    if (sigIt == signalOps.end())
+      return {};
+    Value init = sigIt->second.getInit();
+    current[base] = init;
+    return init;
+  };
+
+  SmallVector<Operation *> toErase;
+  OpBuilder builder(proc);
+  for (Operation &op : llvm::make_early_inc_range(block)) {
+    if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
+      builder.setInsertionPoint(prb);
+      Location loc = prb.getLoc();
+      Value sig = prb.getSignal();
+      Value replacement;
+      if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
+        Value baseCur = getCurrent(builder, loc, alias->second.base);
+        if (!baseCur)
+          return failure();
+        replacement = builder.createOrFold<comb::ExtractOp>(
+            loc, builder.getIntegerType(alias->second.width), baseCur,
+            alias->second.offset);
+      } else {
+        replacement = getCurrent(builder, loc, sig);
+        if (!replacement)
+          return failure();
+      }
+      prb.replaceAllUsesWith(replacement);
+      toErase.push_back(prb);
+      continue;
+    }
+
+    if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
+      builder.setInsertionPoint(drv);
+      Location loc = drv.getLoc();
+      Value sig = drv.getSignal();
+      Value value = drv.getValue();
+      if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
+        Value base = alias->second.base;
+        Value baseCur = getCurrent(builder, loc, base);
+        if (!baseCur)
+          return failure();
+        auto baseTy = dyn_cast<IntegerType>(baseCur.getType());
+        auto valTy = dyn_cast<IntegerType>(value.getType());
+        if (!baseTy || !valTy)
+          return failure();
+
+        unsigned bw = baseTy.getWidth();
+        unsigned sliceWidth = alias->second.width;
+        uint64_t offset = alias->second.offset;
+        if (sliceWidth == 0 || bw == 0 || sliceWidth > bw ||
+            offset + sliceWidth > bw)
+          return failure();
+
+        APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(bw) << offset;
+        APInt clearMask = APInt::getAllOnes(bw) ^ sliceMask;
+        Value clearCst = hw::ConstantOp::create(
+            builder, loc, builder.getIntegerAttr(baseTy, clearMask));
+        Value cleared = builder.createOrFold<comb::AndOp>(loc, baseCur, clearCst);
+
+        Value widened = value;
+        if (bw > sliceWidth) {
+          Value pad = hw::ConstantOp::create(
+              builder, loc,
+              builder.getIntegerAttr(builder.getIntegerType(bw - sliceWidth), 0));
+          widened = builder.createOrFold<comb::ConcatOp>(loc, pad, widened);
+        }
+
+        Value shiftAmt =
+            hw::ConstantOp::create(builder, loc, builder.getIntegerType(bw), offset);
+        Value shifted = builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
+        Value updated = builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
+        current[base] = updated;
+      } else {
+        current[sig] = value;
+      }
+      toErase.push_back(drv);
+      continue;
+    }
+  }
+
+  for (Operation *op : toErase)
+    op->erase();
+
+  for (llhd::SigExtractOp ex : llvm::make_early_inc_range(extracts)) {
+    if (ex.getResult().use_empty())
+      ex.erase();
+  }
+
+  for (llhd::ConstantTimeOp timeOp : llvm::make_early_inc_range(times)) {
+    if (timeOp->use_empty())
+      timeOp.erase();
+  }
+
+  return success();
+}
 
 static Value cloneValueIntoModule(Value value, OpBuilder &builder,
                                   IRMapping &mapping) {
@@ -801,6 +1126,40 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
   }
 };
 
+/// `llhd.sig.extract` -> approximate lowering to `comb.extract` when the low
+/// bit is constant (the inout-ness is dropped by the type converter).
+struct SigExtractOpConversion : public OpConversionPattern<llhd::SigExtractOp> {
+  using OpConversionPattern<llhd::SigExtractOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::SigExtractOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getResult().use_empty()) {
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    auto lowBit = getConstantLowBit(op.getLowBit());
+    if (!lowBit)
+      return rewriter.notifyMatchFailure(op, "non-constant low bit");
+
+    auto outInout = dyn_cast<hw::InOutType>(op.getResult().getType());
+    if (!outInout)
+      return rewriter.notifyMatchFailure(op, "expected inout result type");
+    auto outTy = dyn_cast<IntegerType>(outInout.getElementType());
+    if (!outTy)
+      return rewriter.notifyMatchFailure(op, "expected integer element type");
+
+    Value inputVal = adaptor.getInput();
+    auto inTy = dyn_cast<IntegerType>(inputVal.getType());
+    if (!inTy)
+      return rewriter.notifyMatchFailure(op, "expected integer input type");
+
+    rewriter.replaceOpWithNewOp<comb::ExtractOp>(op, outTy, inputVal, *lowBit);
+    return success();
+  }
+};
+
 /// `llhd.wait` -> `arc.output` (surface the yielded values; drop scheduling)
 struct WaitOpConversion : public OpConversionPattern<llhd::WaitOp> {
   using OpConversionPattern<llhd::WaitOp>::OpConversionPattern;
@@ -921,6 +1280,17 @@ void ConvertToArcsPass::runOnOperation() {
   for (Operation *op : toErase)
     op->erase();
 
+  // Before running the (still incomplete) LLHD-to-Arc conversion, try to
+  // simplify away LLHD signal storage for common "single-shot" processes such
+  // as `initial` blocks without waits or delays.
+  getOperation().walk([&](hw::HWModuleOp module) {
+    for (auto proc :
+         llvm::make_early_inc_range(module.getOps<llhd::ProcessOp>())) {
+      (void)lowerSimpleProcessSignals(proc);
+      (void)convertOneShotProcessToInitial(proc);
+    }
+  });
+
   // NOTE: LLHD `llhd.process` pre-lowering is currently disabled. The existing
   // heuristic lowering to `arc.state` is incomplete and can lead to non-
   // terminating type legalization. A proper scheduler/stateful lowering should
@@ -949,6 +1319,15 @@ void ConvertToArcsPass::runOnOperation() {
         if (inputs.size() != 1)
           return {};
         Value input = inputs.front();
+        auto timeStruct = getTimeStructType(builder.getContext());
+        if (isa<llhd::TimeType>(type) && input.getType() == timeStruct)
+          return builder
+              .create<mlir::UnrealizedConversionCastOp>(loc, type, inputs)
+              .getResult(0);
+        if (type == timeStruct && isa<llhd::TimeType>(input.getType()))
+          return builder
+              .create<mlir::UnrealizedConversionCastOp>(loc, type, inputs)
+              .getResult(0);
         if (auto inout = dyn_cast<hw::InOutType>(input.getType())) {
           if (inout.getElementType() == type)
             return builder
@@ -984,6 +1363,7 @@ void ConvertToArcsPass::runOnOperation() {
   patterns.add<SignalOpConversion>(converter, &getContext());
   patterns.add<ProbeOpConversion>(converter, &getContext());
   patterns.add<DrvOpConversion>(converter, &getContext());
+  patterns.add<SigExtractOpConversion>(converter, &getContext());
   patterns.add<WaitOpConversion>(converter, &getContext());
   patterns.add<HaltOpConversion>(converter, &getContext());
 
@@ -997,7 +1377,9 @@ void ConvertToArcsPass::runOnOperation() {
 
   // Disable pattern rollback to use the faster one-shot dialect conversion.
   ConversionConfig config;
-  config.allowPatternRollback = false;
+  // Keep rollback enabled: this pass still contains partial LLHD lowering and
+  // should fail gracefully instead of aborting.
+  config.allowPatternRollback = true;
 
   // Apply the dialect conversion patterns.
   if (failed(applyPartialConversion(getOperation(), target, std::move(patterns),
@@ -1032,6 +1414,32 @@ void ConvertToArcsPass::runOnOperation() {
       materializationsToErase.push_back(producer);
   });
   for (Operation *op : materializationsToErase)
+    op->erase();
+
+  // Collapse any remaining immediate conversion-cast round-trips (e.g. time
+  // structs materialized back to `llhd.time` and then re-converted) so the
+  // conversion driver doesn't trip over unresolved materializations.
+  SmallVector<Operation *> toEraseGeneric;
+  getOperation().walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
+      return;
+    Value input = cast.getInputs().front();
+    Value result = cast.getResult(0);
+    auto producer = input.getDefiningOp<mlir::UnrealizedConversionCastOp>();
+    if (!producer || producer->getNumOperands() != 1 ||
+        producer->getNumResults() != 1)
+      return;
+    Value producerInput = producer.getInputs().front();
+    if (producer.getResult(0).getType() != input.getType())
+      return;
+    if (producerInput.getType() != result.getType())
+      return;
+    result.replaceAllUsesWith(producerInput);
+    toEraseGeneric.push_back(cast);
+    if (producer.getResult(0).use_empty())
+      toEraseGeneric.push_back(producer);
+  });
+  for (Operation *op : toEraseGeneric)
     op->erase();
 
   // Outline operations into arcs.

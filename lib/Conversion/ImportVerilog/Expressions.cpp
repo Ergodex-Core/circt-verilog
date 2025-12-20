@@ -82,15 +82,6 @@ resolveInterfaceHandle(Context &context,
                        const slang::ast::HierarchicalValueExpression &expr,
                        Location loc) {
   auto hierLoc = context.convertLocation(expr.symbol.location);
-  llvm::errs() << "[import-verilog] resolveInterfaceHandle for "
-               << expr.symbol.name << " path size: "
-               << expr.ref.path.size() << "\n";
-  for (const auto &element : expr.ref.path)
-    llvm::errs() << "  element: "
-                 << slang::ast::toString(element.symbol->kind) << "\n";
-  if (expr.ref.target)
-    llvm::errs() << "  target: "
-                 << slang::ast::toString(expr.ref.target->kind) << "\n";
   auto lookUpSymbol = [&](const slang::ast::Symbol *symbol) -> Value {
     if (!symbol)
       return Value();
@@ -100,9 +91,16 @@ resolveInterfaceHandle(Context &context,
           value && isa<sv::InterfaceType>(value.getType()))
         return value;
     }
+    if (auto *instSym = symbol->as_if<slang::ast::InstanceSymbol>()) {
+      if (auto value = context.valueSymbols.lookup(instSym);
+          value && (isa<sv::InterfaceType>(value.getType()) ||
+                    isa<sv::ModportType>(value.getType())))
+        return value;
+    }
     if (auto *valueSym = symbol->as_if<slang::ast::ValueSymbol>()) {
       if (auto value = context.valueSymbols.lookup(valueSym);
-          value && isa<sv::InterfaceType>(value.getType()))
+          value && (isa<sv::InterfaceType>(value.getType()) ||
+                    isa<sv::ModportType>(value.getType())))
         return value;
     }
     return Value();
@@ -121,6 +119,23 @@ resolveInterfaceHandle(Context &context,
       << "hierarchical reference traverses an interface port but no SSA value "
          "was recorded for it";
   return failure();
+}
+
+static bool traversesInterfaceInstance(const slang::ast::HierarchicalReference &ref) {
+  for (const auto &element : ref.path) {
+    if (auto *instSym = element.symbol->as_if<slang::ast::InstanceSymbol>()) {
+      if (instSym->body.getDefinition().definitionKind ==
+          slang::ast::DefinitionKind::Interface)
+        return true;
+    }
+  }
+  if (auto *instSym = ref.target ? ref.target->as_if<slang::ast::InstanceSymbol>()
+                                 : nullptr) {
+    if (instSym->body.getDefinition().definitionKind ==
+        slang::ast::DefinitionKind::Interface)
+      return true;
+  }
+  return false;
 }
 
 /// Get the currently active timescale as an integer number of femtoseconds.
@@ -167,7 +182,7 @@ FailureOr<Value> Context::assignInterfaceMember(
     memberLoc = convertLocation(member->member.location);
   } else if (auto *hier =
                  lhsExpr.as_if<slang::ast::HierarchicalValueExpression>()) {
-    if (!hier->ref.isViaIfacePort())
+    if (!hier->ref.isViaIfacePort() && !traversesInterfaceInstance(hier->ref))
       return failure();
     auto ifaceHandle = resolveInterfaceHandle(*this, *hier, loc);
     if (failed(ifaceHandle))
@@ -583,11 +598,31 @@ struct RvalueExprVisitor : public ExprVisitor {
     return {};
   }
 
+  /// Handle arbitrary symbol references (e.g. interface instances used in
+  /// contexts like system tasks or stubbed UVM calls).
+  Value visit(const slang::ast::ArbitrarySymbolExpression &expr) {
+    if (auto value = context.valueSymbols.lookup(expr.symbol)) {
+      if (isa<moore::RefType>(value.getType())) {
+        auto readOp = moore::ReadOp::create(builder, loc, value);
+        if (context.rvalueReadCallback)
+          context.rvalueReadCallback(readOp);
+        value = readOp.getResult();
+      }
+      return value;
+    }
+
+    auto d = mlir::emitError(loc, "unknown name `") << expr.symbol->name << "`";
+    d.attachNote(context.convertLocation(expr.symbol->location))
+        << "no rvalue generated for "
+        << slang::ast::toString(expr.symbol->kind);
+    return {};
+  }
+
   // Handle hierarchical values, such as `x = Top.sub.var`.
   Value visit(const slang::ast::HierarchicalValueExpression &expr) {
     auto hierLoc = context.convertLocation(expr.symbol.location);
 
-    if (expr.ref.isViaIfacePort()) {
+    if (expr.ref.isViaIfacePort() || traversesInterfaceInstance(expr.ref)) {
       auto ifaceValueOr = resolveInterfaceHandle(context, expr, loc);
       if (failed(ifaceValueOr))
         return {};
@@ -655,7 +690,7 @@ struct RvalueExprVisitor : public ExprVisitor {
       }
     } else if (auto *hier =
                    expr.left().as_if<slang::ast::HierarchicalValueExpression>()) {
-      if (hier->ref.isViaIfacePort()) {
+      if (hier->ref.isViaIfacePort() || traversesInterfaceInstance(hier->ref)) {
         auto assigned =
             context.assignInterfaceMember(expr.left(), expr.right(), loc);
         if (succeeded(assigned))

@@ -348,7 +348,7 @@ def PrintFormattedOp : SimOp<"print"> {
   let assemblyFormat = "$input `on` $clock `if` $condition attr-dict";
 }
 
-def PrintFormattedProcOp : SimOp<"proc.print"> {
+def PrintFormattedProcOp : SimOp<"proc.print", [MemoryEffects<[MemWrite]>]> {
   let summary = "Print a formatted string within a procedural region";
   let description = [{
     Evaluate a format string and print it to the simulation console.
@@ -401,7 +401,7 @@ def ClockedPauseOp : SimOp<"clocked_pause"> {
   }];
 }
 
-def TerminateOp : SimOp<"terminate"> {
+def TerminateOp : SimOp<"terminate", [MemoryEffects<[MemWrite]>]> {
   let summary = "Terminate the simulation";
   let description = [{
     Terminate the simulation with a success or failure exit code. Depending on

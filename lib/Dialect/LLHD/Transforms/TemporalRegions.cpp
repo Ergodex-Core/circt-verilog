@@ -177,6 +177,10 @@ llhd::TemporalRegionAnalysis::getExitingBlocksInTR(int tr) const {
   SmallVector<Block *, 8> blocks = getBlocksInTR(tr);
   SmallVector<Block *, 8> exitingBlocks;
   for (Block *block : blocks) {
+    if (isa<llhd::HaltOp>(block->getTerminator())) {
+      exitingBlocks.push_back(block);
+      continue;
+    }
     for (auto *succ : block->getSuccessors()) {
       if (blockMap.at(succ) != blockMap.at(block) ||
           isa<WaitOp>(block->getTerminator())) {

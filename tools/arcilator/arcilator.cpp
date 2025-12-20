@@ -260,6 +260,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
   pm.addPass(createLowerVerifSimulationsPass());
+  pm.addPass(sv::createLowerInterfacesPass());
   {
     // Normalize LLHD procedural constructs into structural form so the Arc
     // conversion sees SSA values instead of signal/process primitives.
@@ -276,7 +277,6 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
   }
-  pm.addPass(sv::createLowerInterfacesPass());
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
@@ -379,6 +379,7 @@ static void populateArcToLLVMPipeline(PassManager &pm) {
   if (untilReached(UntilLLVMLowering))
     return;
   pm.addPass(createLowerArcToLLVMPass());
+  pm.addPass(sim::createLowerSimConsole());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 }

@@ -26,6 +26,18 @@ using namespace ImportVerilog;
 // Utilities
 //===----------------------------------------------------------------------===//
 
+static Type getInterfaceSignalType(Type type) {
+  if (auto intTy = dyn_cast<moore::IntType>(type)) {
+    unsigned width = intTy.getBitSize().value_or(1);
+    if (width == 0)
+      width = 1;
+    auto widthAttr =
+        IntegerAttr::get(IntegerType::get(type.getContext(), 32), APInt(32, width));
+    return hw::IntType::get(widthAttr);
+  }
+  return type;
+}
+
 static void guessNamespacePrefix(const slang::ast::Symbol &symbol,
                                  SmallString<64> &prefix) {
   if (symbol.kind != slang::ast::SymbolKind::Package)
@@ -370,6 +382,105 @@ struct ModuleVisitor : public BaseVisitor {
     SmallDenseMap<const slang::ast::InterfacePortSymbol *, Value>
         interfacePortValues;
 
+    struct InterfaceSignalAssign {
+      Value ifaceValue;
+      FlatSymbolRefAttr signalAttr;
+      Type signalType;
+      Location memberLoc;
+    };
+    SmallDenseMap<const PortSymbol *, InterfaceSignalAssign> ifaceSignalAssigns;
+
+    auto resolveIfaceHandleFromHier =
+        [&](const slang::ast::HierarchicalValueExpression &hier) -> Value {
+      auto lookUpSymbol = [&](const slang::ast::Symbol *symbol) -> Value {
+        if (!symbol)
+          return Value();
+        if (auto *ifacePort =
+                symbol->as_if<slang::ast::InterfacePortSymbol>()) {
+          if (auto value = context.valueSymbols.lookup(ifacePort);
+              value && (isa<sv::InterfaceType>(value.getType()) ||
+                        isa<sv::ModportType>(value.getType())))
+            return value;
+        }
+        if (auto *instSym = symbol->as_if<slang::ast::InstanceSymbol>()) {
+          if (auto value = context.valueSymbols.lookup(instSym);
+              value && (isa<sv::InterfaceType>(value.getType()) ||
+                        isa<sv::ModportType>(value.getType())))
+            return value;
+        }
+        if (auto *valueSym = symbol->as_if<slang::ast::ValueSymbol>()) {
+          if (auto value = context.valueSymbols.lookup(valueSym);
+              value && (isa<sv::InterfaceType>(value.getType()) ||
+                        isa<sv::ModportType>(value.getType())))
+            return value;
+        }
+        return Value();
+      };
+
+      for (const auto &element : hier.ref.path)
+        if (auto value = lookUpSymbol(element.symbol))
+          return value;
+
+      if (auto value = lookUpSymbol(hier.ref.target))
+        return value;
+
+      return Value();
+    };
+
+    auto recordInterfaceSignalAssign =
+        [&](const slang::ast::Expression &expr, const PortSymbol *port)
+        -> LogicalResult {
+      auto *hier = expr.as_if<slang::ast::HierarchicalValueExpression>();
+      if (!hier)
+        return failure();
+
+      bool isViaInterface = hier->ref.isViaIfacePort();
+      if (!isViaInterface) {
+        for (const auto &element : hier->ref.path) {
+          if (auto *instSym =
+                  element.symbol->as_if<slang::ast::InstanceSymbol>()) {
+            if (instSym->body.getDefinition().definitionKind ==
+                slang::ast::DefinitionKind::Interface) {
+              isViaInterface = true;
+              break;
+            }
+          }
+        }
+      }
+      if (!isViaInterface)
+        return failure();
+
+      auto ifaceValue = resolveIfaceHandleFromHier(*hier);
+      if (!ifaceValue)
+        return failure();
+
+      auto *memberSym = hier->symbol.as_if<slang::ast::ValueSymbol>();
+      if (!memberSym) {
+        mlir::emitError(loc)
+            << "interface member `" << hier->symbol.name
+            << "` is not a value symbol";
+        return failure();
+      }
+
+      auto memberLoc = context.convertLocation(hier->symbol.location);
+      auto signalAttr = context.lookupInterfaceSignal(*memberSym, memberLoc);
+      if (failed(signalAttr))
+        return failure();
+
+      auto targetType = context.convertType(*hier->type);
+      if (!targetType)
+        return failure();
+      auto signalType = getInterfaceSignalType(targetType);
+      if (!signalType)
+        return failure();
+
+      ifaceSignalAssigns.insert(
+          {port,
+           InterfaceSignalAssign{ifaceValue, *signalAttr, signalType,
+                                 memberLoc}});
+      return success();
+    };
+
     for (const auto *con : instNode.getPortConnections()) {
       const auto *expr = con->getExpression();
 
@@ -433,14 +544,24 @@ struct ModuleVisitor : public BaseVisitor {
       // ref ports), or assign an instance output to it (for output ports).
       if (auto *port = con->port.as_if<PortSymbol>()) {
         // Convert as rvalue for inputs, lvalue for all others.
-        auto value = (port->direction == ArgumentDirection::In)
-                         ? context.convertRvalueExpression(*expr)
-                         : context.convertLvalueExpression(*expr);
-        if (!value)
-          return failure();
         if (auto *existingPort =
                 moduleLowering->portsBySyntaxNode.lookup(con->port.getSyntax()))
           port = existingPort;
+        Value value;
+        if (port->direction == ArgumentDirection::In) {
+          value = context.convertRvalueExpression(*expr);
+          if (!value)
+            return failure();
+          portValues.insert({port, value});
+          continue;
+        }
+        // Allow connecting a module output port to an interface signal.
+        if (port->direction == ArgumentDirection::Out &&
+            succeeded(recordInterfaceSignalAssign(*expr, port)))
+          continue;
+        value = context.convertLvalueExpression(*expr);
+        if (!value)
+          return failure();
         portValues.insert({port, value});
         continue;
       }
@@ -522,8 +643,10 @@ struct ModuleVisitor : public BaseVisitor {
     // Match the module's ports up with the port values determined above.
     SmallVector<Value> inputValues;
     SmallVector<Value> outputValues;
+    SmallVector<const PortSymbol *> outputPorts;
     inputValues.reserve(moduleType.getNumInputs());
     outputValues.reserve(moduleType.getNumOutputs());
+    outputPorts.reserve(moduleType.getNumOutputs());
 
     for (auto &info : moduleLowering->portInfos) {
       if (info.kind == ModuleLowering::ModulePortInfo::Kind::Data) {
@@ -531,6 +654,7 @@ struct ModuleVisitor : public BaseVisitor {
         auto value = portValues.lookup(&port.ast);
         if (port.ast.direction == ArgumentDirection::Out) {
           outputValues.push_back(value);
+          outputPorts.push_back(&port.ast);
         } else {
           if (!value)
             return mlir::emitError(loc) << "missing connection for port `"
@@ -595,14 +719,28 @@ struct ModuleVisitor : public BaseVisitor {
                                     inst->getResult(*hierPath.idx));
 
     // Assign output values from the instance to the connected expression.
-    for (auto [lvalue, output] : llvm::zip(outputValues, inst.getOutputs())) {
-      if (!lvalue)
+    for (auto [idx, output] : llvm::enumerate(inst.getOutputs())) {
+      auto *port = outputPorts[idx];
+      auto lvalue = outputValues[idx];
+      if (lvalue) {
+        Value rvalue = output;
+        auto dstType = cast<moore::RefType>(lvalue.getType()).getNestedType();
+        // TODO: This should honor signedness in the conversion.
+        rvalue = context.materializeConversion(dstType, rvalue, false, loc);
+        moore::ContinuousAssignOp::create(builder, loc, lvalue, rvalue);
         continue;
-      Value rvalue = output;
-      auto dstType = cast<moore::RefType>(lvalue.getType()).getNestedType();
-      // TODO: This should honor signedness in the conversion.
-      rvalue = context.materializeConversion(dstType, rvalue, false, loc);
-      moore::ContinuousAssignOp::create(builder, loc, lvalue, rvalue);
+      }
+      auto ifaceAssignIt = ifaceSignalAssigns.find(port);
+      if (ifaceAssignIt != ifaceSignalAssigns.end()) {
+        const auto &assign = ifaceAssignIt->second;
+        Value rvalue = output;
+        rvalue = context.materializeConversion(assign.signalType, rvalue,
+                                               /*isSigned=*/false, loc);
+        if (!rvalue)
+          return failure();
+        builder.create<sv::AssignInterfaceSignalOp>(
+            assign.memberLoc, assign.ifaceValue, assign.signalAttr, rvalue);
+      }
     }
 
     return success();
@@ -686,6 +824,20 @@ struct ModuleVisitor : public BaseVisitor {
         if (failed(assigned))
           return failure();
         return success();
+      }
+      // Support assignments to signals within interface instances.
+      for (const auto &element : hier->ref.path) {
+        if (auto *instSym =
+                element.symbol->as_if<slang::ast::InstanceSymbol>()) {
+          if (instSym->body.getDefinition().definitionKind !=
+              slang::ast::DefinitionKind::Interface)
+            continue;
+          auto assigned =
+              context.assignInterfaceMember(expr.left(), expr.right(), loc);
+          if (failed(assigned))
+            return failure();
+          return success();
+        }
       }
     }
 
