@@ -352,6 +352,12 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
     pm.nest<hw::HWModuleOp>().addPass(createCSEPass());
     pm.addPass(llhd::createHoistSignalsPass());
+    // Hoist signal accesses (and promote hoistable drives to process results)
+    // before lowering processes to combinational ops. Otherwise, drives end up
+    // trapped inside `llhd.combinational` regions where downstream promotions
+    // (e.g. sig2reg) cannot see them, which can incorrectly collapse outputs to
+    // their initial values.
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createDeseqPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
