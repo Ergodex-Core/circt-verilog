@@ -265,7 +265,6 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     // Normalize LLHD procedural constructs into structural form so the Arc
     // conversion sees SSA values instead of signal/process primitives.
     pm.addPass(llhd::createProcessLowering());
-    pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createEarlyCodeMotion());
     // Temporal code motion is sensitive to how many distinct delay constants
     // show up in a process. CSE helps collapse duplicate `llhd.constant_time`
@@ -273,6 +272,12 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     pm.nest<hw::HWModuleOp>().addPass(createCSEPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createTemporalCodeMotion());
     pm.addPass(llhd::createHoistSignalsPass());
+    // Hoist signal accesses (and promote hoistable drives to process results)
+    // before lowering processes to combinational ops. Otherwise, drives end up
+    // trapped inside `llhd.combinational` regions where downstream promotions
+    // (e.g. sig2reg) cannot see them, which can incorrectly collapse outputs to
+    // their initial values.
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createLowerProcessesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createDeseqPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
