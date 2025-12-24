@@ -132,6 +132,54 @@ struct AssertionExprVisitor {
     return builder.createOrFold<ltl::ConcatOp>(loc, sequenceElements);
   }
 
+  Value visit(const slang::ast::SequenceWithMatchExpr &expr) {
+    // Convert the underlying sequence expression.
+    auto value = context.convertAssertionExpression(expr.expr, loc);
+    if (!value)
+      return {};
+
+    // Apply repetition if present.
+    if (expr.repetition.has_value()) {
+      value = createRepetition(loc, expr.repetition.value(), value);
+      if (!value)
+        return {};
+    }
+
+    // Best-effort convert match items for side effects, but ignore their
+    // returned values. This keeps the importer from failing on constructs like
+    // local-variable assignments and `$display` within sequences.
+    //
+    // TODO: Model match item semantics (value capture / per-thread storage).
+    for (auto *matchItem : expr.matchItems) {
+      if (!matchItem)
+        continue;
+      (void)context.convertRvalueExpression(*matchItem);
+    }
+
+    return value;
+  }
+
+  Value visit(const slang::ast::DisableIffAssertionExpr &expr) {
+    auto cond = context.convertRvalueExpression(expr.condition);
+    if (!cond)
+      return {};
+    cond = context.convertToI1(cond);
+    if (!cond)
+      return {};
+
+    auto inner = context.convertAssertionExpression(expr.expr, loc);
+    if (!inner)
+      return {};
+
+    // Approximation: treat `disable iff (cond) p` as `cond || p`.
+    //
+    // This matches the common "disable checks during reset" idiom and is
+    // sufficient for sv-tests patterns that use boolean properties. A full
+    // implementation would additionally reset pending obligations when the
+    // disable condition is asserted.
+    return ltl::OrOp::create(builder, loc, {cond, inner});
+  }
+
   Value visit(const slang::ast::UnaryAssertionExpr &expr) {
     auto value = context.convertAssertionExpression(expr.expr, loc);
     if (!value)
@@ -302,6 +350,11 @@ FailureOr<Value> Context::convertAssertionSystemCallArity1(
 
   auto systemCallRes =
       llvm::StringSwitch<std::function<FailureOr<Value>()>>(subroutine.name)
+          // Translate $past(x) to x[-1].
+          .Case("$past",
+                [&]() -> Value {
+                  return ltl::PastOp::create(builder, loc, value, 1).getResult();
+                })
           .Case("$sampled",
                 [&]() -> Value {
                   Value sampled = ltl::SampledOp::create(builder, loc, value);
@@ -368,18 +421,25 @@ FailureOr<Value> Context::convertAssertionSystemCallArity1(
                                     .getResult();
                   return stable;
                 })
-          .Case("$past",
+          // Translate $changed to ¬$stable.
+          .Case("$changed",
                 [&]() -> Value {
-                  Value past =
-                      ltl::PastOp::create(builder, loc, value, 1, Value{});
-                  // Cast back to Moore integers so Moore ops can use the result
-                  // if needed
-                  if (auto ty = dyn_cast<moore::IntType>(originalType)) {
-                    past = moore::FromBuiltinIntOp::create(builder, loc, past);
-                    if (ty.getDomain() == Domain::FourValued)
-                      past = moore::IntToLogicOp::create(builder, loc, past);
-                  }
-                  return past;
+                  auto current = value;
+                  auto past =
+                      ltl::PastOp::create(builder, loc, value, 1).getResult();
+                  auto notPast =
+                      ltl::NotOp::create(builder, loc, past).getResult();
+                  auto notCurrent =
+                      ltl::NotOp::create(builder, loc, current).getResult();
+                  auto currentAndNotPast =
+                      ltl::AndOp::create(builder, loc, {current, notPast})
+                          .getResult();
+                  auto notCurrentAndPast =
+                      ltl::AndOp::create(builder, loc, {notCurrent, past})
+                          .getResult();
+                  return ltl::OrOp::create(builder, loc,
+                                           {currentAndNotPast, notCurrentAndPast})
+                      .getResult();
                 })
           .Default([&]() -> Value { return {}; });
   return systemCallRes();

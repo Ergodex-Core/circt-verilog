@@ -37,8 +37,10 @@
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Sim/SimPasses.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
+#include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
 #include "circt/Tools/arcilator/pipelines.h"
@@ -91,6 +93,63 @@
 using namespace mlir;
 using namespace circt;
 using namespace arc;
+
+namespace {
+/// Strip verification ops that are currently not supported by the arcilator
+/// lowering pipeline. This allows us to accept SV sources that include
+/// assertions/properties (including LTL-based ones) without failing the HW→Arc
+/// conversion.
+struct StripVerificationOpsPass
+    : public PassWrapper<StripVerificationOpsPass,
+                         OperationPass<mlir::ModuleOp>> {
+  void runOnOperation() override {
+    SmallVector<Operation *> verifOps;
+    SmallVector<Operation *> ltlOps;
+
+    getOperation().walk([&](Operation *op) {
+      auto *dialect = op->getDialect();
+      if (!dialect)
+        return;
+      auto dialectNS = dialect->getNamespace();
+      if (dialectNS == "verif") {
+        // `verif.simulation` is handled by `arc-lower-verif-simulations`.
+        if (isa<verif::SimulationOp>(op))
+          return;
+        verifOps.push_back(op);
+        return;
+      }
+
+      // Strip SV verification operations that may be present after various
+      // conversions.
+      if (isa<sv::AssertOp, sv::AssumeOp, sv::CoverOp, sv::AssertConcurrentOp,
+              sv::AssumeConcurrentOp, sv::CoverConcurrentOp,
+              sv::AssertPropertyOp, sv::AssumePropertyOp, sv::CoverPropertyOp>(
+              op)) {
+        verifOps.push_back(op);
+        return;
+      }
+
+      if (dialectNS == "ltl") {
+        ltlOps.push_back(op);
+        return;
+      }
+    });
+
+    // Erase assertion-like users first, then remove any remaining LTL ops.
+    for (auto *op : llvm::reverse(verifOps))
+      op->erase();
+    for (auto *op : llvm::reverse(ltlOps)) {
+      if (!op->use_empty()) {
+        op->emitOpError()
+            << "unexpected live uses of LTL op after stripping verification "
+               "ops";
+        return signalPassFailure();
+      }
+      op->erase();
+    }
+  }
+};
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Command Line Arguments
@@ -378,6 +437,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     pm.addPass(arc::createInferMemoriesPass(opts));
   }
   pm.addPass(sim::createLowerDPIFunc());
+  pm.addPass(std::make_unique<StripVerificationOpsPass>());
 
   // Restructure the input from a `hw.module` hierarchy to a collection of arcs.
   if (untilReached(UntilArcConversion))

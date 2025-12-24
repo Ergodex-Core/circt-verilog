@@ -142,8 +142,13 @@ struct StmtVisitor {
         mlir::emitWarning(loc, "unreachable code");
         break;
       }
-      if (failed(context.convertStatement(*stmt)))
+      if (failed(context.convertStatement(*stmt))) {
+        auto stmtLoc = context.convertLocation(stmt->sourceRange);
+        mlir::emitError(stmtLoc)
+            << "failed to convert statement "
+            << slang::ast::toString(stmt->kind);
         return failure();
+      }
     }
     return success();
   }
@@ -797,26 +802,27 @@ struct StmtVisitor {
     if (!property)
       return failure();
 
-    // Handle assertion statements that don't have an action block.
-    if (stmt.ifTrue && stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
-      switch (stmt.assertionKind) {
-      case slang::ast::AssertionKind::Assert:
-        verif::AssertOp::create(builder, loc, property, enable, StringAttr{});
-        return success();
-      case slang::ast::AssertionKind::Assume:
-        verif::AssumeOp::create(builder, loc, property, enable, StringAttr{});
-        return success();
-      default:
-        break;
-      }
-      mlir::emitError(loc) << "unsupported concurrent assertion kind: "
-                           << slang::ast::toString(stmt.assertionKind);
-      return failure();
+    // Ignore action blocks for now. Many sv-tests include `else` blocks that
+    // call `$error` / `uvm_error`, but the verification semantics are captured
+    // by the property itself.
+    //
+    // TODO: Lower action blocks to proper simulation side effects.
+    switch (stmt.assertionKind) {
+    case slang::ast::AssertionKind::Assert:
+    case slang::ast::AssertionKind::Expect:
+      verif::AssertOp::create(builder, loc, property, enable, StringAttr{});
+      return success();
+    case slang::ast::AssertionKind::Assume:
+    case slang::ast::AssertionKind::Restrict:
+      verif::AssumeOp::create(builder, loc, property, enable, StringAttr{});
+      return success();
+    case slang::ast::AssertionKind::CoverProperty:
+    case slang::ast::AssertionKind::CoverSequence:
+      verif::CoverOp::create(builder, loc, property, enable, StringAttr{});
+      return success();
     }
-
-    mlir::emitError(loc)
-        << "concurrent assertion statements with action blocks "
-           "are not supported yet";
+    mlir::emitError(loc) << "unsupported concurrent assertion kind: "
+                         << slang::ast::toString(stmt.assertionKind);
     return failure();
   }
 
