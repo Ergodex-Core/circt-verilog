@@ -1507,8 +1507,14 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
   // Convert the body of the module.
   for (auto &member : module->members()) {
     auto loc = convertLocation(member.location);
-    if (failed(member.visit(ModuleVisitor(*this, loc))))
+    if (failed(member.visit(ModuleVisitor(*this, loc)))) {
+      auto diag = mlir::emitError(loc) << "failed to convert module `"
+                                       << module->name << "` member";
+      if (!member.name.empty())
+        diag << " `" << member.name << "`";
+      diag << " (" << slang::ast::toString(member.kind) << ")";
       return failure();
+    }
   }
 
   // Create additional ops to drive input port values onto the corresponding
@@ -1591,11 +1597,8 @@ Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
 
   // Check if there already is a declaration for this function.
   auto &lowering = functions[&subroutine];
-  if (lowering) {
-    if (!lowering->op)
-      return {};
+  if (lowering)
     return lowering.get();
-  }
   lowering = std::make_unique<FunctionLowering>();
   auto loc = convertLocation(subroutine.location);
 
@@ -1688,6 +1691,10 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   auto *lowering = declareFunction(subroutine);
   if (!lowering)
     return failure();
+
+  // DPI imports are external declarations; do not attempt to synthesize a body.
+  if (subroutine.flags.has(slang::ast::MethodFlags::DPIImport))
+    return success();
   ValueSymbolScope scope(valueSymbols);
 
   // Create a function body block and populate it with block arguments.

@@ -129,6 +129,54 @@ struct AssertionExprVisitor {
     return builder.createOrFold<ltl::ConcatOp>(loc, sequenceElements);
   }
 
+  Value visit(const slang::ast::SequenceWithMatchExpr &expr) {
+    // Convert the underlying sequence expression.
+    auto value = context.convertAssertionExpression(expr.expr, loc);
+    if (!value)
+      return {};
+
+    // Apply repetition if present.
+    if (expr.repetition.has_value()) {
+      value = createRepetition(loc, expr.repetition.value(), value);
+      if (!value)
+        return {};
+    }
+
+    // Best-effort convert match items for side effects, but ignore their
+    // returned values. This keeps the importer from failing on constructs like
+    // local-variable assignments and `$display` within sequences.
+    //
+    // TODO: Model match item semantics (value capture / per-thread storage).
+    for (auto *matchItem : expr.matchItems) {
+      if (!matchItem)
+        continue;
+      (void)context.convertRvalueExpression(*matchItem);
+    }
+
+    return value;
+  }
+
+  Value visit(const slang::ast::DisableIffAssertionExpr &expr) {
+    auto cond = context.convertRvalueExpression(expr.condition);
+    if (!cond)
+      return {};
+    cond = context.convertToI1(cond);
+    if (!cond)
+      return {};
+
+    auto inner = context.convertAssertionExpression(expr.expr, loc);
+    if (!inner)
+      return {};
+
+    // Approximation: treat `disable iff (cond) p` as `cond || p`.
+    //
+    // This matches the common "disable checks during reset" idiom and is
+    // sufficient for sv-tests patterns that use boolean properties. A full
+    // implementation would additionally reset pending obligations when the
+    // disable condition is asserted.
+    return ltl::OrOp::create(builder, loc, {cond, inner});
+  }
+
   Value visit(const slang::ast::UnaryAssertionExpr &expr) {
     auto value = context.convertAssertionExpression(expr.expr, loc);
     if (!value)
@@ -298,6 +346,11 @@ FailureOr<Value> Context::convertAssertionSystemCallArity1(
 
   auto systemCallRes =
       llvm::StringSwitch<std::function<FailureOr<Value>()>>(subroutine.name)
+          // Translate $past(x) to x[-1].
+          .Case("$past",
+                [&]() -> Value {
+                  return ltl::PastOp::create(builder, loc, value, 1).getResult();
+                })
           // Translate $fell to ¬x[0] ∧ x[-1]
           .Case("$fell",
                 [&]() -> Value {
@@ -345,6 +398,26 @@ FailureOr<Value> Context::convertAssertionSystemCallArity1(
                                         {pastAndCurrent, notPastAndNotCurrent})
                           .getResult();
                   return stable;
+                })
+          // Translate $changed to ¬$stable.
+          .Case("$changed",
+                [&]() -> Value {
+                  auto current = value;
+                  auto past =
+                      ltl::PastOp::create(builder, loc, value, 1).getResult();
+                  auto notPast =
+                      ltl::NotOp::create(builder, loc, past).getResult();
+                  auto notCurrent =
+                      ltl::NotOp::create(builder, loc, current).getResult();
+                  auto currentAndNotPast =
+                      ltl::AndOp::create(builder, loc, {current, notPast})
+                          .getResult();
+                  auto notCurrentAndPast =
+                      ltl::AndOp::create(builder, loc, {notCurrent, past})
+                          .getResult();
+                  return ltl::OrOp::create(builder, loc,
+                                           {currentAndNotPast, notCurrentAndPast})
+                      .getResult();
                 })
           .Default([&]() -> Value { return {}; });
   return systemCallRes();
