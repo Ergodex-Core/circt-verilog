@@ -20,6 +20,9 @@ target_link_libraries(firtool PRIVATE
   CIRCTSeq
   CIRCTSim
   CIRCTSVTransforms
+  # Keep these after CIRCTSV/CIRCTSVTransforms to satisfy static link order.
+  CIRCTMoore
+  CIRCTLLHD
   CIRCTTransforms
   CIRCTFirtool
   CIRCTTargetDebugInfo

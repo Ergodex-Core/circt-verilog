@@ -328,7 +328,7 @@ static void bindArcRuntimeSymbols(ExecutionEngine &executionEngine) {
 
 /// Populate a pass manager with the arc simulator pipeline for the given
 /// command line options. This pipeline lowers modules to the Arc dialect.
-static void populateHwModuleToArcPipeline(PassManager &pm) {
+static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
   if (verbosePassExecutions)
     pm.addInstrumentation(
         std::make_unique<VerbosePassInstrumentation<mlir::ModuleOp>>(
@@ -339,7 +339,8 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // represented as intrinsic ops.
   if (untilReached(UntilPreprocessing))
     return;
-  pm.addPass(createConvertMooreToCorePass());
+  if (inputHasMoore)
+    pm.addPass(createConvertMooreToCorePass());
   pm.addPass(om::createStripOMPass());
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
@@ -445,7 +446,12 @@ static LogicalResult processBuffer(
   pmArc.enableTiming(ts);
   if (failed(applyPassManagerCLOptions(pmArc)))
     return failure();
-  populateHwModuleToArcPipeline(pmArc);
+  bool inputHasMoore = false;
+  module->walk([&](Operation *op) {
+    if (auto *dialect = op->getDialect())
+      inputHasMoore |= dialect->getNamespace() == "moore";
+  });
+  populateHwModuleToArcPipeline(pmArc, inputHasMoore);
 
   if (failed(pmArc.run(module.get())))
     return failure();
