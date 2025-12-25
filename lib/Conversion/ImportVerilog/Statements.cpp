@@ -647,16 +647,69 @@ struct StmtVisitor {
 
   // Handle return statements.
   LogicalResult visit(const slang::ast::ReturnStatement &stmt) {
-    if (stmt.expr) {
-      auto expr = context.convertRvalueExpression(*stmt.expr);
-      if (!expr)
-        return failure();
-      sv::ReturnOp::create(builder, loc, ValueRange{expr});
-    } else {
-      sv::ReturnOp::create(builder, loc, ValueRange{});
+    Operation *parentOp =
+        builder.getInsertionBlock() ? builder.getInsertionBlock()->getParentOp()
+                                    : nullptr;
+    if (!parentOp)
+      return mlir::emitError(loc) << "return statement is not within an op";
+
+    // Return from an MLIR `func.func` body.
+    if (auto funcOp = dyn_cast<mlir::func::FuncOp>(parentOp)) {
+      auto resultTypes = funcOp.getFunctionType().getResults();
+      if (resultTypes.size() > 1)
+        return mlir::emitError(loc)
+               << "unsupported function return arity: " << resultTypes.size();
+
+      if (stmt.expr) {
+        if (resultTypes.empty())
+          return mlir::emitError(loc)
+                 << "cannot return a value from a void function";
+        auto expr = context.convertRvalueExpression(*stmt.expr, resultTypes[0]);
+        if (!expr)
+          return failure();
+        mlir::func::ReturnOp::create(builder, loc, ValueRange{expr});
+      } else {
+        if (resultTypes.empty()) {
+          mlir::func::ReturnOp::create(builder, loc, ValueRange{});
+        } else {
+          if (context.functionReturnVarStack.empty() ||
+              !context.functionReturnVarStack.back())
+            return mlir::emitError(loc)
+                   << "missing return variable for non-void function";
+          Value read = moore::ReadOp::create(
+              builder, loc, context.functionReturnVarStack.back());
+          mlir::func::ReturnOp::create(builder, loc, ValueRange{read});
+        }
+      }
+      setTerminated();
+      return success();
     }
-    setTerminated();
-    return success();
+
+    // Return from an SV dialect `sv.func` body.
+    if (isa<sv::FuncOp>(parentOp)) {
+      if (stmt.expr) {
+        auto expr = context.convertRvalueExpression(*stmt.expr);
+        if (!expr)
+          return failure();
+        sv::ReturnOp::create(builder, loc, ValueRange{expr});
+      } else {
+        sv::ReturnOp::create(builder, loc, ValueRange{});
+      }
+      setTerminated();
+      return success();
+    }
+
+    // Return from module-level procedures (initial/always/tasks).
+    if (isa<moore::ProcedureOp>(parentOp)) {
+      if (stmt.expr)
+        return mlir::emitError(loc)
+               << "unsupported `return <expr>` in a procedure";
+      moore::ReturnOp::create(builder, loc);
+      setTerminated();
+      return success();
+    }
+
+    return mlir::emitError(loc) << "unsupported return statement context";
   }
 
   // Handle continue statements.

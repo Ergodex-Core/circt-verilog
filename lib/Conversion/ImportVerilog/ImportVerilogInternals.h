@@ -301,6 +301,11 @@ struct Context {
   /// the correct block.
   SmallVector<LoopFrame> loopStack;
 
+  /// A stack of function return variables. When converting a non-void
+  /// subroutine, this holds the `returnValVar` storage so that `return;`
+  /// statements can return the current value.
+  SmallVector<Value> functionReturnVarStack;
+
   /// A listener called for every variable or net being read. This can be used
   /// to collect all variables read as part of an expression or statement, for
   /// example to populate the list of observed signals in an implicit event

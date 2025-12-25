@@ -1817,6 +1817,10 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
     valueSymbols.insert(subroutine.returnValVar, returnVar);
   }
 
+  functionReturnVarStack.push_back(returnVar);
+  auto returnVarGuard =
+      llvm::make_scope_exit([&] { functionReturnVarStack.pop_back(); });
+
   if (failed(convertStatement(subroutine.getBody())))
     return failure();
 
