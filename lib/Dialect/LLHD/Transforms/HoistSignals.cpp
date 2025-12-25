@@ -29,6 +29,17 @@ using namespace llhd;
 using llvm::PointerUnion;
 using llvm::SmallSetVector;
 
+/// Return true if the given drive delay is effectively "immediate" from the
+/// perspective of other ops in the same process activation. Be conservative for
+/// non-constant delays.
+static bool isImmediateDelay(Value timeValue) {
+  auto timeOp = timeValue.getDefiningOp<llhd::ConstantTimeOp>();
+  if (!timeOp)
+    return true;
+  auto attr = timeOp.getValueAttr();
+  return attr.getTime() == 0 && attr.getDelta() == 0 && attr.getEpsilon() == 1;
+}
+
 //===----------------------------------------------------------------------===//
 // Probe Hoisting
 //===----------------------------------------------------------------------===//
@@ -150,21 +161,28 @@ void ProbeHoister::hoistProbes() {
           observedSignals.insert(prb.getSignal());
     }
 
+    DenseSet<Value> drivenImmediateSignals;
     for (auto &op : llvm::make_early_inc_range(block)) {
+      if (auto driveOp = dyn_cast<DrvOp>(op)) {
+        if (isImmediateDelay(driveOp.getTime()))
+          drivenImmediateSignals.insert(driveOp.getSignal());
+        continue;
+      }
+
       auto probeOp = dyn_cast<PrbOp>(op);
 
-      // We can only hoist probes that have no side-effecting ops between
-      // themselves and the beginning of a block. If we see a side-effecting op,
-      // give up on this block.
+      // We can only hoist probes if we have no unknown side-effecting ops that
+      // could change the values we observe or depend on. Drives are handled
+      // explicitly above; all other side-effecting operations conservatively
+      // stop hoisting for this block.
       if (!probeOp) {
         if (isMemoryEffectFree(&op))
           continue;
-        else
-          break;
+        break;
       }
 
       // Only hoist probes that don't leak across wait ops.
-      if (liveAcrossWait.contains(probeOp)) {
+      if (liveAcrossWait.contains(probeOp.getResult())) {
         LLVM_DEBUG(llvm::dbgs()
                    << "- Skipping (live across wait) " << probeOp << "\n");
         continue;
@@ -176,6 +194,16 @@ void ProbeHoister::hoistProbes() {
       if (observedSignals.contains(probeOp.getSignal())) {
         LLVM_DEBUG(llvm::dbgs() << "- Skipping (observed by wait) " << probeOp
                                 << "\n");
+        continue;
+      }
+
+      // Never hoist probes of a signal that has already been driven with an
+      // immediate delay in this block. Such probes may observe the post-drive
+      // value within the process activation; moving them outside would change
+      // what they sample.
+      if (drivenImmediateSignals.contains(probeOp.getSignal())) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "- Skipping (after drive) " << probeOp << "\n");
         continue;
       }
 
@@ -294,6 +322,27 @@ static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
   return os;
 }
 
+static std::optional<TimeAttr> getConstantTimeAttr(DriveValue value) {
+  if (auto attr = dyn_cast<TimeAttr>(value.data))
+    return attr;
+  if (auto timeValue = dyn_cast<Value>(value.data))
+    if (auto timeOp = timeValue.getDefiningOp<llhd::ConstantTimeOp>())
+      return timeOp.getValueAttr();
+  return std::nullopt;
+}
+
+static bool isLaterDelay(const DriveValue &a, const DriveValue &b) {
+  auto aAttr = getConstantTimeAttr(a);
+  auto bAttr = getConstantTimeAttr(b);
+  if (!aAttr || !bAttr)
+    return false;
+  if (aAttr->getTime() != bAttr->getTime())
+    return aAttr->getTime() > bAttr->getTime();
+  if (aAttr->getDelta() != bAttr->getDelta())
+    return aAttr->getDelta() > bAttr->getDelta();
+  return aAttr->getEpsilon() > bAttr->getEpsilon();
+}
+
 //===----------------------------------------------------------------------===//
 // Drive Hoisting
 //===----------------------------------------------------------------------===//
@@ -375,9 +424,13 @@ void DriveHoister::collectDriveSets() {
       continue;
     suspendOps.push_back(terminator);
 
-    SmallPtrSet<Value, 8> drivenSlots;
+    SmallPtrSet<Value, 8> probedSlots;
     for (auto &op : llvm::make_early_inc_range(
              llvm::reverse(block.without_terminator()))) {
+      if (auto probeOp = dyn_cast<PrbOp>(op)) {
+        probedSlots.insert(probeOp.getSignal());
+        continue;
+      }
       auto driveOp = dyn_cast<DrvOp>(op);
 
       // We can only hoist drives that have no side-effecting ops between
@@ -386,8 +439,17 @@ void DriveHoister::collectDriveSets() {
       if (!driveOp) {
         if (isMemoryEffectFree(&op))
           continue;
-        else
-          break;
+        break;
+      }
+
+      // Do not hoist drives that are followed by a probe of the same slot. Such
+      // probes observe the post-drive value within the process; moving the
+      // drive out would change what they see.
+      if (probedSlots.contains(driveOp.getSignal()) &&
+          isImmediateDelay(driveOp.getTime())) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "- Skipping (probed later) " << driveOp << "\n");
+        continue;
       }
 
       // Check if we can hoist drives to this signal.
@@ -397,14 +459,9 @@ void DriveHoister::collectDriveSets() {
         continue;
       }
 
-      // Skip this drive if we have already seen a later drive for this slot.
-      if (!drivenSlots.insert(driveOp.getSignal()).second) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "- Skipping (driven later) " << driveOp << "\n");
-        continue;
-      }
-
-      // Add the operands of this drive to the drive set for the driven slot.
+      // Add this drive to the set for the slot. If we have already seen a
+      // later drive for this terminator, keep the one that takes effect latest
+      // in time (and otherwise let later procedural order win).
       auto operands = DriveOperands{
           driveOp.getValue(),
           driveOp.getTime(),
@@ -413,7 +470,19 @@ void DriveHoister::collectDriveSets() {
       };
       auto &driveSet = driveSets[driveOp.getSignal()];
       driveSet.ops.insert(driveOp);
-      driveSet.operands.insert({terminator, operands});
+      auto existing = driveSet.operands.find(terminator);
+      if (existing == driveSet.operands.end()) {
+        driveSet.operands.insert({terminator, operands});
+        continue;
+      }
+      if (isLaterDelay(operands.delay, existing->second.delay)) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "- Replacing (later delay) " << driveOp << "\n");
+        existing->second = operands;
+        continue;
+      }
+      LLVM_DEBUG(llvm::dbgs()
+                 << "- Skipping (driven later) " << driveOp << "\n");
     }
   }
 }

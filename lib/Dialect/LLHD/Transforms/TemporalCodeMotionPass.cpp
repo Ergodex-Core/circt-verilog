@@ -219,6 +219,87 @@ static Value rewriteBrokenEdgeCondition(Value value, Location loc,
   return value;
 }
 
+/// Repair broken edge-detection expressions of the form `~x & x` / `x & ~x`
+/// that may arise after canonicalizing wait loops. These expressions are
+/// semantically false, but if `x` is a wait-observed trigger and we have a
+/// corresponding "past" block argument, we can reconstruct the intended
+/// `~past & present` / `past & ~present` form.
+static void repairBrokenEdgeDetectors(llhd::ProcessOp procOp) {
+  // Find the unique wait terminator and derive the mapping from present
+  // triggers (destination operands) to their past loop-carried block args.
+  llhd::WaitOp waitOp;
+  for (auto candidate : procOp.getOps<llhd::WaitOp>()) {
+    if (waitOp)
+      return;
+    waitOp = candidate;
+  }
+  if (!waitOp)
+    return;
+
+  Block *succ = waitOp.getSuccessor();
+  if (!succ)
+    return;
+  if (succ->getNumArguments() != waitOp.getDestOperands().size())
+    return;
+
+  DenseMap<Value, Value> presentToPast;
+  for (auto [present, past] :
+       llvm::zip(waitOp.getDestOperands(), succ->getArguments())) {
+    if (!present.getType().isSignlessInteger(1) ||
+        !past.getType().isSignlessInteger(1))
+      continue;
+    presentToPast.try_emplace(present, past);
+  }
+  if (presentToPast.empty())
+    return;
+
+  SmallVector<comb::AndOp> andOps;
+  procOp.walk([&](comb::AndOp andOp) { andOps.push_back(andOp); });
+
+  for (comb::AndOp andOp : andOps) {
+    if (!andOp)
+      continue;
+
+    auto inputs = llvm::to_vector(andOp.getInputs());
+    if (inputs.size() != 2)
+      continue;
+
+    Value base;
+    bool wantPosedge = false;
+    if (matchI1Not(inputs[0], base) && base == inputs[1]) {
+      wantPosedge = true;
+    } else if (matchI1Not(inputs[1], base) && base == inputs[0]) {
+      wantPosedge = false;
+    } else {
+      continue;
+    }
+
+    auto it = presentToPast.find(base);
+    if (it == presentToPast.end())
+      continue;
+
+    OpBuilder builder(andOp);
+    builder.setInsertionPoint(andOp);
+    Location loc = andOp.getLoc();
+    bool twoState = andOp.getTwoState();
+    Value past = it->second;
+
+    Value replacement;
+    if (wantPosedge) {
+      Value notPast = comb::createOrFoldNot(loc, past, builder, twoState);
+      replacement =
+          comb::AndOp::create(builder, loc, notPast, base, twoState).getResult();
+    } else {
+      Value notPresent = comb::createOrFoldNot(loc, base, builder, twoState);
+      replacement =
+          comb::AndOp::create(builder, loc, past, notPresent, twoState).getResult();
+    }
+
+    andOp.getResult().replaceAllUsesWith(replacement);
+    andOp.erase();
+  }
+}
+
 struct ClockStripInfo {
   Value simplified;
   bool onlyObserved = false;
@@ -1229,6 +1310,7 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
   // it into a single wait loop that is friendlier to drive hoisting and
   // desequentialization. Ignore processes that do not match the pattern.
   (void)canonicalizeWaitLoop(procOp);
+  repairBrokenEdgeDetectors(procOp);
 
   // canonicalizeWaitLoop replaces multiple `llhd.prb` ops of an observed signal
   // with a single graph probe. If we already cloned sim side effects into a
