@@ -46,7 +46,9 @@ namespace {
 static bool isInProceduralRegion(Operation *op) {
   for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
        parent = parent->getParentOp()) {
-    if (parent->hasTrait<sv::ProceduralRegion>() || isa<moore::ProcedureOp>(parent))
+    if (parent->hasTrait<sv::ProceduralRegion>() ||
+        parent->hasTrait<llhd::ProceduralRegion>() ||
+        isa<moore::ProcedureOp>(parent))
       return true;
   }
   return false;
@@ -466,20 +468,19 @@ static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
         Value fieldHandle =
             builder.create<sv::StructFieldInOutOp>(baseValue, fieldAttr);
         bool inProceduralRegion = isInProceduralRegion(assign);
-        bool inModuleBody = isa<hw::HWModuleOp>(assign->getParentOp());
-        if (inProceduralRegion) {
-          builder.create<sv::BPAssignOp>(fieldHandle, assign.getRhs());
-        } else if (inModuleBody) {
-          // Structural assigns are equivalent to a continuous drive. Represent
-          // them as an epsilon-delayed LLHD drive to avoid leaving SV assigns
-          // to non-wire destinations for downstream passes.
-          auto epsilonDelay = llhd::ConstantTimeOp::create(
-              builder, assign.getLoc(), 0, "ns", 0, 1);
-          llhd::DrvOp::create(builder, assign.getLoc(), fieldHandle,
-                              assign.getRhs(), epsilonDelay, Value{});
-        } else {
-          builder.create<sv::AssignOp>(fieldHandle, assign.getRhs());
-        }
+        // Prefer LLHD drives over SV assign ops so downstream passes (Arc/LLVM)
+        // never see residual SV dialect statements.
+        //
+        // - Structural interface bindings (e.g. interface port hookups) are
+        //   modeled as epsilon-delayed continuous drives.
+        // - Procedural writes (e.g. inside `llhd.process` / always blocks) are
+        //   modeled as delta-delayed drives to preserve scheduling semantics.
+        auto delay = llhd::ConstantTimeOp::create(
+            builder, assign.getLoc(), 0, "ns",
+            /*delta=*/inProceduralRegion ? 1 : 0,
+            /*epsilon=*/inProceduralRegion ? 0 : 1);
+        llhd::DrvOp::create(builder, assign.getLoc(), fieldHandle,
+                            assign.getRhs(), delay, Value{});
         assign.erase();
         continue;
       }

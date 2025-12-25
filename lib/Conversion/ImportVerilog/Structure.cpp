@@ -354,6 +354,86 @@ struct ModuleVisitor : public BaseVisitor {
       inst.getOperation()->setAttr(
           "name", builder.getStringAttr(Twine(blockNamePrefix) + instNode.name));
       context.valueSymbols.insert(&instNode, inst.getResult());
+
+      // Lower interface port bindings (e.g. `input_if in(clk);`) by wiring the
+      // provided expressions into the corresponding interface signals. Slang
+      // exposes these as regular port connections on the interface instance.
+      //
+      // Note: This is intentionally conservative and focuses on the most
+      // common patterns (clock/reset inputs, and basic output wiring). Inout
+      // and ref ports are currently ignored.
+      for (const auto *con : instNode.getPortConnections()) {
+        const auto *expr = con->getExpression();
+        if (!expr)
+          continue;
+
+        // Unpack the `<expr> = EmptyArgument` pattern emitted by Slang for
+        // output and inout ports.
+        if (const auto *assign = expr->as_if<AssignmentExpression>())
+          expr = &assign->left();
+
+        auto *port = con->port.as_if<PortSymbol>();
+        if (!port)
+          continue;
+
+        const auto *internalValue =
+            port->internalSymbol
+                ? port->internalSymbol->as_if<slang::ast::ValueSymbol>()
+                : nullptr;
+        if (!internalValue) {
+          mlir::emitError(loc)
+              << "unsupported interface port `" << port->name
+              << "` (missing internal value symbol)";
+          return failure();
+        }
+
+        auto memberLoc = context.convertLocation(internalValue->location);
+        auto signalAttr = context.lookupInterfaceSignal(*internalValue, memberLoc);
+        if (failed(signalAttr))
+          return failure();
+
+        auto targetType = context.convertType(port->getType());
+        if (!targetType)
+          return failure();
+        auto signalType = getInterfaceSignalType(targetType);
+        if (!signalType)
+          return failure();
+
+        switch (port->direction) {
+        case ArgumentDirection::In: {
+          Value rhs = context.convertRvalueExpression(*expr, targetType);
+          if (!rhs)
+            return failure();
+          rhs = context.materializeConversion(signalType, rhs, /*isSigned=*/false,
+                                              rhs.getLoc());
+          if (!rhs)
+            return failure();
+
+          builder.create<sv::AssignInterfaceSignalOp>(
+              memberLoc, inst.getResult(), *signalAttr, rhs);
+          break;
+        }
+        case ArgumentDirection::Out: {
+          // Bind the interface signal to the provided lvalue.
+          Value lvalue = context.convertLvalueExpression(*expr);
+          if (!lvalue)
+            return failure();
+          auto dstType = cast<moore::RefType>(lvalue.getType()).getNestedType();
+          Value read = builder.create<sv::ReadInterfaceSignalOp>(
+              memberLoc, signalType, inst.getResult(), *signalAttr);
+          read = context.materializeConversion(dstType, read,
+                                               /*isSigned=*/false, memberLoc);
+          if (!read)
+            return failure();
+          moore::ContinuousAssignOp::create(builder, memberLoc, lvalue, read);
+          break;
+        }
+        default:
+          // Best-effort: ignore inout/ref ports for now.
+          break;
+        }
+      }
+
       return success();
     }
     case slang::ast::DefinitionKind::Module:
