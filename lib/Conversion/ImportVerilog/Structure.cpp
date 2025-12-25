@@ -2051,6 +2051,10 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   lowering->isConverting = true;
   llvm::scope_exit convertingGuard([&] { lowering->isConverting = false; });
 
+  functionReturnVarStack.push_back(returnVar);
+  auto returnVarGuard =
+      llvm::make_scope_exit([&] { functionReturnVarStack.pop_back(); });
+
   if (failed(convertStatement(subroutine.getBody())))
     return failure();
 
