@@ -1026,13 +1026,25 @@ static LogicalResult convert(llhd::CombinationalOp op,
   // Create a replacement `arc.execute` op.
   auto executeOp =
       ExecuteOp::create(rewriter, op.getLoc(), resultTypes, convertedOperands);
-  executeOp.getBody().takeBody(op.getBody());
-  TypeConverter::SignatureConversion signature(convertedOperands.size());
+  Block &entryBlock = op.getBody().front();
+  unsigned captureOffset = entryBlock.getNumArguments() - operands.size();
+  TypeConverter::SignatureConversion signature(entryBlock.getNumArguments());
+  for (unsigned i = 0; i < captureOffset; ++i) {
+    SmallVector<Type> types;
+    if (failed(converter.convertType(entryBlock.getArgument(i), types)) ||
+        types.size() != 1)
+      return failure();
+    signature.addInputs(i, types.front());
+  }
   for (auto [idx, operand] : llvm::enumerate(convertedOperands))
-    signature.addInputs(idx, operand.getType());
-  if (!rewriter.applySignatureConversion(&executeOp.getBody().front(),
-                                         signature, &converter))
+    signature.addInputs(captureOffset + idx, operand.getType());
+  // Apply signature conversion before moving the body. This keeps the rewrite
+  // rollback-safe: moving regions via `takeBody` is not tracked by the
+  // conversion rewriter and can crash if the pattern needs to fail.
+  if (!rewriter.applySignatureConversion(&entryBlock, signature, &converter))
     return failure();
+  rewriter.inlineRegionBefore(op.getBody(), executeOp.getBody(),
+                              executeOp.getBody().begin());
   rewriter.replaceOp(op, executeOp.getResults());
   return success();
 }
@@ -1068,13 +1080,22 @@ static LogicalResult convert(llhd::ProcessOp op, llhd::ProcessOp::Adaptor adapto
 
   auto executeOp =
       ExecuteOp::create(rewriter, op.getLoc(), resultTypes, convertedOperands);
-  executeOp.getBody().takeBody(op.getBody());
-  TypeConverter::SignatureConversion signature(convertedOperands.size());
+  Block &entryBlock = op.getBody().front();
+  unsigned captureOffset = entryBlock.getNumArguments() - operands.size();
+  TypeConverter::SignatureConversion signature(entryBlock.getNumArguments());
+  for (unsigned i = 0; i < captureOffset; ++i) {
+    SmallVector<Type> types;
+    if (failed(converter.convertType(entryBlock.getArgument(i), types)) ||
+        types.size() != 1)
+      return failure();
+    signature.addInputs(i, types.front());
+  }
   for (auto [idx, operand] : llvm::enumerate(convertedOperands))
-    signature.addInputs(idx, operand.getType());
-  if (!rewriter.applySignatureConversion(&executeOp.getBody().front(),
-                                         signature, &converter))
+    signature.addInputs(captureOffset + idx, operand.getType());
+  if (!rewriter.applySignatureConversion(&entryBlock, signature, &converter))
     return failure();
+  rewriter.inlineRegionBefore(op.getBody(), executeOp.getBody(),
+                              executeOp.getBody().begin());
   rewriter.replaceOp(op, executeOp.getResults());
   return success();
 }
@@ -1140,9 +1161,6 @@ struct SigExtractOpConversion : public OpConversionPattern<llhd::SigExtractOp> {
     }
 
     auto lowBit = getConstantLowBit(op.getLowBit());
-    if (!lowBit)
-      return rewriter.notifyMatchFailure(op, "non-constant low bit");
-
     auto outInout = dyn_cast<hw::InOutType>(op.getResult().getType());
     if (!outInout)
       return rewriter.notifyMatchFailure(op, "expected inout result type");
@@ -1155,7 +1173,70 @@ struct SigExtractOpConversion : public OpConversionPattern<llhd::SigExtractOp> {
     if (!inTy)
       return rewriter.notifyMatchFailure(op, "expected integer input type");
 
-    rewriter.replaceOpWithNewOp<comb::ExtractOp>(op, outTy, inputVal, *lowBit);
+    // Handle constant bit indices with a direct extract, otherwise lower to a
+    // variable shift and then extract bit 0.
+    if (lowBit) {
+      rewriter.replaceOpWithNewOp<comb::ExtractOp>(op, outTy, inputVal, *lowBit);
+      return success();
+    }
+
+    Value lowBitVal = adaptor.getLowBit();
+    auto lowBitTy = dyn_cast<IntegerType>(lowBitVal.getType());
+    if (!lowBitTy)
+      return rewriter.notifyMatchFailure(op, "expected integer lowBit type");
+
+    // comb.shru requires uniform operand widths.
+    if (lowBitTy.getWidth() != inTy.getWidth()) {
+      Location loc = op.getLoc();
+      if (lowBitTy.getWidth() < inTy.getWidth()) {
+        unsigned padWidth = inTy.getWidth() - lowBitTy.getWidth();
+        Value pad = hw::ConstantOp::create(
+            rewriter, loc,
+            rewriter.getIntegerAttr(rewriter.getIntegerType(padWidth), 0));
+        lowBitVal = comb::ConcatOp::create(rewriter, loc, pad, lowBitVal);
+      } else {
+        lowBitVal = comb::ExtractOp::create(rewriter, loc, lowBitVal, 0,
+                                            inTy.getWidth());
+      }
+    }
+
+    Value shifted = rewriter.createOrFold<comb::ShrUOp>(op.getLoc(), inputVal,
+                                                        lowBitVal);
+    rewriter.replaceOpWithNewOp<comb::ExtractOp>(op, outTy, shifted, 0);
+    return success();
+  }
+};
+
+/// `llhd.sig.struct_extract` -> `hw.struct_extract` (drop inout semantics)
+struct SigStructExtractOpConversion
+    : public OpConversionPattern<llhd::SigStructExtractOp> {
+  using OpConversionPattern<llhd::SigStructExtractOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::SigStructExtractOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<hw::StructType>(adaptor.getInput().getType()))
+      return rewriter.notifyMatchFailure(
+          op, "expected struct input after conversion");
+    rewriter.replaceOpWithNewOp<hw::StructExtractOp>(op, adaptor.getInput(),
+                                                     op.getFieldAttr());
+    return success();
+  }
+};
+
+/// `llhd.sig.array_get` -> `hw.array_get` (drop inout semantics)
+struct SigArrayGetOpConversion
+    : public OpConversionPattern<llhd::SigArrayGetOp> {
+  using OpConversionPattern<llhd::SigArrayGetOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::SigArrayGetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<hw::ArrayType>(adaptor.getInput().getType()))
+      return rewriter.notifyMatchFailure(
+          op, "expected array input after conversion");
+    rewriter.replaceOpWithNewOp<hw::ArrayGetOp>(op, adaptor.getInput(),
+                                                adaptor.getIndex());
     return success();
   }
 };
@@ -1406,6 +1487,8 @@ void ConvertToArcsPass::runOnOperation() {
   patterns.add<ProbeOpConversion>(converter, &getContext());
   patterns.add<DrvOpConversion>(converter, &getContext());
   patterns.add<SigExtractOpConversion>(converter, &getContext());
+  patterns.add<SigStructExtractOpConversion>(converter, &getContext());
+  patterns.add<SigArrayGetOpConversion>(converter, &getContext());
   patterns.add<StructFieldInOutOpConversion>(converter, &getContext());
   patterns.add<SVAssignOpConversion>(converter, &getContext());
   patterns.add<SVBPAssignOpConversion>(converter, &getContext());
