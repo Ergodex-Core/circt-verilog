@@ -16,14 +16,18 @@
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/PortConverter.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
+#include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "llvm/ADT/SmallString.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -179,6 +183,9 @@ static LogicalResult verifyWritableSignal(InterfaceInfo *info,
 class LowerInterfacesPass
     : public circt::sv::impl::LowerInterfacesBase<LowerInterfacesPass> {
 public:
+  void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<hw::HWDialect, llhd::LLHDDialect, sv::SVDialect>();
+  }
   void runOnOperation() override;
 
   FailureOr<InterfaceInfo *> lookupInterfaceInfo(InterfaceType type,

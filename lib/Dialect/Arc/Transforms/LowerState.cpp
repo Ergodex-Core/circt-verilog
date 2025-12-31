@@ -14,6 +14,7 @@
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
+#include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -58,6 +59,7 @@ OS &operator<<(OS &os, Phase phase) {
   case Phase::Final:
     return os << "final";
   }
+  return os << "unknown";
 }
 
 struct ModuleLowering;
@@ -102,6 +104,12 @@ struct OpLowering {
   LogicalResult lower(hw::OutputOp op);
   LogicalResult lower(seq::InitialOp op);
   LogicalResult lower(llhd::FinalOp op);
+  LogicalResult lower(verif::AssertOp op);
+  LogicalResult lower(verif::AssumeOp op);
+  LogicalResult lower(verif::CoverOp op);
+  LogicalResult lower(verif::ClockedAssertOp op);
+  LogicalResult lower(verif::ClockedAssumeOp op);
+  LogicalResult lower(verif::ClockedCoverOp op);
 
   scf::IfOp createIfClockOp(Value clock);
 
@@ -117,7 +125,6 @@ struct OpLowering {
   Value lowerValue(seq::InitialOp op, OpResult result, Phase phase);
   Value lowerValue(seq::FromImmutableOp op, OpResult result, Phase phase);
 
-  void addPending(Value value, Phase phase);
   void addPending(Operation *op, Phase phase);
 };
 
@@ -222,7 +229,10 @@ LogicalResult ModuleLowering::run() {
 
   // Lower the ops.
   for (auto &op : moduleOp.getOps()) {
-    if (mlir::isMemoryEffectFree(&op) && !isa<hw::OutputOp>(op))
+    if (mlir::isMemoryEffectFree(&op) &&
+        !isa<hw::OutputOp, verif::AssertOp, verif::AssumeOp, verif::CoverOp,
+             verif::ClockedAssertOp, verif::ClockedAssumeOp,
+             verif::ClockedCoverOp>(op))
       continue;
     if (isa<MemoryReadPortOp, MemoryWritePortOp>(op))
       continue; // handled as part of `MemoryOp`
@@ -381,6 +391,7 @@ OpBuilder &ModuleLowering::getBuilder(Phase phase) {
   case Phase::Final:
     return finalBuilder;
   }
+  return builder;
 }
 
 /// Get the lowered value, or emit a diagnostic and return null.
@@ -416,7 +427,9 @@ LogicalResult OpLowering::lower() {
   return TypeSwitch<Operation *, LogicalResult>(op)
       // Operations with special lowering.
       .Case<StateOp, sim::DPICallOp, MemoryOp, TapOp, InstanceOp, hw::OutputOp,
-            seq::InitialOp, llhd::FinalOp>([&](auto op) { return lower(op); })
+            seq::InitialOp, llhd::FinalOp, verif::AssertOp, verif::AssumeOp,
+            verif::CoverOp, verif::ClockedAssertOp, verif::ClockedAssumeOp,
+            verif::ClockedCoverOp>([&](auto op) { return lower(op); })
 
       // Operations that should be skipped entirely and never land on the
       // worklist to be lowered.
@@ -968,6 +981,145 @@ LogicalResult OpLowering::lower(llhd::FinalOp op) {
   return success();
 }
 
+static Value getI1Constant(OpBuilder &builder, Location loc, bool value) {
+  return ConstantOp::create(builder, loc, builder.getI1Type(),
+                            static_cast<int64_t>(value));
+}
+
+template <typename AssertLikeOp>
+static LogicalResult lowerUnclockedVerifAssertLike(OpLowering &lowering,
+                                                   AssertLikeOp op) {
+  assert(lowering.phase == Phase::New);
+
+  if (!op.getProperty().getType().isInteger(1)) {
+    if (!lowering.initial)
+      op.emitWarning()
+          << "unsupported non-i1 verif assertion property; ignoring";
+    return success();
+  }
+
+  // Materialize dependencies.
+  lowering.lowerValue(op.getProperty(), Phase::Old);
+  if (op.getEnable())
+    lowering.lowerValue(op.getEnable(), Phase::Old);
+  if (lowering.initial)
+    return success();
+
+  Value property = lowering.lowerValue(op.getProperty(), Phase::Old);
+  if (!property)
+    return failure();
+
+  Value enable;
+  if (op.getEnable()) {
+    enable = lowering.lowerValue(op.getEnable(), Phase::Old);
+    if (!enable)
+      return failure();
+  } else {
+    enable = getI1Constant(lowering.module.builder, op.getLoc(), true);
+  }
+
+  Value notProperty = comb::XorOp::create(
+      lowering.module.builder, op.getLoc(), property,
+      getI1Constant(lowering.module.builder, op.getLoc(), true));
+  Value failCond =
+      comb::AndOp::create(lowering.module.builder, op.getLoc(), enable,
+                          notProperty);
+
+  auto ifFail = createOrReuseIf(lowering.module.builder, failCond, false);
+  lowering.module.builder.setInsertionPoint(ifFail.thenYield());
+  sim::TerminateOp::create(lowering.module.builder, op.getLoc(),
+                           /*success=*/false, /*verbose=*/false);
+  return success();
+}
+
+LogicalResult OpLowering::lower(verif::AssertOp op) {
+  return lowerUnclockedVerifAssertLike(*this, op);
+}
+
+LogicalResult OpLowering::lower(verif::AssumeOp op) {
+  return lowerUnclockedVerifAssertLike(*this, op);
+}
+
+LogicalResult OpLowering::lower(verif::CoverOp op) {
+  // Coverage is not currently surfaced in simulation; drop.
+  (void)op;
+  return success();
+}
+
+template <typename ClockedAssertLikeOp>
+static LogicalResult lowerClockedVerifAssertLike(OpLowering &lowering,
+                                                 ClockedAssertLikeOp op) {
+  assert(lowering.phase == Phase::New);
+
+  if (op.getEdge() != verif::ClockEdge::Pos) {
+    if (!lowering.initial)
+      op.emitWarning() << "unsupported verif clock edge; ignoring";
+    return success();
+  }
+
+  if (!op.getProperty().getType().isInteger(1)) {
+    if (!lowering.initial)
+      op.emitWarning()
+          << "unsupported non-i1 verif assertion property; ignoring";
+    return success();
+  }
+
+  // Materialize dependencies.
+  lowering.lowerValue(op.getClock(), Phase::New);
+  lowering.lowerValue(op.getProperty(), Phase::Old);
+  if (op.getEnable())
+    lowering.lowerValue(op.getEnable(), Phase::Old);
+  if (lowering.initial)
+    return success();
+
+  auto ifClockOp = lowering.createIfClockOp(op.getClock());
+  if (!ifClockOp)
+    return failure();
+
+  OpBuilder::InsertionGuard guard(lowering.module.builder);
+  lowering.module.builder.setInsertionPoint(ifClockOp.thenYield());
+
+  Value property = lowering.lowerValue(op.getProperty(), Phase::Old);
+  if (!property)
+    return failure();
+
+  Value enable;
+  if (op.getEnable()) {
+    enable = lowering.lowerValue(op.getEnable(), Phase::Old);
+    if (!enable)
+      return failure();
+  } else {
+    enable = getI1Constant(lowering.module.builder, op.getLoc(), true);
+  }
+
+  Value notProperty = comb::XorOp::create(
+      lowering.module.builder, op.getLoc(), property,
+      getI1Constant(lowering.module.builder, op.getLoc(), true));
+  Value failCond =
+      comb::AndOp::create(lowering.module.builder, op.getLoc(), enable,
+                          notProperty);
+
+  auto ifFail = createOrReuseIf(lowering.module.builder, failCond, false);
+  lowering.module.builder.setInsertionPoint(ifFail.thenYield());
+  sim::TerminateOp::create(lowering.module.builder, op.getLoc(),
+                           /*success=*/false, /*verbose=*/false);
+  return success();
+}
+
+LogicalResult OpLowering::lower(verif::ClockedAssertOp op) {
+  return lowerClockedVerifAssertLike(*this, op);
+}
+
+LogicalResult OpLowering::lower(verif::ClockedAssumeOp op) {
+  return lowerClockedVerifAssertLike(*this, op);
+}
+
+LogicalResult OpLowering::lower(verif::ClockedCoverOp op) {
+  // Coverage is not currently surfaced in simulation; drop.
+  (void)op;
+  return success();
+}
+
 /// Create the operations necessary to detect a posedge on the given clock,
 /// potentially reusing a previous posedge detection, and create an `scf.if`
 /// operation for that posedge. This also tries to reuse an `scf.if` operation
@@ -1163,13 +1315,6 @@ Value OpLowering::lowerValue(seq::InitialOp op, OpResult result, Phase phase) {
 Value OpLowering::lowerValue(seq::FromImmutableOp op, OpResult result,
                              Phase phase) {
   return lowerValue(op.getInput(), phase);
-}
-
-/// Mark a value as to be lowered before the current op.
-void OpLowering::addPending(Value value, Phase phase) {
-  auto *defOp = value.getDefiningOp();
-  assert(defOp && "block args should never be marked as a dependency");
-  addPending(defOp, phase);
 }
 
 /// Mark an operation as to be lowered before the current op. This adds that

@@ -18,7 +18,9 @@
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Dialect/Verif/VerifOps.h"
 #include "circt/Support/ConversionPatternSet.h"
+#include "circt/Support/FVInt.h"
 #include <algorithm>
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/raw_ostream.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
@@ -203,6 +205,284 @@ static LogicalResult resolveClassStructBody(ModuleOp mod, SymbolRefAttr op,
                                             ClassTypeCache &cache) {
   auto classDeclOp = cast<ClassDeclOp>(*mod.lookupSymbol(op));
   return resolveClassStructBody(classDeclOp, typeConverter, cache);
+
+static std::optional<FVInt>
+tryEvaluateMooreIntValue(Value value,
+                         DenseMap<Value, std::optional<FVInt>> &cache,
+                         SmallDenseSet<Value, 8> &visiting);
+
+static std::string formatFourValuedConstant(const FVInt &value,
+                                            moore::IntFormat format) {
+  auto bitWidth = value.getBitWidth();
+  if (bitWidth == 0) {
+    if (format == moore::IntFormat::Decimal)
+      return "0";
+    return "";
+  }
+
+  auto padLeft = [](StringRef text, unsigned targetWidth, char padChar) {
+    if (text.size() >= targetWidth)
+      return text.str();
+    std::string out;
+    out.reserve(targetWidth);
+    out.append(targetWidth - text.size(), padChar);
+    out.append(text.begin(), text.end());
+    return out;
+  };
+
+  switch (format) {
+  case moore::IntFormat::Decimal: {
+    unsigned padWidth = sim::FormatDecOp::getDecimalWidth(bitWidth, false);
+    if (value.hasUnknown()) {
+      char digit = value.isAllZ() ? 'z' : 'x';
+      return padLeft(StringRef(&digit, 1), padWidth, ' ');
+    }
+
+    auto apint = value.toAPInt(false);
+    SmallString<16> strBuf;
+    apint.toString(strBuf, /*Radix=*/10, /*Signed=*/false);
+    return padLeft(strBuf, padWidth, ' ');
+  }
+
+  case moore::IntFormat::Binary: {
+    std::string out;
+    out.reserve(bitWidth);
+    for (unsigned i = 0; i < bitWidth; ++i) {
+      auto bit = value.getBit(bitWidth - 1 - i);
+      switch (bit) {
+      case FVInt::V0:
+        out.push_back('0');
+        break;
+      case FVInt::V1:
+        out.push_back('1');
+        break;
+      case FVInt::X:
+        out.push_back('x');
+        break;
+      case FVInt::Z:
+        out.push_back('z');
+        break;
+      }
+    }
+    return out;
+  }
+
+  case moore::IntFormat::Octal: {
+    std::string out;
+    unsigned digits = (bitWidth + 2) / 3;
+    out.reserve(digits);
+    for (unsigned d = 0; d < digits; ++d) {
+      bool hasX = false;
+      bool hasZ = false;
+      uint8_t val = 0;
+      for (unsigned b = 0; b < 3; ++b) {
+        unsigned idx = digits * 3 - 1 - (d * 3 + b);
+        if (idx >= bitWidth)
+          continue;
+        auto bit = value.getBit(idx);
+        switch (bit) {
+        case FVInt::V0:
+          break;
+        case FVInt::V1:
+          val |= (1u << (2 - b));
+          break;
+        case FVInt::X:
+          hasX = true;
+          break;
+        case FVInt::Z:
+          hasZ = true;
+          break;
+        }
+      }
+      if (hasX)
+        out.push_back('x');
+      else if (hasZ)
+        out.push_back('z');
+      else
+        out.push_back(static_cast<char>('0' + val));
+    }
+    return out;
+  }
+
+  case moore::IntFormat::HexLower:
+  case moore::IntFormat::HexUpper: {
+    std::string out;
+    unsigned digits = (bitWidth + 3) / 4;
+    out.reserve(digits);
+    for (unsigned d = 0; d < digits; ++d) {
+      bool hasX = false;
+      bool hasZ = false;
+      uint8_t val = 0;
+      for (unsigned b = 0; b < 4; ++b) {
+        unsigned idx = digits * 4 - 1 - (d * 4 + b);
+        if (idx >= bitWidth)
+          continue;
+        auto bit = value.getBit(idx);
+        switch (bit) {
+        case FVInt::V0:
+          break;
+        case FVInt::V1:
+          val |= (1u << (3 - b));
+          break;
+        case FVInt::X:
+          hasX = true;
+          break;
+        case FVInt::Z:
+          hasZ = true;
+          break;
+        }
+      }
+      if (hasX) {
+        out.push_back(format == moore::IntFormat::HexUpper ? 'X' : 'x');
+        continue;
+      }
+      if (hasZ) {
+        out.push_back(format == moore::IntFormat::HexUpper ? 'Z' : 'z');
+        continue;
+      }
+
+      if (val < 10) {
+        out.push_back(static_cast<char>('0' + val));
+        continue;
+      }
+      out.push_back(static_cast<char>(
+          (format == moore::IntFormat::HexUpper ? 'A' : 'a') + (val - 10)));
+    }
+    return out;
+  }
+  }
+  llvm_unreachable("unknown integer format");
+}
+
+static std::optional<FVInt>
+tryEvaluateMooreRefValue(Value ref,
+                         DenseMap<Value, std::optional<FVInt>> &cache,
+                         SmallDenseSet<Value, 8> &visiting) {
+  if (!ref)
+    return std::nullopt;
+
+  // Support constant nets driven solely by constant continuous assignments.
+  if (auto net = ref.getDefiningOp<NetOp>()) {
+    SmallVector<FVInt, 2> candidates;
+
+    auto addCandidate = [&](Value v) -> LogicalResult {
+      if (!v)
+        return failure();
+      auto fv = tryEvaluateMooreIntValue(v, cache, visiting);
+      if (!fv)
+        return failure();
+      candidates.push_back(*fv);
+      return success();
+    };
+
+    if (auto assignment = net.getAssignment())
+      if (failed(addCandidate(assignment)))
+        return std::nullopt;
+
+    for (auto &use : ref.getUses()) {
+      auto *owner = use.getOwner();
+      if (auto assign = dyn_cast<ContinuousAssignOp>(owner)) {
+        if (assign.getDst() != ref)
+          return std::nullopt;
+        if (failed(addCandidate(assign.getSrc())))
+          return std::nullopt;
+        continue;
+      }
+      if (isa<ReadOp, OutputOp>(owner))
+        continue;
+      return std::nullopt;
+    }
+
+    if (candidates.empty())
+      return std::nullopt;
+
+    for (auto &candidate : candidates)
+      if (!(candidate == candidates.front()))
+        return std::nullopt;
+    return candidates.front();
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<FVInt>
+tryEvaluateMooreIntValue(Value value,
+                         DenseMap<Value, std::optional<FVInt>> &cache,
+                         SmallDenseSet<Value, 8> &visiting) {
+  if (!value)
+    return std::nullopt;
+
+  auto it = cache.find(value);
+  if (it != cache.end())
+    return it->second;
+
+  if (visiting.contains(value))
+    return std::nullopt;
+  visiting.insert(value);
+  auto guard = llvm::make_scope_exit([&] { visiting.erase(value); });
+
+  std::optional<FVInt> result;
+
+  if (auto constant = value.getDefiningOp<ConstantOp>()) {
+    result = constant.getValue();
+  } else if (auto read = value.getDefiningOp<ReadOp>()) {
+    result = tryEvaluateMooreRefValue(read.getInput(), cache, visiting);
+  } else if (auto eq = value.getDefiningOp<EqOp>()) {
+    auto lhs = tryEvaluateMooreIntValue(eq.getLhs(), cache, visiting);
+    auto rhs = tryEvaluateMooreIntValue(eq.getRhs(), cache, visiting);
+    if (lhs && rhs) {
+      if (lhs->getBitWidth() != rhs->getBitWidth())
+        return std::nullopt;
+
+      auto unknownBits = lhs->getUnknownBits() | rhs->getUnknownBits();
+      auto knownMask = ~(lhs->getUnknownBits() | rhs->getUnknownBits());
+      auto mismatchBits = (lhs->getRawValue() ^ rhs->getRawValue()) & knownMask;
+      if (!mismatchBits.isZero())
+        result = FVInt(/*numBits=*/1, 0);
+      else if (!unknownBits.isZero())
+        result = FVInt::getAllX(/*numBits=*/1);
+      else
+        result = FVInt(/*numBits=*/1, 1);
+    }
+  } else if (auto ne = value.getDefiningOp<NeOp>()) {
+    auto lhs = tryEvaluateMooreIntValue(ne.getLhs(), cache, visiting);
+    auto rhs = tryEvaluateMooreIntValue(ne.getRhs(), cache, visiting);
+    if (lhs && rhs) {
+      if (lhs->getBitWidth() != rhs->getBitWidth())
+        return std::nullopt;
+
+      auto unknownBits = lhs->getUnknownBits() | rhs->getUnknownBits();
+      auto knownMask = ~(lhs->getUnknownBits() | rhs->getUnknownBits());
+      auto mismatchBits = (lhs->getRawValue() ^ rhs->getRawValue()) & knownMask;
+      if (!mismatchBits.isZero())
+        result = FVInt(/*numBits=*/1, 1);
+      else if (!unknownBits.isZero())
+        result = FVInt::getAllX(/*numBits=*/1);
+      else
+        result = FVInt(/*numBits=*/1, 0);
+    }
+  } else if (auto caseEq = value.getDefiningOp<CaseEqOp>()) {
+    auto lhs = tryEvaluateMooreIntValue(caseEq.getLhs(), cache, visiting);
+    auto rhs = tryEvaluateMooreIntValue(caseEq.getRhs(), cache, visiting);
+    if (lhs && rhs)
+      result = FVInt(/*numBits=*/1, (*lhs == *rhs) ? 1 : 0);
+  } else if (auto caseNe = value.getDefiningOp<CaseNeOp>()) {
+    auto lhs = tryEvaluateMooreIntValue(caseNe.getLhs(), cache, visiting);
+    auto rhs = tryEvaluateMooreIntValue(caseNe.getRhs(), cache, visiting);
+    if (lhs && rhs)
+      result = FVInt(/*numBits=*/1, (*lhs != *rhs) ? 1 : 0);
+  } else if (auto intToLogic = value.getDefiningOp<IntToLogicOp>()) {
+    auto input = tryEvaluateMooreIntValue(intToLogic.getInput(), cache, visiting);
+    if (input)
+      result = FVInt(input->toAPInt(false));
+  } else if (auto logicToInt = value.getDefiningOp<LogicToIntOp>()) {
+    auto input = tryEvaluateMooreIntValue(logicToInt.getInput(), cache, visiting);
+    if (input)
+      result = FVInt(input->toAPInt(false));
+  }
+
+  cache.try_emplace(value, result);
+  return result;
 }
 
 /// Returns the passed value if the integer width is already correct.
@@ -972,14 +1252,88 @@ struct VariableOpConversion : public OpConversionPattern<VariableOp> {
     // Determine the initial value of the signal.
     Value init = adaptor.getInitial();
     if (!init) {
-      auto elementType = cast<llhd::RefType>(resultType).getNestedType();
-      init = createZeroValue(elementType, loc, rewriter);
-      if (!init)
-        return failure();
+      auto refTy = dyn_cast<llhd::RefType>(resultType);
+      if (!refTy)
+        return rewriter.notifyMatchFailure(op.getLoc(),
+                                           "unexpected converted variable type");
+
+      Type elementType = refTy.getNestedType();
+      if (isa<hw::StringType>(elementType)) {
+        rewriter.getContext()->getOrLoadDialect<sv::SVDialect>();
+        init = rewriter.create<sv::ConstantStrOp>(
+            loc, cast<hw::StringType>(elementType), rewriter.getStringAttr(""));
+      } else {
+        init = createZeroValue(elementType, loc, rewriter);
+        if (!init)
+          return failure();
+      }
     }
 
-    rewriter.replaceOpWithNewOp<llhd::SignalOp>(op, resultType,
-                                                op.getNameAttr(), init);
+    rewriter.replaceOpWithNewOp<llhd::SignalOp>(op, resultType, op.getNameAttr(),
+                                                init);
+    return success();
+  }
+};
+
+static func::FuncOp getOrCreateStringCmpFn(ModuleOp module,
+                                           ConversionPatternRewriter &rewriter) {
+  if (auto existing = module.lookupSymbol<func::FuncOp>("circt_sv_strcmp"))
+    return existing;
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(module.getBody());
+
+  auto strTy = hw::StringType::get(module.getContext());
+  auto i32Ty = rewriter.getI32Type();
+  auto fnType = rewriter.getFunctionType({strTy, strTy}, {i32Ty});
+  auto fn =
+      rewriter.create<func::FuncOp>(module.getLoc(), "circt_sv_strcmp", fnType);
+  fn.setPrivate();
+  return fn;
+}
+
+struct StringCmpOpConversion : public OpConversionPattern<StringCmpOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(StringCmpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto module = op->getParentOfType<ModuleOp>();
+    if (!module)
+      return failure();
+
+    auto strcmpFn = getOrCreateStringCmpFn(module, rewriter);
+    auto call = rewriter.create<func::CallOp>(op.getLoc(), strcmpFn,
+                                              ValueRange{adaptor.getLhs(),
+                                                         adaptor.getRhs()});
+    Value cmp = call.getResult(0);
+    Value zero = hw::ConstantOp::create(rewriter, op.getLoc(),
+                                        rewriter.getI32Type(), 0);
+
+    comb::ICmpPredicate pred;
+    switch (op.getPredicate()) {
+    case moore::StringCmpPredicate::eq:
+      pred = comb::ICmpPredicate::eq;
+      break;
+    case moore::StringCmpPredicate::ne:
+      pred = comb::ICmpPredicate::ne;
+      break;
+    case moore::StringCmpPredicate::lt:
+      pred = comb::ICmpPredicate::slt;
+      break;
+    case moore::StringCmpPredicate::le:
+      pred = comb::ICmpPredicate::sle;
+      break;
+    case moore::StringCmpPredicate::gt:
+      pred = comb::ICmpPredicate::sgt;
+      break;
+    case moore::StringCmpPredicate::ge:
+      pred = comb::ICmpPredicate::sge;
+      break;
+    }
+
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<comb::ICmpOp>(op, resultType, pred, cmp, zero);
     return success();
   }
 };
@@ -1001,12 +1355,49 @@ struct NetOpConversion : public OpConversionPattern<NetOp> {
     if (width == -1)
       return failure();
 
-    auto init =
+    // Many sv-tests simulation cases declare constant-driven wires via a net
+    // initializer (e.g. `wire [N:0] a = <const>;`) and then immediately
+    // compute expressions from those nets inside a `final` block. Later in the
+    // pipeline we intentionally drop LLHD inout storage semantics for
+    // `llhd.signal`/`llhd.drv`/`llhd.prb` in graph regions; if we always
+    // initialize nets to 0 and model the initializer as an epsilon-timed drive
+    // only, the driven value can get lost and these tests become vacuous or
+    // wrong. As a best-effort, if the net initializer is trivially constant,
+    // use it as the signal's initializer directly.
+    auto isTriviallyConstant = [](Value v) -> bool {
+      while (Operation *defOp = v.getDefiningOp()) {
+        if (defOp->hasTrait<OpTrait::ConstantLike>())
+          return true;
+        if (auto bitcast = dyn_cast<hw::BitcastOp>(defOp)) {
+          v = bitcast.getInput();
+          continue;
+        }
+        if (auto cast = dyn_cast<mlir::UnrealizedConversionCastOp>(defOp)) {
+          if (cast.getInputs().size() != 1)
+            break;
+          v = cast.getInputs().front();
+          continue;
+        }
+        break;
+      }
+      return false;
+    };
+
+    Value init =
         createInitialValue(op.getKind(), rewriter, loc, width, elementType);
+    if (auto assignedValue = adaptor.getAssignment())
+      if (assignedValue.getType() == elementType &&
+          isTriviallyConstant(assignedValue))
+        init = assignedValue;
     auto signal = rewriter.replaceOpWithNewOp<llhd::SignalOp>(
         op, resultType, op.getNameAttr(), init);
 
     if (auto assignedValue = adaptor.getAssignment()) {
+      // If we used the assignment as an initializer already, there's no need
+      // to add an extra drive. This also avoids introducing epsilon scheduling
+      // requirements for constant-driven nets.
+      if (assignedValue == init)
+        return success();
       auto timeAttr = llhd::TimeAttr::get(resultType.getContext(), 0U,
                                           llvm::StringRef("ns"), 0, 1);
       auto time = llhd::ConstantTimeOp::create(rewriter, loc, timeAttr);
@@ -1088,7 +1479,15 @@ struct ConstantRealOpConv : public OpConversionPattern<ConstantRealOp> {
   LogicalResult
   matchAndRewrite(ConstantRealOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, op.getValueAttr());
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+
+    auto attr = op.getValueAttr();
+    if (attr.getType() != resultType)
+      attr = FloatAttr::get(resultType, attr.getValueAsDouble());
+
+    rewriter.replaceOpWithNewOp<mlir::arith::ConstantOp>(op, resultType, attr);
     return success();
   }
 };
@@ -1106,10 +1505,121 @@ struct ConstantTimeOpConv : public OpConversionPattern<ConstantTimeOp> {
   }
 };
 
+struct TimeBIOpConv : public OpConversionPattern<TimeBIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(TimeBIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    rewriter.replaceOpWithNewOp<llhd::CurrentTimeOp>(op);
+    return success();
+  }
+};
+
+static mlir::func::FuncOp getOrCreateExternFunc(mlir::ModuleOp module,
+                                                StringRef name,
+                                                FunctionType fnType,
+                                                ConversionPatternRewriter &rewriter) {
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  PatternRewriter::InsertionGuard g(rewriter);
+  rewriter.setInsertionPointToStart(module.getBody());
+  auto fn = rewriter.create<mlir::func::FuncOp>(module.getLoc(), name, fnType);
+  fn.setPrivate();
+  return fn;
+}
+
+struct UrandomBIOpConv : public OpConversionPattern<UrandomBIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(UrandomBIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+    auto module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return failure();
+
+    SmallVector<Value> operands;
+    StringRef fnName = "circt_sv_urandom_u32";
+    if (Value seed = adaptor.getSeed()) {
+      operands.push_back(seed);
+      fnName = "circt_sv_urandom_seed_u32";
+    }
+
+    SmallVector<Type> inputTypes;
+    inputTypes.reserve(operands.size());
+    for (Value v : operands)
+      inputTypes.push_back(v.getType());
+    auto fnType = FunctionType::get(op.getContext(), inputTypes, {resultType});
+    auto fn = getOrCreateExternFunc(module, fnName, fnType, rewriter);
+    auto call = rewriter.create<mlir::func::CallOp>(op.getLoc(), fn, operands);
+    rewriter.replaceOp(op, call.getResults());
+    return success();
+  }
+};
+
+struct RandomBIOpConv : public OpConversionPattern<RandomBIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(RandomBIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+    auto module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return failure();
+
+    SmallVector<Value> operands;
+    StringRef fnName = "circt_sv_random_i32";
+    if (Value seed = adaptor.getSeed()) {
+      operands.push_back(seed);
+      fnName = "circt_sv_random_seed_i32";
+    }
+
+    SmallVector<Type> inputTypes;
+    inputTypes.reserve(operands.size());
+    for (Value v : operands)
+      inputTypes.push_back(v.getType());
+    auto fnType = FunctionType::get(op.getContext(), inputTypes, {resultType});
+    auto fn = getOrCreateExternFunc(module, fnName, fnType, rewriter);
+    auto call = rewriter.create<mlir::func::CallOp>(op.getLoc(), fn, operands);
+    rewriter.replaceOp(op, call.getResults());
+    return success();
+  }
+};
+
+struct TimeToLogicOpConv : public OpConversionPattern<TimeToLogicOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(TimeToLogicOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<llhd::TimeToIntOp>(op, adaptor.getInput());
+    return success();
+  }
+};
+
+struct LogicToTimeOpConv : public OpConversionPattern<LogicToTimeOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(LogicToTimeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<llhd::IntToTimeOp>(op, adaptor.getInput());
+    return success();
+  }
+};
+
 struct ConstantStringOpConv : public OpConversionPattern<ConstantStringOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
-  matchAndRewrite(moore::ConstantStringOp op, OpAdaptor adaptor,
+  matchAndRewrite(ConstantStringOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     const auto resultType =
         typeConverter->convertType(op.getResult().getType());
@@ -1130,6 +1640,23 @@ struct ConstantStringOpConv : public OpConversionPattern<ConstantStringOp> {
 
     rewriter.replaceOpWithNewOp<hw::ConstantOp>(
         op, resultType, rewriter.getIntegerAttr(resultType, value));
+    return success();
+  }
+};
+
+template <typename MooreOp, typename MathOp>
+struct RealMathBuiltinOpConversion : public OpConversionPattern<MooreOp> {
+  using OpConversionPattern<MooreOp>::OpConversionPattern;
+  using OpAdaptor = typename MooreOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(MooreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType =
+        this->typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return failure();
+    rewriter.replaceOpWithNewOp<MathOp>(op, resultType, adaptor.getValue());
     return success();
   }
 };
@@ -1810,6 +2337,41 @@ struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
 
       return failure();
     }
+
+    // Integer <-> floating point conversions.
+    if (auto floatResTy = dyn_cast<FloatType>(resultType)) {
+      if (auto floatInTy = dyn_cast<FloatType>(adaptor.getInput().getType())) {
+        if (floatInTy == floatResTy) {
+          rewriter.replaceOp(op, adaptor.getInput());
+          return success();
+        }
+        if (floatInTy.getWidth() < floatResTy.getWidth()) {
+          rewriter.replaceOpWithNewOp<mlir::arith::ExtFOp>(
+              op, floatResTy, adaptor.getInput());
+          return success();
+        }
+        if (floatInTy.getWidth() > floatResTy.getWidth()) {
+          rewriter.replaceOpWithNewOp<mlir::arith::TruncFOp>(
+              op, floatResTy, adaptor.getInput());
+          return success();
+        }
+      }
+
+      if (isa<IntegerType>(adaptor.getInput().getType())) {
+        rewriter.replaceOpWithNewOp<mlir::arith::SIToFPOp>(
+            op, floatResTy, adaptor.getInput());
+        return success();
+      }
+    }
+
+    if (auto intResTy = dyn_cast<IntegerType>(resultType)) {
+      if (isa<FloatType>(adaptor.getInput().getType())) {
+        rewriter.replaceOpWithNewOp<mlir::arith::FPToSIOp>(
+            op, intResTy, adaptor.getInput());
+        return success();
+      }
+    }
+
     int64_t inputBw = hw::getBitWidth(adaptor.getInput().getType());
     int64_t resultBw = hw::getBitWidth(resultType);
     if (inputBw == -1 || resultBw == -1)
@@ -2300,6 +2862,73 @@ struct FormatLiteralOpConversion : public OpConversionPattern<FormatLiteralOp> {
   }
 };
 
+struct FormatStringOpConversion : public OpConversionPattern<FormatStringOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(FormatStringOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<sim::FormatStrOp>(op, adaptor.getString());
+    return success();
+  }
+};
+
+struct FormatStringToStringOpConversion
+    : public OpConversionPattern<FormatStringToStringOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(FormatStringToStringOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    auto strTy = dyn_cast<hw::StringType>(resultType);
+    if (!strTy)
+      return failure();
+
+    Value input = adaptor.getFmtstring();
+
+    // If the format string is just a string fragment, the conversion is a no-op.
+    if (auto strOp = input.getDefiningOp<sim::FormatStrOp>()) {
+      rewriter.replaceOp(op, strOp.getValue());
+      return success();
+    }
+
+    // If the format string is a literal fragment, materialize a string literal.
+    if (auto litOp = input.getDefiningOp<sim::FormatLitOp>()) {
+      rewriter.replaceOpWithNewOp<sv::ConstantStrOp>(
+          op, strTy, rewriter.getStringAttr(litOp.getLiteral()));
+      return success();
+    }
+
+    // Best-effort: if the concatenation is entirely literal fragments, fold.
+    if (auto concat = input.getDefiningOp<sim::FormatStringConcatOp>()) {
+      SmallVector<Value> fragments;
+      if (succeeded(concat.getFlattenedInputs(fragments))) {
+        std::string text;
+        bool allLiteral = true;
+        for (Value fragment : fragments) {
+          auto fragOp = fragment.getDefiningOp<sim::FormatLitOp>();
+          if (!fragOp) {
+            allLiteral = false;
+            break;
+          }
+          text += fragOp.getLiteral().str();
+        }
+        if (allLiteral) {
+          rewriter.replaceOpWithNewOp<sv::ConstantStrOp>(
+              op, strTy, rewriter.getStringAttr(text));
+          return success();
+        }
+      }
+    }
+
+    // Otherwise, drop formatting and produce an empty string for bring-up.
+    rewriter.replaceOpWithNewOp<sv::ConstantStrOp>(op, strTy,
+                                                   rewriter.getStringAttr(""));
+    return success();
+  }
+};
+
 struct FormatConcatOpConversion : public OpConversionPattern<FormatConcatOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2318,14 +2947,23 @@ struct FormatIntOpConversion : public OpConversionPattern<FormatIntOp> {
   LogicalResult
   matchAndRewrite(FormatIntOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-
     char padChar = adaptor.getPadding() == IntPadding::Space ? 32 : 48;
     IntegerAttr padCharAttr = rewriter.getI8IntegerAttr(padChar);
     auto widthAttr = adaptor.getSpecifierWidthAttr();
 
     bool isLeftAligned = adaptor.getAlignment() == IntAlign::Left;
     BoolAttr isLeftAlignedAttr = rewriter.getBoolAttr(isLeftAligned);
-
+    // If the formatted value can be evaluated to a constant four-valued value,
+    // emit a literal formatted string. This preserves correct X/Z printing and
+    // avoids lossy conversion of four-valued integers to core dialects.
+    DenseMap<Value, std::optional<FVInt>> cache;
+    SmallDenseSet<Value, 8> visiting;
+    if (auto fv = tryEvaluateMooreIntValue(op.getValue(), cache, visiting)) {
+      auto text = formatFourValuedConstant(*fv, op.getFormat());
+      rewriter.replaceOpWithNewOp<sim::FormatLitOp>(
+          op, rewriter.getStringAttr(text));
+      return success();
+    }
     switch (op.getFormat()) {
     case IntFormat::Decimal:
       rewriter.replaceOpWithNewOp<sim::FormatDecOp>(
@@ -2713,6 +3351,7 @@ static LogicalResult convert(TimeToLogicOp op, TimeToLogicOp::Adaptor adaptor,
 static void populateLegality(ConversionTarget &target,
                              const TypeConverter &converter) {
   target.addIllegalDialect<MooreDialect>();
+  target.addLegalDialect<mlir::arith::ArithDialect>();
   target.addLegalDialect<comb::CombDialect>();
   target.addLegalDialect<hw::HWDialect>();
   target.addLegalDialect<seq::SeqDialect>();
@@ -2775,6 +3414,16 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
 
   typeConverter.addConversion(
       [&](TimeType type) { return llhd::TimeType::get(type.getContext()); });
+
+  typeConverter.addConversion([&](RealType type) -> std::optional<Type> {
+    switch (type.getWidth()) {
+    case RealWidth::f32:
+      return Float32Type::get(type.getContext());
+    case RealWidth::f64:
+      return Float64Type::get(type.getContext());
+    }
+    return {};
+  });
 
   typeConverter.addConversion([&](FormatStringType type) {
     return sim::FormatStringType::get(type.getContext());
@@ -2898,6 +3547,7 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
   typeConverter.addConversion([](FloatType type) { return type; });
   typeConverter.addConversion([](sim::DynamicStringType type) { return type; });
   typeConverter.addConversion([](llhd::TimeType type) { return type; });
+  typeConverter.addConversion([](hw::StringType type) { return type; });
   typeConverter.addConversion([](debug::ArrayType type) { return type; });
   typeConverter.addConversion([](debug::ScopeType type) { return type; });
   typeConverter.addConversion([](debug::StructType type) { return type; });
@@ -3009,6 +3659,11 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     ConcatOpConversion,
     ReplicateOpConversion,
     ConstantTimeOpConv,
+    TimeBIOpConv,
+    UrandomBIOpConv,
+    RandomBIOpConv,
+    TimeToLogicOpConv,
+    LogicToTimeOpConv,
     ExtractOpConversion,
     DynExtractOpConversion,
     DynExtractRefOpConversion,
@@ -3025,6 +3680,24 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     YieldOpConversion,
     OutputOpConversion,
     ConstantStringOpConv,
+    RealMathBuiltinOpConversion<LnBIOp, mlir::math::LogOp>,
+    RealMathBuiltinOpConversion<Log10BIOp, mlir::math::Log10Op>,
+    RealMathBuiltinOpConversion<ExpBIOp, mlir::math::ExpOp>,
+    RealMathBuiltinOpConversion<SqrtBIOp, mlir::math::SqrtOp>,
+    RealMathBuiltinOpConversion<FloorBIOp, mlir::math::FloorOp>,
+    RealMathBuiltinOpConversion<CeilBIOp, mlir::math::CeilOp>,
+    RealMathBuiltinOpConversion<SinBIOp, mlir::math::SinOp>,
+    RealMathBuiltinOpConversion<CosBIOp, mlir::math::CosOp>,
+    RealMathBuiltinOpConversion<TanBIOp, mlir::math::TanOp>,
+    RealMathBuiltinOpConversion<AsinBIOp, mlir::math::AsinOp>,
+    RealMathBuiltinOpConversion<AcosBIOp, mlir::math::AcosOp>,
+    RealMathBuiltinOpConversion<AtanBIOp, mlir::math::AtanOp>,
+    RealMathBuiltinOpConversion<SinhBIOp, mlir::math::SinhOp>,
+    RealMathBuiltinOpConversion<CoshBIOp, mlir::math::CoshOp>,
+    RealMathBuiltinOpConversion<TanhBIOp, mlir::math::TanhOp>,
+    RealMathBuiltinOpConversion<AsinhBIOp, mlir::math::AsinhOp>,
+    RealMathBuiltinOpConversion<AcoshBIOp, mlir::math::AcoshOp>,
+    RealMathBuiltinOpConversion<AtanhBIOp, mlir::math::AtanhOp>,
     ReadInterfaceSignalOpConversion,
 
     // Patterns of unary operations.
@@ -3083,6 +3756,7 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     FCmpOpConversion<EqRealOp, arith::CmpFPredicate::OEQ>,
     CaseXZEqOpConversion<CaseZEqOp, true>,
     CaseXZEqOpConversion<CaseXZEqOp, false>,
+    StringCmpOpConversion,
 
     // Patterns of structural operations.
     SVModuleOpConversion,
@@ -3112,23 +3786,25 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     InPlaceOpConversion<debug::StructOp>,
     InPlaceOpConversion<debug::VariableOp>,
 
-    // Patterns of assert-like operations
-    AssertLikeOpConversion<AssertOp, verif::AssertOp>,
-    AssertLikeOpConversion<AssumeOp, verif::AssumeOp>,
-    AssertLikeOpConversion<CoverOp, verif::CoverOp>,
+	    // Patterns of assert-like operations
+	    AssertLikeOpConversion<AssertOp, verif::AssertOp>,
+	    AssertLikeOpConversion<AssumeOp, verif::AssumeOp>,
+	    AssertLikeOpConversion<CoverOp, verif::CoverOp>,
 
     // Format strings.
     FormatLiteralOpConversion,
+    FormatStringOpConversion,
+    FormatStringToStringOpConversion,
     FormatConcatOpConversion,
     FormatIntOpConversion,
     FormatRealOpConversion,
     DisplayBIOpConversion,
 
-    // Dynamic string operations
+    // Dynamic string operations.
     StringLenOpConversion,
     StringConcatOpConversion,
 
-    // Queue operations
+    // Queue operations.
     QueueSizeBIOpConversion,
     QueuePushBackOpConversion,
     QueuePushFrontOpConversion,
@@ -3187,6 +3863,9 @@ void MooreToCorePass::runOnOperation() {
   MLIRContext &context = getContext();
   ModuleOp module = getOperation();
   ClassTypeCache classCache;
+
+  context.getOrLoadDialect<sv::SVDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
 
   IRRewriter rewriter(module);
   (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());

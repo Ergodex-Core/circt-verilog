@@ -150,6 +150,28 @@ static Value castToI64(Value value, bool isSigned, OpBuilder &builder,
   return v;
 }
 
+static Value castToF64(Value value, OpBuilder &builder, Location loc,
+                       bool &truncated) {
+  truncated = false;
+  auto floatTy = dyn_cast<FloatType>(value.getType());
+  if (!floatTy)
+    return {};
+
+  auto f64Ty = builder.getF64Type();
+  if (value.getType() == f64Ty)
+    return value;
+
+  if (floatTy.getWidth() < 64)
+    return LLVM::FPExtOp::create(builder, loc, f64Ty, value);
+
+  if (floatTy.getWidth() > 64) {
+    truncated = true;
+    return LLVM::FPTruncOp::create(builder, loc, f64Ty, value);
+  }
+
+  return {};
+}
+
 LogicalResult LowerSimConsolePass::lowerPrint(sim::PrintFormattedProcOp op) {
   OpBuilder builder(op);
   auto loc = op.getLoc();
@@ -193,12 +215,20 @@ LogicalResult LowerSimConsolePass::lowerPrint(sim::PrintFormattedProcOp op) {
     }
 
     auto res = TypeSwitch<Operation *, LogicalResult>(defOp)
-                   .Case<sim::FormatLitOp>([&](auto litOp) {
-                     return printCString(litOp.getLiteral());
-                   })
-                   .Case<sim::FormatDecOp>([&](auto decOp) {
-                     bool truncated = false;
-                     bool isSigned = decOp.getIsSigned();
+	                   .Case<sim::FormatLitOp>([&](auto litOp) {
+	                     return printCString(litOp.getLiteral());
+	                   })
+	                   .Case<sim::FormatStrOp>([&](auto strOp) {
+	                     auto fmtGlobal = getOrCreateFormatString(loc, "%s");
+	                     Value fmtPtr = getStringGlobalPtr(loc, fmtGlobal, builder);
+	                     Value strPtr = strOp.getValue();
+	                     LLVM::CallOp::create(builder, loc, printfFn.value(),
+	                                          ValueRange{fmtPtr, strPtr});
+	                     return success();
+	                   })
+	                   .Case<sim::FormatDecOp>([&](auto decOp) {
+	                     bool truncated = false;
+	                     bool isSigned = decOp.getIsSigned();
                      Value v64 = castToI64(decOp.getValue(), isSigned, builder,
                                            loc, truncated);
                      if (!v64) {
@@ -298,6 +328,29 @@ LogicalResult LowerSimConsolePass::lowerPrint(sim::PrintFormattedProcOp op) {
                                           ValueRange{fmtPtr, v64});
                      return success();
                    })
+                   .Case<sim::FormatRealOp>([&](auto realOp) {
+                     bool truncated = false;
+                     Value v64 =
+                         castToF64(realOp.getValue(), builder, loc, truncated);
+                     if (!v64) {
+                       realOp.emitOpError(
+                           "unsupported value type for real formatting");
+                       return failure();
+                     }
+
+                     StringRef fmt = "%f";
+                     auto mode = realOp.getFormat();
+                     if (mode == "exponential")
+                       fmt = "%e";
+                     else if (mode == "general")
+                       fmt = "%g";
+
+                     auto fmtGlobal = getOrCreateFormatString(loc, fmt);
+                     Value fmtPtr = getStringGlobalPtr(loc, fmtGlobal, builder);
+                     LLVM::CallOp::create(builder, loc, printfFn.value(),
+                                          ValueRange{fmtPtr, v64});
+                     return success();
+                   })
                    .Default([&](Operation *) {
                      return printCString("<unsupported sim.fmt.* fragment>");
                    });
@@ -347,11 +400,12 @@ void LowerSimConsolePass::runOnOperation() {
   while (changed) {
     changed = false;
     SmallVector<Operation *> toErase;
-    module.walk([&](Operation *op) {
-      if (!isa<sim::FormatLitOp, sim::FormatHexOp, sim::FormatBinOp,
-               sim::FormatDecOp, sim::FormatCharOp,
-               sim::FormatStringConcatOp>(op))
-        return;
+	    module.walk([&](Operation *op) {
+	      if (!isa<sim::FormatLitOp, sim::FormatHexOp, sim::FormatBinOp,
+	               sim::FormatDecOp, sim::FormatRealOp, sim::FormatCharOp,
+	               sim::FormatStrOp,
+	               sim::FormatStringConcatOp>(op))
+	        return;
       if (op->getNumResults() != 1)
         return;
       if (op->getResult(0).use_empty())

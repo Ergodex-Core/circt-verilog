@@ -156,12 +156,33 @@ struct BaseVisitor {
 //===----------------------------------------------------------------------===//
 
 namespace {
+static LogicalResult convertClassDecl(Context &context,
+                                     const slang::ast::ClassType &cls,
+                                     Location loc) {
+  context.getOrAssignClassId(cls);
+  if (const auto *baseType = cls.getBaseClass())
+    if (const auto *baseCls = baseType->as_if<slang::ast::ClassType>())
+      context.getOrAssignClassId(*baseCls);
+
+  for (auto &prop : cls.membersOfType<slang::ast::ClassPropertySymbol>())
+    context.getOrAssignClassFieldId(prop);
+
+  for (auto &method : cls.membersOfType<slang::ast::SubroutineSymbol>())
+    if (failed(context.convertFunction(method)))
+      return failure();
+
+  return success();
+}
+
 struct RootVisitor : public BaseVisitor {
   using BaseVisitor::BaseVisitor;
   using BaseVisitor::visit;
 
-  // Ignore standalone class declarations.
-  LogicalResult visit(const slang::ast::ClassType &) { return success(); }
+  LogicalResult visit(const slang::ast::ClassType &cls) {
+    if (context.options.allowClassStubs)
+      return success();
+    return convertClassDecl(context, cls, loc);
+  }
   LogicalResult visit(const slang::ast::GenericClassDefSymbol &) {
     return success();
   }
@@ -225,11 +246,17 @@ struct PackageVisitor : public BaseVisitor {
   using BaseVisitor::BaseVisitor;
   using BaseVisitor::visit;
 
-  // Ignore class declarations inside packages. Full class lowering happens
-  // elsewhere; packages often host stubs that do not require importer output.
-  LogicalResult visit(const slang::ast::ClassType &) { return success(); }
-  LogicalResult visit(const slang::ast::GenericClassDefSymbol &) {
-    return success();
+  LogicalResult visit(const slang::ast::ClassType &node) {
+    if (context.options.allowClassStubs)
+      return success();
+    return convertClassDecl(context, node, loc);
+  }
+  LogicalResult visit(const slang::ast::GenericClassDefSymbol &node) {
+    if (context.options.allowClassStubs)
+      return success();
+    mlir::emitError(loc, "unsupported package member: generic class `")
+        << node.name << "`";
+    return failure();
   }
 
   // Handle functions and tasks.
@@ -237,13 +264,18 @@ struct PackageVisitor : public BaseVisitor {
     if (const auto *parentScope = subroutine.getParentScope()) {
       const auto &parentSym = parentScope->asSymbol();
       if (parentSym.kind == slang::ast::SymbolKind::ClassType ||
-          parentSym.kind == slang::ast::SymbolKind::GenericClassDef)
-        return success();
+          parentSym.kind == slang::ast::SymbolKind::GenericClassDef) {
+        if (context.options.allowClassStubs)
+          return success();
+        mlir::emitError(loc, "unsupported package member: class method `")
+            << subroutine.name << "`";
+        return failure();
+      }
     }
     return context.convertFunction(subroutine);
   }
 
-  // Handle global variables.
+  // Handle package-scope variables.
   LogicalResult visit(const slang::ast::VariableSymbol &var) {
     return context.convertGlobalVariable(var);
   }
@@ -332,8 +364,11 @@ struct ModuleVisitor : public BaseVisitor {
   LogicalResult visit(const slang::ast::PortSymbol &) { return success(); }
   LogicalResult visit(const slang::ast::MultiPortSymbol &) { return success(); }
 
-  // Skip class declarations nested in modules.
-  LogicalResult visit(const slang::ast::ClassType &) { return success(); }
+  LogicalResult visit(const slang::ast::ClassType &cls) {
+    if (context.options.allowClassStubs)
+      return success();
+    return convertClassDecl(context, cls, loc);
+  }
   LogicalResult visit(const slang::ast::GenericClassDefSymbol &) {
     return success();
   }
@@ -1696,11 +1731,23 @@ Context::convertPackage(const slang::ast::PackageSymbol &package) {
   timeScale = package.getTimeScale().value_or(slang::TimeScale());
   llvm::scope_exit timeScaleGuard([&] { timeScale = prevTimeScale; });
 
-  // The lightweight UVM stub package only exists to satisfy preprocessing
-  // requirements. Skip converting its contents so that unsupported class
-  // constructs (and their methods) do not trigger importer crashes.
-  if (package.name == "uvm_pkg")
+  // M3 bring-up: the UVM package is class-heavy and not yet fully supported.
+  // However, some top-level entry points (e.g. `run_test`) are plain package
+  // tasks/functions that we can lower and execute in top-executed mode. To
+  // avoid being blocked by the full UVM surface area, selectively lower only
+  // the small subset of package-level subroutines we currently rely on.
+  if (package.name == "uvm_pkg") {
+    ValueSymbolScope scope(valueSymbols);
+    for (auto &member : package.members()) {
+      if (member.kind != slang::ast::SymbolKind::Subroutine)
+        continue;
+      if (member.name != "run_test")
+        continue;
+      if (failed(convertFunction(member.as<slang::ast::SubroutineSymbol>())))
+        return failure();
+    }
     return success();
+  }
 
   OpBuilder::InsertionGuard g(builder);
   builder.setInsertionPointToEnd(intoModuleOp.getBody());
@@ -1713,6 +1760,24 @@ Context::convertPackage(const slang::ast::PackageSymbol &package) {
   return success();
 }
 
+int32_t Context::getOrAssignClassId(const slang::ast::ClassType &type) {
+  auto it = classIds.find(&type);
+  if (it != classIds.end())
+    return it->second;
+  int32_t id = nextClassId++;
+  classIds[&type] = id;
+  return id;
+}
+
+int32_t Context::getOrAssignClassFieldId(const slang::ast::VariableSymbol &field) {
+  auto it = classFieldIds.find(&field);
+  if (it != classFieldIds.end())
+    return it->second;
+  int32_t id = nextClassFieldId++;
+  classFieldIds[&field] = id;
+  return id;
+}
+
 /// Convert a function and its arguments to a function declaration in the IR.
 /// This does not convert the function body.
 FunctionLowering *
@@ -1722,38 +1787,56 @@ Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
   if (lowering)
     return lowering.get();
 
-  // Bring-up mode: class methods (and UVM package subroutines) are treated as
-  // absent and callers may stub them out.
-  if (const auto *parentScope = subroutine.getParentScope()) {
-    const auto &parentSym = parentScope->asSymbol();
-    if (parentSym.kind == slang::ast::SymbolKind::ClassType) {
+  // Ensure the subroutine has been elaborated so members such as `thisVar` are
+  // populated before we inspect them.
+  (void)subroutine.getArguments();
+
+  // Bring-up mode: allow skipping class-heavy constructs (class methods and
+  // most of `uvm_pkg`) by making the subroutine appear absent. Callers can
+  // then stub the call site.
+  if (options.allowClassStubs) {
+    bool shouldStub = false;
+    if (const auto *parentScope = subroutine.getParentScope()) {
+      const auto &parentSym = parentScope->asSymbol();
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType ||
+          parentSym.kind == slang::ast::SymbolKind::GenericClassDef) {
+        shouldStub = true;
+      }
+      if (parentSym.kind == slang::ast::SymbolKind::Package &&
+          parentSym.name == "uvm_pkg" && subroutine.name != "run_test") {
+        shouldStub = true;
+      }
+    } else if (subroutine.thisVar) {
+      shouldStub = true;
+    }
+
+    if (shouldStub) {
       lowering = std::make_unique<FunctionLowering>();
       lowering->op = nullptr;
       return lowering.get();
     }
-    if (parentSym.kind == slang::ast::SymbolKind::Package &&
-        parentSym.name == "uvm_pkg") {
-      lowering = std::make_unique<FunctionLowering>();
-      lowering->op = nullptr;
-      return lowering.get();
-    }
-  } else if (subroutine.thisVar) {
-    lowering = std::make_unique<FunctionLowering>();
-    lowering->op = nullptr;
-    return lowering.get();
-  }
-  if (subroutine.thisVar) {
-    lowering = std::make_unique<FunctionLowering>();
-    lowering->op = nullptr;
-    return lowering.get();
   }
 
   SmallString<64> name;
-  guessNamespacePrefix(subroutine.getParentScope()->asSymbol(), name);
-  name += subroutine.name;
+  if (const auto *parentScope = subroutine.getParentScope()) {
+    const auto &parentSym = parentScope->asSymbol();
+    if (parentSym.kind == slang::ast::SymbolKind::ClassType ||
+        parentSym.kind == slang::ast::SymbolKind::GenericClassDef) {
+      if (auto *grand = parentSym.getParentScope())
+        guessNamespacePrefix(grand->asSymbol(), name);
+      name += parentSym.name;
+      name += "::";
+      name += subroutine.name;
+    } else {
+      guessNamespacePrefix(parentSym, name);
+      name += subroutine.name;
+    }
+  } else {
+    name += subroutine.name;
+  }
 
-  SmallVector<Type, 1> noThis = {};
-  return declareCallableImpl(subroutine, name, noThis);
+  SmallVector<Type, 1> extraParams;
+  return declareCallableImpl(subroutine, name, extraParams);
 }
 
 /// Helper function to generate the function signature from a SubroutineSymbol
@@ -1768,7 +1851,15 @@ getFunctionSignature(Context &context,
   inputTypes.append(extraParams.begin(), extraParams.end());
   SmallVector<Type, 1> outputTypes;
 
-  for (const auto *arg : subroutine.getArguments()) {
+  auto astArgs = subroutine.getArguments();
+  if (subroutine.thisVar) {
+    auto type = context.convertType(subroutine.thisVar->getType());
+    if (!type)
+      return {};
+    inputTypes.push_back(type);
+  }
+
+  for (const auto *arg : astArgs) {
     auto type = context.convertType(arg->getType());
     if (!type)
       return {};
@@ -1895,7 +1986,7 @@ static LogicalResult rewriteCallSitesToPassCaptures(mlir::func::FuncOp callee,
 /// Convert a function.
 LogicalResult
 Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
-  if (subroutine.thisVar)
+  if (subroutine.thisVar && options.allowClassStubs)
     return success();
 
   // Keep track of the local time scale. `getTimeScale` automatically looks
@@ -1908,6 +1999,8 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   auto *lowering = declareFunction(subroutine);
   if (!lowering)
     return failure();
+  if (!lowering->op.getBody().empty())
+    return success();
 
   // If function already has been finalized, or is already being converted
   // (recursive/re-entrant calls) stop here.
@@ -1921,27 +2014,39 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   ValueSymbolScope scope(valueSymbols);
 
   // Create a function body block and populate it with block arguments.
+  auto astArgs = subroutine.getArguments();
   SmallVector<moore::VariableOp> argVariables;
   auto &block = lowering->op.getBody().emplaceBlock();
-
-  // If this is a class method, the first input is %this :
-  // !moore.class<@C>
-  if (isMethod) {
-    auto thisLoc = convertLocation(subroutine.location);
-    auto thisType = lowering->op.getFunctionType().getInput(0);
-    auto thisArg = block.addArgument(thisType, thisLoc);
-
-    // Bind `this` so NamedValue/MemberAccess can find it.
+  auto inputTypes = lowering->op.getFunctionType().getInputs();
+  size_t expectedInputs = astArgs.size() + (subroutine.thisVar ? 1 : 0);
+  if (inputTypes.size() != expectedInputs) {
+    mlir::emitError(lowering->op.getLoc(), "internal error: argument count mismatch for `")
+        << lowering->op.getName() << "` (expected " << expectedInputs << ", got "
+        << inputTypes.size() << ")";
+    return failure();
+  }
+  size_t inputIdx = 0;
+  bool pushedThis = false;
+  auto thisGuard = llvm::make_scope_exit([&] {
+    if (pushedThis)
+      thisStack.pop_back();
+  });
+  if (subroutine.thisVar) {
+    auto thisLoc = convertLocation(subroutine.thisVar->location);
+    Value thisArg = block.addArgument(inputTypes[inputIdx++], thisLoc);
     valueSymbols.insert(subroutine.thisVar, thisArg);
+    thisStack.push_back(thisArg);
+    pushedThis = true;
   }
 
-  // Add user-defined block arguments
-  auto inputs = lowering->op.getFunctionType().getInputs();
-  auto astArgs = subroutine.getArguments();
-  auto valInputs = llvm::ArrayRef<Type>(inputs).drop_front(isMethod ? 1 : 0);
-
-  for (auto [astArg, type] : llvm::zip(astArgs, valInputs)) {
+  for (const auto *astArg : astArgs) {
     auto loc = convertLocation(astArg->location);
+    if (inputIdx >= inputTypes.size()) {
+      mlir::emitError(lowering->op.getLoc(), "internal error: ran out of input types for `")
+          << lowering->op.getName() << "`";
+      return failure();
+    }
+    auto type = inputTypes[inputIdx++];
     auto blockArg = block.addArgument(type, loc);
 
     if (isa<moore::RefType>(type)) {
@@ -2070,10 +2175,44 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   // If there was no explicit return statement provided by the user, insert a
   // default one.
   if (builder.getBlock()) {
-    if (returnVar && !subroutine.getReturnType().isVoid()) {
-      Value read =
-          moore::ReadOp::create(builder, returnVar.getLoc(), returnVar);
-      mlir::func::ReturnOp::create(builder, lowering->op.getLoc(), read);
+    auto resultTypes = lowering->op.getFunctionType().getResults();
+    if (!resultTypes.empty()) {
+      if (returnVar && !subroutine.getReturnType().isVoid()) {
+        Value read =
+            moore::ReadOp::create(builder, returnVar.getLoc(), returnVar);
+        mlir::func::ReturnOp::create(builder, lowering->op.getLoc(), read);
+      } else {
+        // Some implicitly provided/built-in methods (e.g. class randomization
+        // API) may not expose a `returnValVar`, but still have a non-void
+        // signature. Materialize a conservative default return value so the IR
+        // remains verifiable.
+        Type resultType = resultTypes.front();
+        Value defaultValue;
+        if (auto intType = dyn_cast<moore::IntType>(resultType)) {
+          int64_t value = 0;
+          if (subroutine.name == "randomize")
+            value = 1;
+          defaultValue = moore::ConstantOp::create(builder, lowering->op.getLoc(),
+                                                   intType, value,
+                                                   /*isSigned=*/true);
+        } else if (isa<moore::StringType>(resultType)) {
+          auto i8Ty = moore::IntType::get(getContext(), /*width=*/8,
+                                          moore::Domain::TwoValued);
+          Value raw =
+              moore::StringConstantOp::create(builder, lowering->op.getLoc(),
+                                              i8Ty, "")
+                  .getResult();
+          defaultValue = moore::ConversionOp::create(builder, lowering->op.getLoc(),
+                                                     resultType, raw);
+        } else {
+          mlir::emitError(lowering->op.getLoc(),
+                          "unsupported default return type for `")
+              << lowering->op.getName() << "`: " << resultType;
+          return failure();
+        }
+        mlir::func::ReturnOp::create(builder, lowering->op.getLoc(),
+                                     defaultValue);
+      }
     } else {
       mlir::func::ReturnOp::create(builder, lowering->op.getLoc(),
                                    ValueRange{});

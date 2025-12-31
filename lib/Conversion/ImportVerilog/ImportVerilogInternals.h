@@ -148,6 +148,8 @@ struct Context {
   LogicalResult buildClassProperties(const slang::ast::ClassType &classdecl);
   LogicalResult materializeClassMethods(const slang::ast::ClassType &classdecl);
   LogicalResult convertGlobalVariable(const slang::ast::VariableSymbol &var);
+  int32_t getOrAssignClassId(const slang::ast::ClassType &type);
+  int32_t getOrAssignClassFieldId(const slang::ast::VariableSymbol &field);
 
   /// Checks whether one class (actualTy) is derived from another class
   /// (baseTy). True if it's a subclass, false otherwise.
@@ -323,6 +325,14 @@ struct Context {
   DenseMap<const slang::ast::ClassType *, std::unique_ptr<ClassLowering>>
       classes;
 
+  /// Assigned integer IDs for SV classes and their fields. These IDs are used
+  /// by the runtime-backed class lowering to implement field access and
+  /// virtual dispatch without embedding full object layouts in the IR.
+  DenseMap<const slang::ast::ClassType *, int32_t> classIds;
+  DenseMap<const slang::ast::VariableSymbol *, int32_t> classFieldIds;
+  int32_t nextClassId = 1;
+  int32_t nextClassFieldId = 1;
+
   /// A table of defined values, such as variables, that may be referred to by
   /// name in expressions. The expressions use this table to lookup the MLIR
   /// value that was created for a given declaration in the Slang AST node.
@@ -366,6 +376,9 @@ struct Context {
   /// subroutine, this holds the `returnValVar` storage so that `return;`
   /// statements can return the current value.
   SmallVector<Value> functionReturnVarStack;
+
+  /// A stack of implicit `this` handles for methods currently being lowered.
+  SmallVector<Value> thisStack;
 
   /// A listener called for every variable or net being read. This can be used
   /// to collect all variables read as part of an expression or statement, for

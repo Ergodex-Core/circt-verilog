@@ -64,27 +64,17 @@ struct TypeVisitor {
   }
 
   Type visit(const slang::ast::QueueType &type) {
-    auto innerType = type.elementType.visit(*this);
-    if (!innerType)
-      return {};
-    return moore::QueueType::get(cast<moore::UnpackedType>(innerType),
-                                 type.maxBound);
+    // Represent dynamic containers as opaque 32-bit handles backed by the
+    // runtime. This avoids having to model their storage layout in the IR.
+    (void)type;
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               moore::Domain::TwoValued);
   }
 
   Type visit(const slang::ast::AssociativeArrayType &type) {
-    auto innerType = type.elementType.visit(*this);
-    if (!innerType)
-      return {};
-    if (!type.indexType) {
-      mlir::emitError(
-          loc, "unsupported type: associative arrays with wildcard index");
-      return {};
-    }
-    auto indexType = type.indexType->visit(*this);
-    if (!indexType)
-      return {};
-    return moore::AssocArrayType::get(cast<moore::UnpackedType>(innerType),
-                                      cast<moore::UnpackedType>(indexType));
+    (void)type;
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               moore::Domain::TwoValued);
   }
 
   Type visit(const slang::ast::FixedSizeUnpackedArrayType &type) {
@@ -96,11 +86,9 @@ struct TypeVisitor {
   }
 
   Type visit(const slang::ast::DynamicArrayType &type) {
-    auto innerType = type.elementType.visit(*this);
-    if (!innerType)
-      return {};
-    return moore::OpenUnpackedArrayType::get(
-        cast<moore::UnpackedType>(innerType));
+    (void)type;
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               moore::Domain::TwoValued);
   }
 
   // Handle type defs.
@@ -166,6 +154,13 @@ struct TypeVisitor {
     return moore::ChandleType::get(context.getContext());
   }
 
+  Type visit(const slang::ast::EventType &type) {
+    // Represent SystemVerilog `event` handles as a monotonically-increasing
+    // integer token. Triggering the event bumps the token, and event controls
+    // (`@(e)`) detect changes in this value.
+    return moore::IntType::get(context.getContext(), /*width=*/32,
+                               Domain::TwoValued);
+  }
   Type visit(const slang::ast::ClassType &type) {
     // Represent class handles as simple 32-bit integers. This allows the
     // importer to thread class-typed values through the IR without modeling

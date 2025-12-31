@@ -232,6 +232,12 @@ struct CLOptions {
                "ports without producing an error."),
       cl::init(true), cl::cat(cat)};
 
+  cl::opt<bool> allowClassStubs{
+      "allow-class-stubs",
+      cl::desc("Allow the importer to stub/skip unsupported SystemVerilog "
+               "class/UVM constructs instead of failing (bring-up aid only)."),
+      cl::init(true), cl::cat(cat)};
+
   cl::list<std::string> topModules{
       "top",
       cl::desc("One or more top-level modules to instantiate (instead of "
@@ -343,6 +349,7 @@ static LogicalResult executeWithSources(MLIRContext *context,
   options.allowUseBeforeDeclare = opts.allowUseBeforeDeclare;
   options.ignoreUnknownModules = opts.ignoreUnknownModules;
   options.allowTopLevelIfacePorts = opts.allowTopLevelIfacePorts;
+  options.allowClassStubs = opts.allowClassStubs;
   if (opts.loweringMode != LoweringMode::OnlyLint)
     options.topModules = opts.topModules;
   options.paramOverrides = opts.paramOverrides;

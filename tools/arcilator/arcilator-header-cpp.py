@@ -21,6 +21,9 @@ extern "C" {
 {% if model.initialFnSym %}
 void {{ model.name }}_initial(void* state);
 {% endif %}
+{% if model.finalFnSym %}
+void {{ model.finalFnSym }}(void* state);
+{% endif %}
 void {{ model.name }}_eval(void* state);
 #ifdef ARC_USE_COMPILED_RUNTIME_LIB
 extern ArcRuntimeModelInfo arcRuntimeModel_{{ model.name }};
@@ -74,30 +77,25 @@ public:
 #endif
 
   {{ model.name }}View view;
+  bool finalized = false;
 
 #ifdef ARC_USE_COMPILED_RUNTIME_LIB
   explicit {{ model.name }}(const char* runtimeArgs = nullptr)  :
     runtimeInstance(arcRuntimeAllocateInstance(&arcRuntimeModel_{{ model.name }}, runtimeArgs)),
     storage(runtimeInstance->modelState),
-    view(&storage[0])
+    view(storage)
   {
 {% if model.initialFnSym %}
-    {{ model.initialFnSym }}(&storage[0]);
+    {{ model.initialFnSym }}(storage);
 {% endif %}
     arcRuntimeOnInitialized(runtimeInstance);
   }
-
-  ~{{ model.name }}() {
-    arcRuntimeDeleteInstance(runtimeInstance);
-    storage = nullptr;
-    runtimeInstance = nullptr;
-  }
 #else // ARC_USE_COMPILED_RUNTIME_LIB
   {{ model.name }}() :
-    storage({{ model.name }}Layout::numStateBytes, 0), view(&storage[0])
-  {
+    storage({{ model.name }}Layout::numStateBytes ? {{ model.name }}Layout::numStateBytes : 1, 0),
+    view(storage.data()) {
 {% if model.initialFnSym %}
-    {{ model.initialFnSym }}(&storage[0]);
+    {{ model.initialFnSym }}(storage.data());
 {% endif %}
   }
 #endif // ARC_USE_COMPILED_RUNTIME_LIB
@@ -105,12 +103,39 @@ public:
   void eval() {
 #ifdef ARC_USE_COMPILED_RUNTIME_LIB
     arcRuntimeOnEval(runtimeInstance);
+    {{ model.name }}_eval(storage);
+#else
+    {{ model.name }}_eval(storage.data());
 #endif
-    {{ model.name }}_eval(&storage[0]);
+  }
+
+  void final() {
+    if (finalized) return;
+    finalized = true;
+{% if model.finalFnSym %}
+#ifdef ARC_USE_COMPILED_RUNTIME_LIB
+    {{ model.finalFnSym }}(storage);
+#else
+    {{ model.finalFnSym }}(storage.data());
+#endif
+{% endif %}
+  }
+
+  ~{{ model.name }}() {
+    final();
+#ifdef ARC_USE_COMPILED_RUNTIME_LIB
+    arcRuntimeDeleteInstance(runtimeInstance);
+    storage = nullptr;
+    runtimeInstance = nullptr;
+#endif
   }
 
   ValueChangeDump<{{ model.name }}Layout> vcd(std::basic_ostream<char> &os) {
-    ValueChangeDump<{{ model.name }}Layout> vcd(os, &storage[0]);
+#ifdef ARC_USE_COMPILED_RUNTIME_LIB
+    ValueChangeDump<{{ model.name }}Layout> vcd(os, storage);
+#else
+    ValueChangeDump<{{ model.name }}Layout> vcd(os, storage.data());
+#endif
     vcd.writeHeader();
     vcd.writeDumpvars();
     return vcd;
@@ -171,12 +196,14 @@ class ModelInfo:
   name: str
   numStateBytes: int
   initialFnSym: str
+  finalFnSym: str
   states: List[StateInfo]
   io: List[StateInfo]
   hierarchy: List[StateHierarchy]
 
   def decode(d: dict) -> "ModelInfo":
     return ModelInfo(d["name"], d["numStateBytes"], d.get("initialFnSym", ""),
+                     d.get("finalFnSym", ""),
                      [StateInfo.decode(d) for d in d["states"]], list(), list())
 
 

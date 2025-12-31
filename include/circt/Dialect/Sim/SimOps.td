@@ -18,6 +18,7 @@ include "circt/Dialect/Sim/SimTypes.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpAsmInterface.td"
 
 class SimOp<string mnemonic, list<Trait> traits = []> :
@@ -168,6 +169,21 @@ def FormatLiteralOp : SimOp<"fmt.literal", [Pure, ConstantLike]> {
   let results = (outs FormatStringType:$result);
 
   let hasFolder = true;
+}
+
+def FormatStrOp : SimOp<"fmt.str", [Pure]> {
+  let summary = "String format specifier";
+  let description = [{
+    Format the given string value as a format string fragment.
+
+    This is used to implement `%s` formatting for SystemVerilog `$display` /
+    `$write` / `$sformatf` lowering when the argument is already a string.
+  }];
+
+  let arguments = (ins HWStringType:$value);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = "$value attr-dict";
 }
 
 def FormatHexOp : SimOp<"fmt.hex",
@@ -406,6 +422,24 @@ def FormatDecOp : SimOp<"fmt.dec",
 
         return isSigned ? digits + 1 : digits;
       }
+  }];
+}
+
+def FormatRealOp : SimOp<"fmt.real", [Pure]> {
+  let summary = "Real format specifier";
+  let description = [{
+    Format the given floating point value as a string according to the
+    specified format.
+
+    This is used to implement `%f`, `%e`, and `%g` style formatting for
+    SystemVerilog `$display`/`$write`/`$sformatf` lowering.
+  }];
+
+  let arguments = (ins AnyFloat:$value, StrAttr:$format);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $format $value attr-dict `:` qualified(type($value))
   }];
 }
 

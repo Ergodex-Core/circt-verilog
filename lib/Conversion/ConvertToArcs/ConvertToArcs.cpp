@@ -18,6 +18,7 @@
 #include "circt/Support/ConversionPatternSet.h"
 #include "circt/Support/Namespace.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -36,6 +37,392 @@ using namespace hw;
 using llvm::MapVector;
 using llvm::SmallSetVector;
 using mlir::ConversionConfig;
+
+static constexpr StringLiteral kArcilatorProcIdAttr = "arcilator.proc_id";
+static constexpr StringLiteral kArcilatorWaitIdAttr = "arcilator.wait_id";
+static constexpr StringLiteral kArcilatorSigIdAttr = "arcilator.sig_id";
+static constexpr StringLiteral kArcilatorNeedsSchedulerAttr =
+    "arcilator.needs_scheduler";
+
+static mlir::func::FuncOp getOrInsertFunc(mlir::ModuleOp module, StringRef name,
+                                          mlir::FunctionType type) {
+  if (!module)
+    return {};
+  if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return fn;
+
+  OpBuilder builder(module.getBodyRegion());
+  builder.setInsertionPointToStart(module.getBody());
+  auto fn = builder.create<mlir::func::FuncOp>(module.getLoc(), name, type);
+  fn.setPrivate();
+  return fn;
+}
+
+static Value buildI32Constant(OpBuilder &builder, Location loc, uint32_t value) {
+  return hw::ConstantOp::create(builder, loc, APInt(32, value));
+}
+
+static Value buildI64Constant(OpBuilder &builder, Location loc, uint64_t value) {
+  return hw::ConstantOp::create(builder, loc, APInt(64, value));
+}
+
+static FailureOr<uint64_t> tryExtractDelayFs(Value delay) {
+  if (!delay)
+    return failure();
+  auto cst = delay.getDefiningOp<llhd::ConstantTimeOp>();
+  if (!cst)
+    return failure();
+  auto timeAttr = cst.getValue();
+  uint64_t scale = llvm::StringSwitch<uint64_t>(timeAttr.getTimeUnit())
+                       .Case("fs", 1ULL)
+                       .Case("ps", 1000ULL)
+                       .Case("ns", 1000ULL * 1000ULL)
+                       .Case("us", 1000ULL * 1000ULL * 1000ULL)
+                       .Case("ms", 1000ULL * 1000ULL * 1000ULL * 1000ULL)
+                       .Case("s", 1000ULL * 1000ULL * 1000ULL * 1000ULL *
+                                     1000ULL)
+                       .Default(0);
+  if (scale == 0)
+    return failure();
+  return timeAttr.getTime() * scale;
+}
+
+static bool needsCycleScheduler(llhd::ProcessOp op) {
+  // The current scheduler lowering does not model LLHD process results (wait/halt
+  // yields). Pre-lowering may rewrite some resultful processes into direct
+  // signal drives, at which point they become eligible for cycle scheduling.
+  if (!op.getResults().empty())
+    return false;
+  bool hasDelay = false;
+  bool hasWideObserved = false;
+  op.walk([&](llhd::WaitOp wait) {
+    if (wait.getDelay())
+      hasDelay = true;
+    for (Value obs : wait.getObserved()) {
+      auto intTy = dyn_cast<IntegerType>(obs.getType());
+      if (!intTy || intTy.getWidth() != 1)
+        hasWideObserved = true;
+    }
+  });
+  return hasDelay || hasWideObserved;
+}
+
+static bool isRematerializableForPolling(Operation *op) {
+  if (!op)
+    return false;
+  if (op->getNumRegions() != 0)
+    return false;
+  if (op->hasTrait<OpTrait::IsTerminator>())
+    return false;
+  // Treat LLHD signal declarations as rematerializable handles. For scheduled
+  // processes we lower signals into runtime-managed storage keyed by a stable
+  // id, so cloning the declaration is equivalent to duplicating the handle.
+  if (isa<llhd::SignalOp>(op))
+    return true;
+  if (op->hasTrait<OpTrait::ConstantLike>())
+    return true;
+  if (mlir::isMemoryEffectFree(op))
+    return true;
+  auto effects = dyn_cast<mlir::MemoryEffectOpInterface>(op);
+  if (!effects)
+    return false;
+  SmallVector<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>>
+      effectList;
+  effects.getEffects(effectList);
+  for (auto &effect : effectList)
+    if (!isa<mlir::MemoryEffects::Read>(effect.getEffect()))
+      return false;
+  return true;
+}
+
+static FailureOr<Value>
+rematerializeValueForPolling(Value value, DenseMap<Value, Value> &memo,
+                             mlir::RewriterBase &rewriter) {
+  if (!value)
+    return failure();
+  if (auto it = memo.find(value); it != memo.end())
+    return it->second;
+
+  if (isa<BlockArgument>(value)) {
+    memo.try_emplace(value, value);
+    return value;
+  }
+
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp)
+    return failure();
+  if (!isRematerializableForPolling(defOp))
+    return failure();
+
+  IRMapping mapping;
+  for (Value operand : defOp->getOperands()) {
+    auto remat = rematerializeValueForPolling(operand, memo, rewriter);
+    if (failed(remat))
+      return failure();
+    mapping.map(operand, *remat);
+  }
+
+  Operation *cloned = rewriter.clone(*defOp, mapping);
+  for (auto [from, to] :
+       llvm::zip(defOp->getResults(), cloned->getResults()))
+    memo.try_emplace(from, to);
+
+  auto it = memo.find(value);
+  if (it == memo.end())
+    return failure();
+  return it->second;
+}
+
+static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
+                                         mlir::RewriterBase &rewriter) {
+  Region &region = execOp.getBody();
+  if (region.empty())
+    return success();
+
+  Block *entryBlock = &region.front();
+  for (auto &block : region)
+    if (&block != entryBlock && !block.getArguments().empty())
+      return execOp.emitOpError()
+             << "cannot lower scheduled process with non-entry block arguments";
+
+  auto module = execOp->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return execOp.emitOpError() << "missing module for scheduler lowering";
+
+  // Runtime hooks (implemented by the autogenerated driver).
+  (void)getOrInsertFunc(
+      module, "__arcilator_get_pc",
+      rewriter.getFunctionType({rewriter.getI32Type()}, {rewriter.getI32Type()}));
+  (void)getOrInsertFunc(
+      module, "__arcilator_set_pc",
+      rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                               {}));
+  (void)getOrInsertFunc(
+      module, "__arcilator_wait_delay",
+      rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI64Type()},
+                               {rewriter.getI1Type()}));
+  (void)getOrInsertFunc(
+      module, "__arcilator_wait_change",
+      rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI64Type()},
+                               {rewriter.getI1Type()}));
+
+  // Insert the dispatch block as the new entry. If the original entry block has
+  // captured values as arguments, move those captures to the dispatch block so
+  // they remain available when the scheduler jumps directly to a wait state.
+  SmallVector<Type> entryArgTypes;
+  SmallVector<Location> entryArgLocs;
+  entryArgTypes.reserve(entryBlock->getNumArguments());
+  entryArgLocs.reserve(entryBlock->getNumArguments());
+  for (BlockArgument arg : entryBlock->getArguments()) {
+    entryArgTypes.push_back(arg.getType());
+    entryArgLocs.push_back(arg.getLoc());
+  }
+  Block *dispatchBlock =
+      rewriter.createBlock(&region, region.begin(), entryArgTypes, entryArgLocs);
+  for (auto [oldArg, newArg] :
+       llvm::zip(entryBlock->getArguments(), dispatchBlock->getArguments()))
+    oldArg.replaceAllUsesWith(newArg);
+  while (entryBlock->getNumArguments() != 0)
+    entryBlock->eraseArgument(0);
+
+  rewriter.setInsertionPointToEnd(dispatchBlock);
+  Location loc = execOp.getLoc();
+  Value procIdVal = buildI32Constant(rewriter, loc, procId);
+
+  // Create a common exit block that returns from the execute region.
+  Block *exitBlock = rewriter.createBlock(&region);
+  rewriter.setInsertionPointToEnd(exitBlock);
+  arc::OutputOp::create(rewriter, loc, ValueRange{});
+
+  // The scheduler dispatch can jump directly to any wait state, bypassing the
+  // original entry block. Hoist any constant-like definitions that are shared
+  // across blocks into the dispatch block so they dominate all possible entry
+  // points.
+  SmallVector<Operation *> hoistable;
+  for (Block &block : region) {
+    if (&block == dispatchBlock || &block == exitBlock)
+      continue;
+    for (Operation &op : block.without_terminator()) {
+      if (!isRematerializableForPolling(&op))
+        continue;
+      bool usedOutsideBlock = false;
+      for (Value result : op.getResults()) {
+        for (OpOperand &use : result.getUses()) {
+          if (use.getOwner()->getBlock() != &block) {
+            usedOutsideBlock = true;
+            break;
+          }
+        }
+        if (usedOutsideBlock)
+          break;
+      }
+      if (usedOutsideBlock)
+        hoistable.push_back(&op);
+    }
+  }
+  for (Operation *op : hoistable)
+    op->moveBefore(dispatchBlock, dispatchBlock->end());
+
+  // Split each `llhd.wait` into its own block so we don't re-run side effects in
+  // the pre-wait block while waiting.
+  SmallVector<std::pair<Block *, llhd::WaitOp>> waitBlocks;
+  SmallVector<llhd::WaitOp> waits;
+  execOp.walk([&](llhd::WaitOp w) { waits.push_back(w); });
+  for (auto w : waits) {
+    auto *parent = w->getBlock();
+    auto insertIt = std::next(Region::iterator(parent));
+    Block *waitBlock = rewriter.createBlock(&region, insertIt);
+    w->moveBefore(waitBlock, waitBlock->end());
+    rewriter.setInsertionPointToEnd(parent);
+    mlir::cf::BranchOp::create(rewriter, loc, waitBlock);
+    waitBlocks.push_back({waitBlock, w});
+  }
+
+  // Collect the blocks that represent resumable scheduler states.
+  SmallVector<Block *> stateBlocks;
+  stateBlocks.reserve(region.getBlocks().size());
+  for (auto &block : region) {
+    if (&block == dispatchBlock || &block == exitBlock)
+      continue;
+    stateBlocks.push_back(&block);
+  }
+
+  DenseMap<Block *, uint32_t> stateIds;
+  for (auto [idx, block] : llvm::enumerate(stateBlocks))
+    stateIds[block] = static_cast<uint32_t>(idx);
+
+  // Ensure suspension always records the current wait state, regardless of how
+  // control enters the wait block (conditional branches, loops, etc.).
+  for (auto [waitBlock, waitOp] : waitBlocks) {
+    uint32_t waitState = stateIds.lookup(waitBlock);
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(waitBlock);
+    Value waitStateVal = buildI32Constant(rewriter, loc, waitState);
+    rewriter.create<mlir::func::CallOp>(waitOp.getLoc(), "__arcilator_set_pc",
+                                        TypeRange{},
+                                        ValueRange{procIdVal, waitStateVal});
+  }
+
+  // Replace wait terminators with runtime polling + branching.
+  for (auto [waitBlock, waitOp] : waitBlocks) {
+    if (!waitOp.getYieldOperands().empty())
+      return waitOp.emitOpError() << "scheduled wait with yield operands unsupported";
+    if (!waitOp.getDestOperands().empty())
+      return waitOp.emitOpError() << "scheduled wait with dest operands unsupported";
+
+    rewriter.setInsertionPoint(waitOp);
+
+    auto waitIdAttr = waitOp->getAttrOfType<IntegerAttr>(kArcilatorWaitIdAttr);
+    if (!waitIdAttr)
+      return waitOp.emitOpError() << "missing wait id attribute";
+    Value waitIdVal =
+        buildI32Constant(rewriter, waitOp.getLoc(), waitIdAttr.getInt());
+
+    Value ready;
+    if (auto delay = waitOp.getDelay()) {
+      auto delayFs = tryExtractDelayFs(delay);
+      if (failed(delayFs))
+        return waitOp.emitOpError() << "unsupported non-constant delay";
+      Value delayFsVal =
+          buildI64Constant(rewriter, waitOp.getLoc(), *delayFs);
+      ready = rewriter
+                  .create<mlir::func::CallOp>(waitOp.getLoc(),
+                                              "__arcilator_wait_delay",
+                                              rewriter.getI1Type(),
+                                              ValueRange{waitIdVal, delayFsVal})
+                  .getResult(0);
+    } else if (!waitOp.getObserved().empty()) {
+      // Combine observed values into a single signature to keep the runtime API
+      // simple. Rematerialize observed reads into the wait block so each poll
+      // sees the current value even when the scheduler jumps directly here.
+      Value sig = buildI64Constant(rewriter, waitOp.getLoc(), 0);
+      DenseMap<Value, Value> rematCache;
+      for (Value obs : waitOp.getObserved()) {
+        auto remat = rematerializeValueForPolling(obs, rematCache, rewriter);
+        if (failed(remat))
+          return waitOp.emitOpError() << "could not rematerialize observed value";
+        Value curObs = *remat;
+        auto intTy = dyn_cast<IntegerType>(curObs.getType());
+        if (!intTy || intTy.getWidth() > 64)
+          return waitOp.emitOpError() << "unsupported observed value type";
+        Value ext = curObs;
+        if (intTy.getWidth() < 64)
+          ext = comb::createZExt(rewriter, waitOp.getLoc(), curObs, 64);
+        sig = comb::XorOp::create(rewriter, waitOp.getLoc(), sig, ext, true);
+      }
+      ready = rewriter
+                  .create<mlir::func::CallOp>(waitOp.getLoc(),
+                                              "__arcilator_wait_change",
+                                              rewriter.getI1Type(),
+                                              ValueRange{waitIdVal, sig})
+                  .getResult(0);
+    } else {
+      // Waits with neither delay nor observed values never resume.
+      rewriter.setInsertionPoint(waitOp);
+      rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(waitOp, exitBlock);
+      continue;
+    }
+
+    Block *dest = waitOp.getDest();
+    auto destIt = stateIds.find(dest);
+    if (destIt == stateIds.end())
+      return waitOp.emitOpError() << "wait dest block is not a scheduler state";
+
+    // Resume block: update PC and branch to the successor.
+    Block *resumeBlock =
+        rewriter.createBlock(&region, std::next(Region::iterator(waitBlock)));
+    rewriter.setInsertionPointToEnd(resumeBlock);
+    Value destStateVal = buildI32Constant(rewriter, waitOp.getLoc(), destIt->second);
+    rewriter.create<mlir::func::CallOp>(waitOp.getLoc(), "__arcilator_set_pc",
+                                        TypeRange{},
+                                        ValueRange{procIdVal, destStateVal});
+    mlir::cf::BranchOp::create(rewriter, waitOp.getLoc(), dest);
+
+    // Conditional branch: resume or yield.
+    rewriter.setInsertionPoint(waitOp);
+    rewriter.replaceOpWithNewOp<mlir::cf::CondBranchOp>(waitOp, ready, resumeBlock,
+                                                        exitBlock);
+  }
+
+  // Replace halts with a pc update + exit.
+  SmallVector<llhd::HaltOp> halts;
+  execOp.walk([&](llhd::HaltOp h) { halts.push_back(h); });
+  for (auto haltOp : halts) {
+    if (!haltOp.getYieldOperands().empty())
+      return haltOp.emitOpError() << "scheduled halt with yield operands unsupported";
+    rewriter.setInsertionPoint(haltOp);
+    // Use an out-of-range state id to make the dispatch default to exit.
+    Value doneStateVal = buildI32Constant(rewriter, haltOp.getLoc(), 0xFFFFFFFFu);
+    rewriter.create<mlir::func::CallOp>(haltOp.getLoc(), "__arcilator_set_pc",
+                                        TypeRange{},
+                                        ValueRange{procIdVal, doneStateVal});
+    rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(haltOp, exitBlock);
+  }
+
+  rewriter.setInsertionPointToEnd(dispatchBlock);
+  Value pc =
+      rewriter
+          .create<mlir::func::CallOp>(loc, "__arcilator_get_pc",
+                                      rewriter.getI32Type(),
+                                      ValueRange{procIdVal})
+          .getResult(0);
+
+  SmallVector<int32_t> caseValues;
+  SmallVector<Block *> caseDests;
+  SmallVector<ValueRange> caseOperands;
+  caseValues.reserve(stateBlocks.size());
+  caseDests.reserve(stateBlocks.size());
+  caseOperands.reserve(stateBlocks.size());
+  for (auto [idx, block] : llvm::enumerate(stateBlocks)) {
+    caseValues.push_back(static_cast<int32_t>(idx));
+    caseDests.push_back(block);
+    caseOperands.push_back(ValueRange{});
+  }
+  rewriter.create<mlir::cf::SwitchOp>(loc, pc, exitBlock, ValueRange{},
+                                      caseValues, caseDests, caseOperands);
+
+  return success();
+}
 
 static bool isArcBreakingOp(Operation *op) {
   if (isa<TapOp>(op))
@@ -79,6 +466,16 @@ static std::optional<uint64_t> getConstantLowBit(Value value) {
   if (auto cst = value.getDefiningOp<hw::ConstantOp>())
     return cst.getValue().getZExtValue();
   return std::nullopt;
+}
+
+static std::optional<bool> getConstantBoolValue(Value value) {
+  auto intTy = dyn_cast<IntegerType>(value.getType());
+  if (!intTy || intTy.getWidth() != 1)
+    return std::nullopt;
+  auto lowBit = getConstantLowBit(value);
+  if (!lowBit)
+    return std::nullopt;
+  return (*lowBit & 1ULL) != 0;
 }
 
 static bool isCloneableConstant(Value value) {
@@ -172,6 +569,133 @@ static LogicalResult convertOneShotProcessToInitial(llhd::ProcessOp proc) {
   });
 
   proc.erase();
+  return success();
+}
+
+/// Lower LLHD process results that are used exclusively by epsilon-time drives
+/// into direct `llhd.drv` ops within the process. This matches the common
+/// lowering shape for `->event` triggers where the process yields a new event
+/// "bump" value and an enable bit to a module-level `llhd.drv`.
+///
+/// This rewrite intentionally only supports constant enable values at each
+/// suspension point (wait/halt). That is sufficient for M3 bring-up tests while
+/// avoiding the need to model enabled drives in the later best-effort lowering.
+static LogicalResult sinkProcessResultDrives(llhd::ProcessOp proc) {
+  if (proc.getNumResults() == 0)
+    return failure();
+
+  llvm::SmallDenseSet<Operation *, 4> driveOps;
+  for (Value result : proc.getResults()) {
+    for (OpOperand &use : result.getUses()) {
+      auto drv = dyn_cast<llhd::DrvOp>(use.getOwner());
+      if (!drv)
+        return failure();
+      if (proc->isAncestor(drv))
+        return failure();
+      driveOps.insert(drv.getOperation());
+    }
+  }
+  if (driveOps.empty())
+    return failure();
+
+  SmallVector<llhd::DrvOp> drives;
+  drives.reserve(driveOps.size());
+  for (Operation *op : driveOps)
+    drives.push_back(cast<llhd::DrvOp>(op));
+
+  for (llhd::DrvOp drv : drives) {
+    if (!isEpsilonTime(drv.getTime()))
+      return failure();
+  }
+
+  unsigned numResults = proc.getNumResults();
+  SmallVector<Operation *> suspendOps;
+  for (Block &block : proc.getBody()) {
+    Operation *term = block.getTerminator();
+    if (isa<llhd::WaitOp, llhd::HaltOp>(term))
+      suspendOps.push_back(term);
+  }
+  if (suspendOps.empty())
+    return failure();
+
+  auto remapValue = [](Value value,
+                       const DenseMap<Value, Value> &yieldMap) -> Value {
+    if (!value)
+      return value;
+    auto it = yieldMap.find(value);
+    if (it != yieldMap.end())
+      return it->second;
+    return value;
+  };
+
+  for (Operation *term : suspendOps) {
+    ValueRange yieldOperands;
+    if (auto waitOp = dyn_cast<llhd::WaitOp>(term))
+      yieldOperands = waitOp.getYieldOperands();
+    else if (auto haltOp = dyn_cast<llhd::HaltOp>(term))
+      yieldOperands = haltOp.getYieldOperands();
+    else
+      return failure();
+
+    if (yieldOperands.size() != numResults)
+      return failure();
+
+    DenseMap<Value, Value> yieldMap;
+    yieldMap.reserve(numResults);
+    for (unsigned i = 0; i != numResults; ++i)
+      yieldMap.try_emplace(proc.getResult(i), yieldOperands[i]);
+
+    OpBuilder builder(term);
+    builder.setInsertionPoint(term);
+    Location loc = term->getLoc();
+    for (llhd::DrvOp drv : drives) {
+      Value signal = remapValue(drv.getSignal(), yieldMap);
+      Value value = remapValue(drv.getValue(), yieldMap);
+      Value time = remapValue(drv.getTime(), yieldMap);
+      Value enable = remapValue(drv.getEnable(), yieldMap);
+
+      if (enable) {
+        auto enableConst = getConstantBoolValue(enable);
+        if (!enableConst)
+          return failure();
+        if (!*enableConst)
+          continue;
+        enable = Value{};
+      }
+
+      llhd::DrvOp::create(builder, loc, signal, value, time, enable);
+    }
+
+    if (auto waitOp = dyn_cast<llhd::WaitOp>(term)) {
+      Value delay = waitOp.getDelay();
+      ValueRange observed = waitOp.getObserved();
+      ValueRange destOperands = waitOp.getDestOperands();
+      Block *dest = waitOp.getDest();
+      (void)llhd::WaitOp::create(builder, loc, ValueRange{}, delay, observed,
+                                 destOperands, dest);
+      waitOp.erase();
+      continue;
+    }
+
+    if (auto haltOp = dyn_cast<llhd::HaltOp>(term)) {
+      (void)llhd::HaltOp::create(builder, loc, ValueRange{});
+      haltOp.erase();
+      continue;
+    }
+
+    return failure();
+  }
+
+  for (llhd::DrvOp drv : drives)
+    drv.erase();
+
+  OpBuilder builder(proc);
+  auto newProc =
+      llhd::ProcessOp::create(builder, proc.getLoc(), TypeRange{},
+                              proc->getOperands(), proc->getAttrs());
+  newProc.getBody().takeBody(proc.getBody());
+  proc.erase();
+
   return success();
 }
 
@@ -363,6 +887,222 @@ static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
 
         Value shiftAmt =
             hw::ConstantOp::create(builder, loc, builder.getIntegerType(bw), offset);
+        Value shifted = builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
+        Value updated = builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
+        current[base] = updated;
+      } else {
+        current[sig] = value;
+      }
+      toErase.push_back(drv);
+      continue;
+    }
+  }
+
+  for (Operation *op : toErase)
+    op->erase();
+
+  for (llhd::SigExtractOp ex : llvm::make_early_inc_range(extracts)) {
+    if (ex.getResult().use_empty())
+      ex.erase();
+  }
+
+  for (llhd::ConstantTimeOp timeOp : llvm::make_early_inc_range(times)) {
+    if (timeOp->use_empty())
+      timeOp.erase();
+  }
+
+  return success();
+}
+
+/// Best-effort lowering for "simple" LLHD signal semantics within a single
+/// `llhd.final`. This mirrors `lowerSimpleProcessSignals` but targets teardown
+/// code that runs without waits/delays. Many sv-tests simulation cases use
+/// `final` blocks to compute a value and print `:assert:` lines; those are
+/// commonly lowered by Moore/LLHD to a sequence of `llhd.drv`/`llhd.prb`
+/// operations in a one-block `llhd.final`. Rewriting these to pure SSA updates
+/// avoids needing full inout storage modeling in later conversions.
+static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
+  if (!fin.getBody().hasOneBlock())
+    return failure();
+
+  Block &block = fin.getBody().front();
+  if (!fin.getOps<llhd::WaitOp>().empty())
+    return failure();
+
+  auto module = fin->getParentOfType<hw::HWModuleOp>();
+  if (!module)
+    return failure();
+
+  DenseMap<Value, llhd::SignalOp> signalOps;
+  for (auto sig : module.getOps<llhd::SignalOp>())
+    signalOps.try_emplace(sig.getResult(), sig);
+
+  llvm::SmallDenseSet<Value, 8> baseSignals;
+  SmallVector<llhd::SigExtractOp> extracts;
+  SmallVector<llhd::DrvOp> drives;
+  SmallVector<llhd::PrbOp> probes;
+  SmallVector<llhd::ConstantTimeOp> times;
+
+  for (Operation &op : block) {
+    if (auto ex = dyn_cast<llhd::SigExtractOp>(op)) {
+      extracts.push_back(ex);
+      baseSignals.insert(ex.getInput());
+    } else if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
+      drives.push_back(drv);
+      if (auto timeOp = drv.getTime().getDefiningOp<llhd::ConstantTimeOp>())
+        times.push_back(timeOp);
+    } else if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
+      probes.push_back(prb);
+    } else if (isa<llhd::WaitOp>(op)) {
+      return failure();
+    }
+  }
+
+  struct AliasInfo {
+    Value base;
+    uint64_t offset = 0;
+    unsigned width = 0;
+  };
+  DenseMap<Value, AliasInfo> aliasInfo;
+
+  for (llhd::SigExtractOp ex : extracts) {
+    for (OpOperand &use : ex.getResult().getUses()) {
+      if (!fin->isAncestor(use.getOwner()))
+        return failure();
+      if (!isa<llhd::PrbOp, llhd::DrvOp>(use.getOwner()))
+        return failure();
+    }
+
+    auto lowBit = getConstantLowBit(ex.getLowBit());
+    if (!lowBit)
+      return failure();
+
+    auto inoutTy = dyn_cast<hw::InOutType>(ex.getResult().getType());
+    if (!inoutTy)
+      return failure();
+    auto elemTy = dyn_cast<IntegerType>(inoutTy.getElementType());
+    if (!elemTy)
+      return failure();
+
+    aliasInfo[ex.getResult()] = {ex.getInput(), *lowBit,
+                                 static_cast<unsigned>(elemTy.getWidth())};
+  }
+
+  for (llhd::SigExtractOp ex : extracts)
+    baseSignals.insert(ex.getInput());
+  for (llhd::DrvOp drv : drives) {
+    Value sig = drv.getSignal();
+    if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end())
+      baseSignals.insert(alias->second.base);
+    else
+      baseSignals.insert(sig);
+  }
+  for (llhd::PrbOp prb : probes) {
+    Value sig = prb.getSignal();
+    if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end())
+      baseSignals.insert(alias->second.base);
+    else
+      baseSignals.insert(sig);
+  }
+
+  for (Value base : baseSignals) {
+    auto it = signalOps.find(base);
+    if (it == signalOps.end())
+      return failure();
+
+    for (OpOperand &use : base.getUses()) {
+      if (!fin->isAncestor(use.getOwner()))
+        return failure();
+      if (!isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp>(use.getOwner()))
+        return failure();
+    }
+  }
+
+  for (llhd::DrvOp drv : drives) {
+    if (drv.getEnable())
+      return failure();
+    if (!isEpsilonTime(drv.getTime()))
+      return failure();
+  }
+
+  DenseMap<Value, Value> current;
+  auto getCurrent = [&](OpBuilder &builder, Location loc, Value base) -> Value {
+    if (auto it = current.find(base); it != current.end())
+      return it->second;
+    auto sigIt = signalOps.find(base);
+    if (sigIt == signalOps.end())
+      return {};
+    Value init = sigIt->second.getInit();
+    current[base] = init;
+    return init;
+  };
+
+  SmallVector<Operation *> toErase;
+  OpBuilder builder(fin);
+  for (Operation &op : llvm::make_early_inc_range(block)) {
+    if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
+      builder.setInsertionPoint(prb);
+      Location loc = prb.getLoc();
+      Value sig = prb.getSignal();
+      Value replacement;
+      if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
+        Value baseCur = getCurrent(builder, loc, alias->second.base);
+        if (!baseCur)
+          return failure();
+        replacement = builder.createOrFold<comb::ExtractOp>(
+            loc, builder.getIntegerType(alias->second.width), baseCur,
+            alias->second.offset);
+      } else {
+        replacement = getCurrent(builder, loc, sig);
+        if (!replacement)
+          return failure();
+      }
+      prb.replaceAllUsesWith(replacement);
+      toErase.push_back(prb);
+      continue;
+    }
+
+    if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
+      builder.setInsertionPoint(drv);
+      Location loc = drv.getLoc();
+      Value sig = drv.getSignal();
+      Value value = drv.getValue();
+      if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
+        Value base = alias->second.base;
+        Value baseCur = getCurrent(builder, loc, base);
+        if (!baseCur)
+          return failure();
+        auto baseTy = dyn_cast<IntegerType>(baseCur.getType());
+        auto valTy = dyn_cast<IntegerType>(value.getType());
+        if (!baseTy || !valTy)
+          return failure();
+
+        unsigned bw = baseTy.getWidth();
+        unsigned sliceWidth = alias->second.width;
+        uint64_t offset = alias->second.offset;
+        if (sliceWidth == 0 || bw == 0 || sliceWidth > bw ||
+            offset + sliceWidth > bw)
+          return failure();
+
+        APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(bw) << offset;
+        APInt clearMask = APInt::getAllOnes(bw) ^ sliceMask;
+        Value clearCst = hw::ConstantOp::create(
+            builder, loc, builder.getIntegerAttr(baseTy, clearMask));
+        Value cleared =
+            builder.createOrFold<comb::AndOp>(loc, baseCur, clearCst);
+
+        Value widened = value;
+        if (bw > sliceWidth) {
+          Value pad = hw::ConstantOp::create(
+              builder, loc,
+              builder.getIntegerAttr(builder.getIntegerType(bw - sliceWidth),
+                                     0));
+          widened = builder.createOrFold<comb::ConcatOp>(loc, pad, widened);
+        }
+
+        Value shiftAmt = hw::ConstantOp::create(builder, loc,
+                                                builder.getIntegerType(bw),
+                                                offset);
         Value shifted = builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
         Value updated = builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
         current[base] = updated;
@@ -1096,6 +1836,17 @@ static LogicalResult convert(llhd::ProcessOp op, llhd::ProcessOp::Adaptor adapto
     return failure();
   rewriter.inlineRegionBefore(op.getBody(), executeOp.getBody(),
                               executeOp.getBody().begin());
+
+  if (auto procIdAttr = op->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+    executeOp->setAttr(kArcilatorProcIdAttr, procIdAttr);
+
+  if (needsCycleScheduler(op)) {
+    auto procIdAttr = op->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr);
+    uint32_t procId = procIdAttr ? static_cast<uint32_t>(procIdAttr.getInt()) : 0;
+    if (failed(lowerCycleScheduler(executeOp, procId, rewriter)))
+      return failure();
+  }
+
   rewriter.replaceOp(op, executeOp.getResults());
   return success();
 }
@@ -1114,6 +1865,25 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
   LogicalResult
   matchAndRewrite(llhd::SignalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // For scheduled simulation, treat some integer signals as runtime-managed
+    // storage, using a stable integer id as the "signal handle" after type
+    // conversion. This is a minimal model that enables cross-process variables
+    // and events (lowered as integer bumps) without implementing full LLHD
+    // signal semantics.
+    auto sigIdAttr = op->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr);
+    auto convertedTy =
+        dyn_cast_or_null<IntegerType>(typeConverter->convertType(op.getType()));
+    if (sigIdAttr && convertedTy && convertedTy.getWidth() >= 32 &&
+        convertedTy.getWidth() <= 64) {
+      uint64_t sigId = static_cast<uint64_t>(sigIdAttr.getInt());
+      APInt sigIdBits(convertedTy.getWidth(), sigId);
+      Value handle = hw::ConstantOp::create(rewriter, op.getLoc(), sigIdBits);
+      if (auto cstOp = handle.getDefiningOp<hw::ConstantOp>())
+        cstOp->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+      rewriter.replaceOp(op, handle);
+      return success();
+    }
+
     rewriter.replaceOp(op, adaptor.getInit());
     return success();
   }
@@ -1126,22 +1896,154 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
   LogicalResult
   matchAndRewrite(llhd::PrbOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getSignal());
+    Value handle = adaptor.getSignal();
+    while (auto castOp =
+               handle.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (castOp.getInputs().size() != 1)
+        break;
+      handle = castOp.getInputs().front();
+    }
+    auto *defOp = handle.getDefiningOp();
+    auto sigIdAttr =
+        defOp ? defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)
+              : IntegerAttr();
+    if (!sigIdAttr) {
+      rewriter.replaceOp(op, adaptor.getSignal());
+      return success();
+    }
+
+    auto resultTy =
+        dyn_cast_or_null<IntegerType>(typeConverter->convertType(op.getType()));
+    if (!resultTy || resultTy.getWidth() > 64)
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported probed signal type");
+
+    auto module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return rewriter.notifyMatchFailure(op, "missing module for runtime hook");
+
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_load_u64",
+        rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                                 {rewriter.getI64Type()}));
+
+    uint32_t procId = 0xFFFFFFFFu;
+    if (auto exec = op->getParentOfType<arc::ExecuteOp>()) {
+      if (auto attr =
+              exec->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+        procId = static_cast<uint32_t>(attr.getInt());
+    } else if (auto proc = op->getParentOfType<llhd::ProcessOp>()) {
+      if (auto attr =
+              proc->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+        procId = static_cast<uint32_t>(attr.getInt());
+    }
+    Value procIdVal = buildI32Constant(rewriter, op.getLoc(), procId);
+
+    Value sigIdVal;
+    if (handle.getType() == rewriter.getI32Type()) {
+      sigIdVal = handle;
+    } else if (auto sigIntTy = dyn_cast<IntegerType>(handle.getType())) {
+      if (sigIntTy.getWidth() < 32)
+        return rewriter.notifyMatchFailure(op,
+                                           "signal handle is too narrow");
+      sigIdVal = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                         rewriter.getI32Type(), handle, 0);
+    } else if (isa<llhd::SignalOp>(defOp)) {
+      sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
+    } else {
+      return rewriter.notifyMatchFailure(op, "signal handle is not an integer");
+    }
+
+    Value loaded =
+        rewriter
+            .create<mlir::func::CallOp>(op.getLoc(), "__arcilator_sig_load_u64",
+                                        rewriter.getI64Type(),
+                                        ValueRange{sigIdVal, procIdVal})
+            .getResult(0);
+    if (resultTy.getWidth() == 64) {
+      rewriter.replaceOp(op, loaded);
+      return success();
+    }
+
+    Value truncated = comb::ExtractOp::create(
+        rewriter, op.getLoc(), rewriter.getIntegerType(resultTy.getWidth()),
+        loaded, 0);
+    rewriter.replaceOp(op, truncated);
     return success();
   }
 };
 
-/// `llhd.drv` -> pass-through of the driven value (ignore delay/enable for now)
+/// `llhd.drv` -> best-effort runtime store (ignore precise delay/enable).
 struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
   using OpConversionPattern<llhd::DrvOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(llhd::DrvOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // `llhd.drv` has no SSA results; the current LLHD shims ignore scheduling
-    // and treat drives as side effects on the corresponding `llhd.sig`. Until
-    // we have a proper LLHD-to-Arc lowering that models signal storage, simply
-    // erase the drive during type legalization.
+    Value handle = adaptor.getSignal();
+    while (auto castOp =
+               handle.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (castOp.getInputs().size() != 1)
+        break;
+      handle = castOp.getInputs().front();
+    }
+    auto *defOp = handle.getDefiningOp();
+    auto sigIdAttr =
+        defOp ? defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)
+              : IntegerAttr();
+    if (!sigIdAttr) {
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    auto valueTy = dyn_cast<IntegerType>(adaptor.getValue().getType());
+    if (!valueTy || valueTy.getWidth() > 64)
+      return rewriter.notifyMatchFailure(op, "unsupported driven value type");
+
+    auto module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module)
+      return rewriter.notifyMatchFailure(op, "missing module for runtime hook");
+
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_store_u64",
+        rewriter.getFunctionType(
+            {rewriter.getI32Type(), rewriter.getI64Type(), rewriter.getI32Type()},
+            {}));
+
+    uint32_t procId = 0xFFFFFFFFu;
+    if (auto exec = op->getParentOfType<arc::ExecuteOp>()) {
+      if (auto attr =
+              exec->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+        procId = static_cast<uint32_t>(attr.getInt());
+    } else if (auto proc = op->getParentOfType<llhd::ProcessOp>()) {
+      if (auto attr =
+              proc->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+        procId = static_cast<uint32_t>(attr.getInt());
+    }
+    Value procIdVal = buildI32Constant(rewriter, op.getLoc(), procId);
+
+    Value sigIdVal;
+    if (handle.getType() == rewriter.getI32Type()) {
+      sigIdVal = handle;
+    } else if (auto sigIntTy = dyn_cast<IntegerType>(handle.getType())) {
+      if (sigIntTy.getWidth() < 32)
+        return rewriter.notifyMatchFailure(op,
+                                           "signal handle is too narrow");
+      sigIdVal = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                         rewriter.getI32Type(), handle, 0);
+    } else if (isa<llhd::SignalOp>(defOp)) {
+      sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
+    } else {
+      return rewriter.notifyMatchFailure(op, "signal handle is not an integer");
+    }
+
+    Value value64 = adaptor.getValue();
+    if (valueTy.getWidth() < 64)
+      value64 = comb::createZExt(rewriter, op.getLoc(), value64, 64);
+
+    rewriter.create<mlir::func::CallOp>(op.getLoc(), "__arcilator_sig_store_u64",
+                                        TypeRange{},
+                                        ValueRange{sigIdVal, value64, procIdVal});
     rewriter.eraseOp(op);
     return success();
   }
@@ -1295,6 +2197,80 @@ struct WaitOpConversion : public OpConversionPattern<llhd::WaitOp> {
   }
 };
 
+/// `llhd.now` -> runtime read + time struct materialization
+struct NowOpConversion : public OpConversionPattern<llhd::NowOp> {
+  using OpConversionPattern<llhd::NowOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::NowOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    (void)adaptor;
+    auto structTy = dyn_cast<hw::StructType>(
+        typeConverter->convertType(op.getResult().getType()));
+    if (!structTy)
+      return rewriter.notifyMatchFailure(op, "expected time struct type");
+    auto timeFieldTy = structTy.getFieldType("time");
+    auto deltaFieldTy = structTy.getFieldType("delta");
+    auto epsilonFieldTy = structTy.getFieldType("epsilon");
+    if (!timeFieldTy || !deltaFieldTy || !epsilonFieldTy)
+      return rewriter.notifyMatchFailure(op, "malformed time struct layout");
+
+    auto module = op->getParentOfType<mlir::ModuleOp>();
+    auto fnType = rewriter.getFunctionType({}, {rewriter.getI64Type()});
+    (void)getOrInsertFunc(module, "__arcilator_now_fs", fnType);
+    auto nowFs = rewriter.create<mlir::func::CallOp>(op.getLoc(),
+                                                     "__arcilator_now_fs",
+                                                     rewriter.getI64Type())
+                     .getResult(0);
+
+    Value delta = hw::ConstantOp::create(rewriter, op.getLoc(), deltaFieldTy, 0);
+    Value eps = hw::ConstantOp::create(rewriter, op.getLoc(), epsilonFieldTy, 0);
+    rewriter.replaceOpWithNewOp<hw::StructCreateOp>(
+        op, structTy, ValueRange{nowFs, delta, eps});
+    return success();
+  }
+};
+
+/// `llhd.time_to_int` -> extract `time` field from struct
+struct TimeToIntOpConversion : public OpConversionPattern<llhd::TimeToIntOp> {
+  using OpConversionPattern<llhd::TimeToIntOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::TimeToIntOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto structTy = dyn_cast<hw::StructType>(
+        typeConverter->convertType(op.getInput().getType()));
+    if (!structTy)
+      return rewriter.notifyMatchFailure(op, "expected time struct type");
+    rewriter.replaceOpWithNewOp<hw::StructExtractOp>(op, adaptor.getInput(),
+                                                     rewriter.getStringAttr("time"));
+    return success();
+  }
+};
+
+/// `llhd.int_to_time` -> build a time struct from fs + zero delta/epsilon
+struct IntToTimeOpConversion : public OpConversionPattern<llhd::IntToTimeOp> {
+  using OpConversionPattern<llhd::IntToTimeOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(llhd::IntToTimeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto structTy = dyn_cast<hw::StructType>(
+        typeConverter->convertType(op.getResult().getType()));
+    if (!structTy)
+      return rewriter.notifyMatchFailure(op, "expected time struct type");
+    auto deltaFieldTy = structTy.getFieldType("delta");
+    auto epsilonFieldTy = structTy.getFieldType("epsilon");
+    if (!deltaFieldTy || !epsilonFieldTy)
+      return rewriter.notifyMatchFailure(op, "malformed time struct layout");
+    Value delta = hw::ConstantOp::create(rewriter, op.getLoc(), deltaFieldTy, 0);
+    Value eps = hw::ConstantOp::create(rewriter, op.getLoc(), epsilonFieldTy, 0);
+    rewriter.replaceOpWithNewOp<hw::StructCreateOp>(
+        op, structTy, ValueRange{adaptor.getInput(), delta, eps});
+    return success();
+  }
+};
+
 /// `llhd.halt` -> `arc.output` (surface the yielded values; drop scheduling)
 struct HaltOpConversion : public OpConversionPattern<llhd::HaltOp> {
   using OpConversionPattern<llhd::HaltOp>::OpConversionPattern;
@@ -1407,9 +2383,14 @@ void ConvertToArcsPass::runOnOperation() {
   // simplify away LLHD signal storage for common "single-shot" processes such
   // as `initial` blocks without waits or delays.
   getOperation().walk([&](hw::HWModuleOp module) {
+    for (auto fin :
+         llvm::make_early_inc_range(module.getOps<llhd::FinalOp>()))
+      (void)lowerSimpleFinalSignals(fin);
     for (auto proc :
          llvm::make_early_inc_range(module.getOps<llhd::ProcessOp>())) {
       (void)lowerSimpleProcessSignals(proc);
+      if (succeeded(sinkProcessResultDrives(proc)))
+        continue;
       (void)convertOneShotProcessToInitial(proc);
     }
   });
@@ -1419,6 +2400,75 @@ void ConvertToArcsPass::runOnOperation() {
   // terminating type legalization. A proper scheduler/stateful lowering should
   // live in LLHD transforms (e.g. `llhd-deseq`) or be implemented here as a
   // dedicated conversion.
+
+  // Assign stable ids for scheduled-process lowering. These ids are consumed by
+  // the arcilator-generated driver runtime to retain per-process state (PC and
+  // wait bookkeeping) in a cycle-driven execution model.
+  uint32_t nextProcId = 0;
+  uint32_t nextWaitId = 0;
+  uint32_t nextSigId = 0;
+  OpBuilder idBuilder(&getContext());
+  getOperation().walk([&](llhd::ProcessOp proc) {
+    if (!proc->hasAttr(kArcilatorProcIdAttr))
+      proc->setAttr(kArcilatorProcIdAttr,
+                    idBuilder.getI32IntegerAttr(nextProcId++));
+    if (needsCycleScheduler(proc) && !proc->hasAttr(kArcilatorNeedsSchedulerAttr))
+      proc->setAttr(kArcilatorNeedsSchedulerAttr, idBuilder.getUnitAttr());
+    proc.walk([&](llhd::WaitOp wait) {
+      if (!wait->hasAttr(kArcilatorWaitIdAttr))
+        wait->setAttr(kArcilatorWaitIdAttr,
+                      idBuilder.getI32IntegerAttr(nextWaitId++));
+    });
+  });
+  getOperation().walk([&](llhd::SignalOp sig) {
+    if (!sig->hasAttr(kArcilatorSigIdAttr))
+      sig->setAttr(kArcilatorSigIdAttr, idBuilder.getI32IntegerAttr(nextSigId++));
+  });
+
+  // Pre-lower scheduled LLHD processes into `arc.execute` state machines before
+  // running dialect conversion. Dialect conversion is type-driven and would
+  // otherwise eagerly convert `llhd.wait` terminators (dropping control flow)
+  // before the process-level scheduler rewrite can run.
+  bool schedulerFailed = false;
+  mlir::PatternRewriter schedulerRewriter(&getContext());
+  getOperation().walk([&](hw::HWModuleOp module) {
+    for (auto proc :
+         llvm::make_early_inc_range(module.getOps<llhd::ProcessOp>())) {
+      if (!proc->hasAttr(kArcilatorNeedsSchedulerAttr))
+        continue;
+      auto procIdAttr = proc->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr);
+      uint32_t procId =
+          procIdAttr ? static_cast<uint32_t>(procIdAttr.getInt()) : 0;
+      auto cloneIntoBody = [](Operation *inner) {
+        // Clone constants and LLHD signal/probe declarations into the body so
+        // scheduled-process pre-lowering does not capture `!hw.inout` values as
+        // `arc.execute` operands (those would require unresolved
+        // materializations during type conversion).
+        return inner->hasTrait<OpTrait::ConstantLike>() ||
+               isa<llhd::SignalOp, llhd::PrbOp>(inner);
+      };
+      schedulerRewriter.setInsertionPoint(proc);
+      auto operands = mlir::makeRegionIsolatedFromAbove(
+          schedulerRewriter, proc.getBody(), cloneIntoBody);
+      auto executeOp =
+          ExecuteOp::create(schedulerRewriter, proc.getLoc(), TypeRange{}, operands);
+      if (procIdAttr)
+        executeOp->setAttr(kArcilatorProcIdAttr, procIdAttr);
+      schedulerRewriter.inlineRegionBefore(proc.getBody(), executeOp.getBody(),
+                                           executeOp.getBody().begin());
+      if (failed(lowerCycleScheduler(executeOp, procId, schedulerRewriter))) {
+        proc.emitOpError() << "failed to lower scheduled process";
+        schedulerFailed = true;
+        continue;
+      }
+      schedulerRewriter.eraseOp(proc);
+    }
+  });
+  if (schedulerFailed) {
+    emitError(getOperation().getLoc())
+        << "failed to pre-lower scheduled LLHD processes";
+    return signalPassFailure();
+  }
 
   // Setup the type conversion.
   TypeConverter converter;
@@ -1482,6 +2532,9 @@ void ConvertToArcsPass::runOnOperation() {
   patterns.add<llhd::CombinationalOp>(convert);
   patterns.add<llhd::ProcessOp>(convert);
   patterns.add<llhd::YieldOp>(convert);
+  patterns.add<NowOpConversion>(converter, &getContext());
+  patterns.add<TimeToIntOpConversion>(converter, &getContext());
+  patterns.add<IntToTimeOpConversion>(converter, &getContext());
   patterns.add<ConstantTimeOpConversion>(converter, &getContext());
   patterns.add<SignalOpConversion>(converter, &getContext());
   patterns.add<ProbeOpConversion>(converter, &getContext());
@@ -1498,9 +2551,21 @@ void ConvertToArcsPass::runOnOperation() {
   // Setup the legal ops. (Sort alphabetically.)
   ConversionTarget target(getContext());
   target.addIllegalDialect<llhd::LLHDDialect>();
+  // Keep `llhd.final` around for `arc::LowerState`, which lowers it into the
+  // model's `arc.final` clock tree. Similarly, keep `llhd.halt` terminators
+  // within `llhd.final` regions so they can be replaced with `scf.yield` by the
+  // finalization lowering.
+  target.addLegalOp<llhd::FinalOp>();
+  target.addDynamicallyLegalOp<llhd::HaltOp>(
+      [](llhd::HaltOp op) { return isa<llhd::FinalOp>(op->getParentOp()); });
+  target.addDynamicallyLegalOp<llhd::WaitOp>([](llhd::WaitOp op) {
+    auto parent = op->getParentOfType<llhd::ProcessOp>();
+    return parent && parent->hasAttr(kArcilatorNeedsSchedulerAttr);
+  });
   target.addIllegalOp<llhd::DrvOp, llhd::ProcessOp, llhd::SignalOp,
-                      llhd::WaitOp, llhd::PrbOp, sv::StructFieldInOutOp,
-                      sv::AssignOp, sv::BPAssignOp>();
+                      llhd::PrbOp, llhd::NowOp,
+                      llhd::TimeToIntOp, llhd::IntToTimeOp,
+                      sv::StructFieldInOutOp, sv::AssignOp, sv::BPAssignOp>();
   target.markUnknownOpDynamicallyLegal(
       [](Operation *op) { return !isa<llhd::LLHDDialect>(op->getDialect()); });
 

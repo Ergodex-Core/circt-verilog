@@ -9,6 +9,7 @@
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/SystemSubroutine.h"
+#include "slang/ast/types/AllTypes.h"
 #include "llvm/ADT/ScopeExit.h"
 
 using namespace mlir;
@@ -238,6 +239,56 @@ struct StmtVisitor {
       initial = context.convertRvalueExpression(*init, type);
       if (!initial)
         return failure();
+    } else {
+      const slang::ast::Type &astType = var.getDeclaredType()->getType();
+
+      auto getOrCreateExternFunc = [&](StringRef name, FunctionType fnType) {
+        if (auto existing =
+                context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(name)) {
+          if (existing.getFunctionType() != fnType) {
+            mlir::emitError(loc, "conflicting declarations for `")
+                << name << "`";
+            return mlir::func::FuncOp();
+          }
+          return existing;
+        }
+
+        OpBuilder::InsertionGuard g(context.builder);
+        context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+        context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+        auto fn =
+            mlir::func::FuncOp::create(context.builder, loc, name, fnType);
+        fn.setPrivate();
+        return fn;
+      };
+
+      // Runtime-backed dynamic containers default-initialize to an empty handle.
+      if (astType.as_if<slang::ast::DynamicArrayType>()) {
+        auto intType = dyn_cast<moore::IntType>(type);
+        if (!intType) {
+          mlir::emitError(loc, "unsupported dynamic array storage type: ")
+              << type;
+          return failure();
+        }
+        initial = moore::ConstantOp::create(builder, loc, intType, /*value=*/0,
+                                            /*isSigned=*/true);
+      } else if (astType.as_if<slang::ast::QueueType>()) {
+        auto fnType = FunctionType::get(context.getContext(), {}, {type});
+        auto fn = getOrCreateExternFunc("circt_sv_queue_alloc_i32", fnType);
+        if (!fn)
+          return failure();
+        initial =
+            mlir::func::CallOp::create(builder, loc, fn, ValueRange{})
+                .getResult(0);
+      } else if (astType.as_if<slang::ast::AssociativeArrayType>()) {
+        auto fnType = FunctionType::get(context.getContext(), {}, {type});
+        auto fn = getOrCreateExternFunc("circt_sv_assoc_alloc_str_i32", fnType);
+        if (!fn)
+          return failure();
+        initial =
+            mlir::func::CallOp::create(builder, loc, fn, ValueRange{})
+                .getResult(0);
+      }
     }
 
     // Collect local temporary variables.
@@ -667,6 +718,33 @@ struct StmtVisitor {
   // Handle timing control.
   LogicalResult visit(const slang::ast::TimedStatement &stmt) {
     return context.convertTimingControl(stmt.timing, stmt.stmt);
+  }
+
+  // Handle `->e;` and `->>e;` event triggers.
+  //
+  // We currently model SystemVerilog `event` values as an integer token. A
+  // trigger increments the token, and `@(e)` is lowered as an any-change event
+  // control on that token.
+  LogicalResult visit(const slang::ast::EventTriggerStatement &stmt) {
+    if (stmt.timing)
+      return mlir::emitError(loc) << "unsupported timed event trigger";
+
+    Value lhs = context.convertLvalueExpression(stmt.target);
+    if (!lhs)
+      return failure();
+    auto refTy = dyn_cast<moore::RefType>(lhs.getType());
+    if (!refTy)
+      return mlir::emitError(loc) << "event trigger target did not lower to a ref";
+
+    auto intTy = dyn_cast<moore::IntType>(refTy.getNestedType());
+    if (!intTy)
+      return mlir::emitError(loc) << "unsupported event trigger target type";
+
+    Value cur = moore::ReadOp::create(builder, loc, lhs);
+    Value one = moore::ConstantOp::create(builder, loc, intTy, 1);
+    Value next = moore::AddOp::create(builder, loc, cur, one).getResult();
+    moore::BlockingAssignOp::create(builder, loc, lhs, next);
+    return success();
   }
 
   // Handle return statements.

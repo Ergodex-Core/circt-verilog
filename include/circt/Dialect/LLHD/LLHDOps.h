@@ -50,4 +50,15 @@ void registerDestructableIntegerExternalModel(mlir::DialectRegistry &registry);
 #define GET_OP_CLASSES
 #include "circt/Dialect/LLHD/LLHD.h.inc"
 
+namespace circt {
+namespace llhd {
+
+// Backwards-compatible aliases for older LLHD op class names.
+using PrbOp = ProbeOp;
+using DrvOp = DriveOp;
+using NowOp = CurrentTimeOp;
+
+} // namespace llhd
+} // namespace circt
+
 #endif // CIRCT_DIALECT_LLHD_LLHDOPS_H
