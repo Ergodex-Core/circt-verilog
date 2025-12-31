@@ -80,9 +80,9 @@ void ProbeHoister::hoist() {
 /// process. Therefore, if such ops are moved outside of the process, they are
 /// effectively moved across the waits and thus sample their operands at
 /// different points in time. Only values that are explicitly carried across
-/// `llhd.wait`, where the LLHD dialect has control over the control flow
-/// semantics, may have probes in their fan-in cone hoisted out.
-void ProbeHoister::findValuesLiveAcrossWait(Liveness &liveness) {
+  /// `llhd.wait`, where the LLHD dialect has control over the control flow
+  /// semantics, may have probes in their fan-in cone hoisted out.
+  void ProbeHoister::findValuesLiveAcrossWait(Liveness &liveness) {
   // First find all values that are live across `llhd.wait` operations. We are
   // only interested in values defined in the current region.
   SmallVector<Value> worklist;
@@ -126,14 +126,34 @@ void ProbeHoister::findValuesLiveAcrossWait(Liveness &liveness) {
 /// Hoist any probes at the beginning of resuming blocks out of the process if
 /// their values do not leak across wait ops. Resuming blocks are blocks where
 /// all predecessors are `llhd.wait` ops, and the entry block. Only waits
-/// without any side-effecting op in between themselves and the beginning of the
-/// block can be hoisted.
-void ProbeHoister::hoistProbes() {
+  /// without any side-effecting op in between themselves and the beginning of the
+  /// block can be hoisted.
+  void ProbeHoister::hoistProbes() {
+  Operation *parentOp = region.getParentOp();
+  Block *parentBlock = parentOp ? parentOp->getBlock() : nullptr;
+
   auto findExistingProbe = [&](Value signal) {
-    for (auto *user : signal.getUsers())
-      if (auto probeOp = dyn_cast<PrbOp>(user))
-        if (probeOp->getParentRegion()->isProperAncestor(&region))
-          return probeOp;
+    // Only reuse probes that *dominate* the region we're hoisting from.
+    //
+    // Probes are reused to avoid duplication when hoisting nested regions (e.g.
+    // `scf.if` within an `llhd.process`). However, blindly reusing an existing
+    // probe from an ancestor region can break SSA dominance if that probe is in
+    // a non-dominating block. Restrict reuse to probes that appear before the
+    // parent op that owns this region.
+    for (auto *user : signal.getUsers()) {
+      auto probeOp = dyn_cast<PrbOp>(user);
+      if (!probeOp)
+        continue;
+      if (!probeOp->getParentRegion()->isProperAncestor(&region))
+        continue;
+      if (!parentOp || !parentBlock)
+        continue;
+      if (probeOp->getBlock() != parentBlock)
+        continue;
+      if (!probeOp->isBeforeInBlock(parentOp))
+        continue;
+      return probeOp;
+    }
     return PrbOp{};
   };
 

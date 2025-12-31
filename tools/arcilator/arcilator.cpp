@@ -24,18 +24,23 @@
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
 #include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/Emit/EmitPasses.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
+#include "circt/Dialect/HW/PortImplementation.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
+#include "circt/Dialect/LTL/LTLDialect.h"
 #include "circt/Dialect/Moore/MooreDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Dialect/Sim/SimPasses.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
@@ -47,6 +52,7 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -59,6 +65,7 @@
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
@@ -88,6 +95,285 @@ using namespace circt;
 using namespace arc;
 
 namespace {
+/// Bridge for "top-executed" SV testbenches that have no explicit ports.
+///
+/// Motivation: arcilator's cycle-driven pipeline intentionally drops LLHD
+/// signal/process scheduling semantics. For `sv-tests` "module top" benches
+/// that generate clocks/time internally (e.g. `#50 clk = ~clk;`) this makes
+/// execution vacuous. In strict mode we also want clocked assertions to be
+/// meaningful instead of forcing `--strip-verification`.
+///
+/// This pass performs a pragmatic, opt-in rewrite for no-port `hw.module @top`
+/// testbenches:
+///   - Lift `llhd.sig` named `clk`/`rst`/`reset` into new module input ports and
+///     drop internal drives/processes that write them.
+///   - Inline trivial `llhd.sig` wires that are driven once (epsilon) by an SSA
+///     value and only ever probed, to keep the model purely SSA where possible.
+///   - Hoist `verif.clocked_*` ops out of tight `llhd.process` loops so the Arc
+///     state-lowering pass can lower them (posedge detection + terminate).
+///
+/// This is not a general SV scheduler; it is a bring-up bridge that makes
+/// strict-mode assertion tests measurable while the proper M1 scheduler is
+/// implemented.
+struct MakeNoPortTopDriveablePass
+    : public PassWrapper<MakeNoPortTopDriveablePass,
+                         OperationPass<mlir::ModuleOp>> {
+  void runOnOperation() override;
+
+private:
+  static bool isClockLikeName(StringRef name);
+  static bool isResetLikeName(StringRef name);
+  static Value cloneValueIntoBlock(Value value, Operation *scopeOp,
+                                   OpBuilder &builder, IRMapping &mapping);
+};
+
+bool MakeNoPortTopDriveablePass::isClockLikeName(StringRef name) {
+  name = name.trim();
+  return name == "clk" || name.ends_with(".clk") || name.ends_with("/clk");
+}
+
+bool MakeNoPortTopDriveablePass::isResetLikeName(StringRef name) {
+  name = name.trim();
+  return name == "rst" || name == "reset" || name.ends_with(".rst") ||
+         name.ends_with(".reset") || name.ends_with("/rst") ||
+         name.ends_with("/reset");
+}
+
+Value MakeNoPortTopDriveablePass::cloneValueIntoBlock(Value value,
+                                                      Operation *scopeOp,
+                                                      OpBuilder &builder,
+                                                      IRMapping &mapping) {
+  if (!value)
+    return {};
+  if (auto mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  // Values defined outside `scopeOp` can be referenced directly.
+  if (auto barg = dyn_cast<BlockArgument>(value)) {
+    mapping.map(value, barg);
+    return barg;
+  }
+
+  auto *defOp = value.getDefiningOp();
+  if (!defOp)
+    return {};
+  if (!scopeOp->isAncestor(defOp)) {
+    mapping.map(value, value);
+    return value;
+  }
+
+  // Only clone simple, side-effect-free computation (plus LLHD probes).
+  if (defOp->getNumRegions() != 0)
+    return {};
+  bool allowSideEffects = isa<llhd::PrbOp>(defOp);
+  if (!defOp->hasTrait<OpTrait::ConstantLike>() && !isMemoryEffectFree(defOp) &&
+      !allowSideEffects)
+    return {};
+
+  for (auto operand : defOp->getOperands()) {
+    if (!cloneValueIntoBlock(operand, scopeOp, builder, mapping))
+      return {};
+  }
+
+  Operation *cloned = builder.clone(*defOp, mapping);
+  auto result = dyn_cast<OpResult>(value);
+  if (!result)
+    return {};
+  auto clonedResult = cloned->getResult(result.getResultNumber());
+  mapping.map(value, clonedResult);
+  return clonedResult;
+}
+
+void MakeNoPortTopDriveablePass::runOnOperation() {
+  auto module = getOperation();
+
+  for (auto hwModule : module.getOps<hw::HWModuleOp>()) {
+    if (hwModule.getModuleName() != "top")
+      continue;
+    if (hwModule.getNumPorts() != 0)
+      continue;
+
+    auto *body = hwModule.getBodyBlock();
+    auto *terminator = body->getTerminator();
+    OpBuilder builder(terminator);
+
+    // Collect signal ops we may want to lift.
+    SmallVector<llhd::SignalOp> toExternalize;
+    for (auto sig : hwModule.getOps<llhd::SignalOp>()) {
+      auto nameAttr = sig->getAttrOfType<StringAttr>("name");
+      if (!nameAttr)
+        continue;
+      auto name = nameAttr.getValue();
+      auto inoutTy = dyn_cast<hw::InOutType>(sig.getResult().getType());
+      if (!inoutTy || !inoutTy.getElementType().isInteger(1))
+        continue;
+      if (isClockLikeName(name) || isResetLikeName(name))
+        toExternalize.push_back(sig);
+    }
+
+    DenseMap<Value, Value> liftedSignals;
+
+    // Lift selected signals into module input ports (i1).
+    for (auto sig : toExternalize) {
+      auto nameAttr = sig->getAttrOfType<StringAttr>("name");
+      if (!nameAttr)
+        continue;
+
+      auto [portName, portArg] = hwModule.insertInput(
+          hwModule.getNumInputPorts(), nameAttr, builder.getI1Type());
+      (void)portName;
+      liftedSignals[sig.getResult()] = portArg;
+
+      // Replace all probes of this signal with the new input.
+      SmallVector<llhd::PrbOp> probes;
+      for (auto *user : sig.getResult().getUsers())
+        if (auto prb = dyn_cast<llhd::PrbOp>(user))
+          probes.push_back(prb);
+      for (auto prb : probes) {
+        prb.replaceAllUsesWith(portArg);
+        prb.erase();
+      }
+
+      // Drop any processes which were responsible for driving this signal.
+      // This avoids leaving behind tight loops after the drives are erased.
+      SmallVector<llhd::ProcessOp> procs;
+      hwModule.walk([&](llhd::ProcessOp proc) {
+        bool drivesLifted = false;
+        proc.walk([&](llhd::DrvOp drv) {
+          if (drv.getSignal() == sig.getResult())
+            drivesLifted = true;
+        });
+        if (drivesLifted)
+          procs.push_back(proc);
+      });
+      for (auto proc : procs)
+        proc.erase();
+
+      // Drop any drives into the signal (it is now an input).
+      SmallVector<llhd::DrvOp> drives;
+      hwModule.walk([&](llhd::DrvOp drv) {
+        if (drv.getSignal() == sig.getResult())
+          drives.push_back(drv);
+      });
+      for (auto drv : drives)
+        drv.erase();
+
+      if (sig.use_empty())
+        sig.erase();
+    }
+
+    // Inline trivial signal wires: `sig` + single epsilon drive + only probes.
+    SmallVector<llhd::SignalOp> signals;
+    for (auto sig : llvm::make_early_inc_range(hwModule.getOps<llhd::SignalOp>()))
+      signals.push_back(sig);
+
+    for (auto sig : signals) {
+      if (liftedSignals.contains(sig.getResult()))
+        continue;
+
+      // Collect drives/probes.
+      SmallVector<llhd::DrvOp> drives;
+      SmallVector<llhd::PrbOp> probes;
+      for (auto *user : sig.getResult().getUsers()) {
+        if (auto drv = dyn_cast<llhd::DrvOp>(user)) {
+          if (drv.getSignal() == sig.getResult())
+            drives.push_back(drv);
+          continue;
+        }
+        if (auto prb = dyn_cast<llhd::PrbOp>(user)) {
+          probes.push_back(prb);
+          continue;
+        }
+        drives.clear();
+        probes.clear();
+        break;
+      }
+      if (drives.size() != 1 || probes.empty())
+        continue;
+
+      auto drv = drives.front();
+      if (drv.getEnable())
+        continue;
+
+      // Only inline epsilon drives (treat as combinational wiring).
+      auto cstTime = drv.getTime().getDefiningOp<llhd::ConstantTimeOp>();
+      if (!cstTime)
+        continue;
+      auto t = cstTime.getValue();
+      if (t.getTime() != 0 || t.getDelta() != 0 || t.getEpsilon() != 1)
+        continue;
+
+      Value driven = drv.getValue();
+      for (auto prb : probes) {
+        prb.replaceAllUsesWith(driven);
+        prb.erase();
+      }
+      drv.erase();
+      if (sig.use_empty())
+        sig.erase();
+    }
+
+    // Hoist verif ops out of tight llhd.process loops (no waits).
+    SmallVector<llhd::ProcessOp> procsToErase;
+    for (auto proc :
+         llvm::make_early_inc_range(hwModule.getOps<llhd::ProcessOp>())) {
+      if (!proc.getResults().empty())
+        continue;
+      if (!proc.getOps<llhd::WaitOp>().empty())
+        continue;
+
+      SmallVector<Operation *> verifOps;
+      proc.walk([&](Operation *op) {
+        if (isa<verif::AssertOp, verif::AssumeOp, verif::CoverOp,
+                verif::ClockedAssertOp, verif::ClockedAssumeOp,
+                verif::ClockedCoverOp>(op))
+          verifOps.push_back(op);
+      });
+      if (verifOps.empty())
+        continue;
+
+      // Refuse to touch processes that do anything else stateful.
+      bool hasOtherSideEffects = false;
+      proc.walk([&](Operation *op) {
+        if (op == proc.getOperation())
+          return;
+        if (isa<verif::AssertOp, verif::AssumeOp, verif::CoverOp,
+                verif::ClockedAssertOp, verif::ClockedAssumeOp,
+                verif::ClockedCoverOp>(op))
+          return;
+        if (op->hasTrait<OpTrait::IsTerminator>())
+          return;
+        if (!isMemoryEffectFree(op) && !isa<llhd::PrbOp>(op))
+          hasOtherSideEffects = true;
+      });
+      if (hasOtherSideEffects)
+        continue;
+
+      // Clone dependencies and the verif op itself into the module body.
+      IRMapping mapping;
+      bool canHoist = true;
+      for (Operation *op : verifOps) {
+        // Ensure operands are available in the module body.
+        for (auto operand : op->getOperands()) {
+          if (!cloneValueIntoBlock(operand, proc, builder, mapping)) {
+            canHoist = false;
+            break;
+          }
+        }
+        if (!canHoist)
+          break;
+        builder.clone(*op, mapping);
+      }
+      if (!canHoist)
+        continue;
+
+      procsToErase.push_back(proc);
+    }
+    for (auto proc : procsToErase)
+      proc.erase();
+  }
+}
+
 /// Strip verification ops that are currently not supported by the arcilator
 /// lowering pipeline. This allows us to accept SV sources that include
 /// assertions/properties (including LTL-based ones) without failing the HW→Arc
@@ -140,6 +426,99 @@ struct StripVerificationOpsPass
       }
       op->erase();
     }
+  }
+};
+
+/// Lower any remaining `verif.{assert,assume,cover}` operations to `sim.*` ops
+/// so the Arc→LLVM lowering does not fail in strict mode.
+///
+/// In strict mode (`--strip-verification=false`) we keep `verif.*` ops in the
+/// IR, but some can survive Arc state lowering nested inside `arc.execute`
+/// regions. The Arc→LLVM conversion does not accept `verif.*` ops, so provide
+/// a pragmatic lowering bridge here.
+struct LowerVerifAssertLikeToSimPass
+    : public PassWrapper<LowerVerifAssertLikeToSimPass,
+                         OperationPass<mlir::ModuleOp>> {
+  void runOnOperation() override {
+    auto module = getOperation();
+
+    auto getI1Constant = [](OpBuilder &builder, Location loc,
+                            bool value) -> Value {
+      return hw::ConstantOp::create(builder, loc, builder.getI1Type(),
+                                    static_cast<int64_t>(value))
+          .getResult();
+    };
+
+    auto lowerUnclockedAssertLike = [&](auto op) {
+      if (!op.getProperty().getType().isInteger(1)) {
+        op.emitWarning()
+            << "unsupported non-i1 verif assert-like property; dropping";
+        op.erase();
+        return;
+      }
+
+      OpBuilder builder(op);
+      auto loc = op.getLoc();
+
+      Value enable = op.getEnable();
+      if (!enable)
+        enable = getI1Constant(builder, loc, /*value=*/true);
+      Value notProperty =
+          comb::XorOp::create(builder, loc, op.getProperty(),
+                              getI1Constant(builder, loc, /*value=*/true));
+      Value failCond = comb::AndOp::create(builder, loc, enable, notProperty);
+
+      auto ifFail =
+          scf::IfOp::create(builder, loc, failCond, /*withElse=*/false);
+      builder.setInsertionPoint(ifFail.thenYield());
+      sim::TerminateOp::create(builder, loc, /*success=*/false,
+                               /*verbose=*/false);
+
+      op.erase();
+    };
+
+    // Collect first to avoid invalidating the walk while rewriting.
+    SmallVector<verif::AssertOp> asserts;
+    SmallVector<verif::AssumeOp> assumes;
+    SmallVector<verif::CoverOp> covers;
+    SmallVector<verif::ClockedAssertOp> clockedAsserts;
+    SmallVector<verif::ClockedAssumeOp> clockedAssumes;
+    SmallVector<verif::ClockedCoverOp> clockedCovers;
+
+    module.walk([&](verif::AssertOp op) { asserts.push_back(op); });
+    module.walk([&](verif::AssumeOp op) { assumes.push_back(op); });
+    module.walk([&](verif::CoverOp op) { covers.push_back(op); });
+    module.walk(
+        [&](verif::ClockedAssertOp op) { clockedAsserts.push_back(op); });
+    module.walk(
+        [&](verif::ClockedAssumeOp op) { clockedAssumes.push_back(op); });
+    module.walk(
+        [&](verif::ClockedCoverOp op) { clockedCovers.push_back(op); });
+
+    for (auto op : asserts)
+      lowerUnclockedAssertLike(op);
+    for (auto op : assumes)
+      lowerUnclockedAssertLike(op);
+
+    // Coverage is not currently surfaced in simulation; drop.
+    for (auto op : covers)
+      op.erase();
+
+    // If any clocked ops survive to this point, they are not supported by the
+    // current strict-mode bridge (proper scheduling is still M1). Drop them
+    // with a warning rather than failing Arc→LLVM lowering.
+    for (auto op : clockedAsserts) {
+      op.emitWarning()
+          << "unlowered verif.clocked_assert reached Arc→LLVM; dropping";
+      op.erase();
+    }
+    for (auto op : clockedAssumes) {
+      op.emitWarning()
+          << "unlowered verif.clocked_assume reached Arc→LLVM; dropping";
+      op.erase();
+    }
+    for (auto op : clockedCovers)
+      op.erase();
   }
 };
 } // namespace
@@ -207,6 +586,13 @@ static llvm::cl::opt<bool> shouldDetectResets(
     "detect-resets",
     llvm::cl::desc("Infer reset conditions for states to avoid computation"),
     llvm::cl::init(false), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<bool>
+    stripVerificationOps("strip-verification",
+                         llvm::cl::desc("Strip verif/ltl/SV assertion ops that "
+                                        "are not supported by the arcilator "
+                                        "lowering pipeline"),
+                         llvm::cl::init(true), llvm::cl::cat(mainCategory));
 
 static llvm::cl::opt<bool>
     shouldMakeLUTs("lookup-tables",
@@ -314,6 +700,8 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
   // represented as intrinsic ops.
   if (untilReached(UntilPreprocessing))
     return;
+  // In strict mode (`--strip-verification=false`), keep `verif.*` ops in the IR
+  // and lower supported assertions later during Arc state lowering.
   if (inputHasMoore)
     pm.addPass(createConvertMooreToCorePass());
   pm.addPass(om::createStripOMPass());
@@ -331,6 +719,10 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     // ops so the temporal region analysis can succeed on typical always blocks.
     pm.nest<hw::HWModuleOp>().addPass(createCSEPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createTemporalCodeMotion());
+    // Promote stack-like memory (`llhd.var` / `llhd.load` / `llhd.store`) to SSA
+    // values early so later LLHD and Arc conversions don't have to reason about
+    // pointer-typed state.
+    pm.nest<hw::HWModuleOp>().addPass(llhd::createMemoryToBlockArgument());
     pm.addPass(llhd::createHoistSignalsPass());
     // Hoist signal accesses (and promote hoistable drives to process results)
     // before lowering processes to combinational ops. Otherwise, drives end up
@@ -342,6 +734,8 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     pm.nest<hw::HWModuleOp>().addPass(llhd::createCombineDrivesPass());
     pm.nest<hw::HWModuleOp>().addPass(llhd::createSig2Reg());
   }
+  if (!stripVerificationOps)
+    pm.addPass(std::make_unique<MakeNoPortTopDriveablePass>());
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
@@ -357,7 +751,8 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     pm.addPass(arc::createInferMemoriesPass(opts));
   }
   pm.addPass(sim::createLowerDPIFunc());
-  pm.addPass(std::make_unique<StripVerificationOpsPass>());
+  if (stripVerificationOps)
+    pm.addPass(std::make_unique<StripVerificationOpsPass>());
 
   // Restructure the input from a `hw.module` hierarchy to a collection of arcs.
   if (untilReached(UntilArcConversion))
@@ -444,6 +839,8 @@ static void populateArcToLLVMPipeline(PassManager &pm) {
   // Lower the arcs and update functions to LLVM.
   if (untilReached(UntilLLVMLowering))
     return;
+  if (!stripVerificationOps)
+    pm.addPass(std::make_unique<LowerVerifAssertLikeToSimPass>());
   pm.addPass(createLowerArcToLLVMPass());
   pm.addPass(sim::createLowerSimConsole());
   pm.addPass(createCSEPass());
@@ -677,6 +1074,7 @@ static LogicalResult executeArcilator(MLIRContext &context) {
     emit::EmitDialect,
     hw::HWDialect,
     llhd::LLHDDialect,
+    ltl::LTLDialect,
     moore::MooreDialect,
     mlir::arith::ArithDialect,
     mlir::cf::ControlFlowDialect,

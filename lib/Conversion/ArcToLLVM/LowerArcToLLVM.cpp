@@ -14,6 +14,7 @@
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Support/ConversionPatternSet.h"
 #include "circt/Support/Namespace.h"
@@ -57,6 +58,51 @@ static llvm::Twine evalSymbolFromModelName(StringRef modelName) {
 }
 
 namespace {
+
+struct ConstantStrOpLowering : public OpConversionPattern<sv::ConstantStrOp> {
+  ConstantStrOpLowering(LLVMTypeConverter &converter, MLIRContext *ctx,
+                        unsigned *nextStringId)
+      : OpConversionPattern(converter, ctx), nextStringId(nextStringId) {}
+
+  LogicalResult
+  matchAndRewrite(sv::ConstantStrOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    auto module = op->getParentOfType<mlir::ModuleOp>();
+    if (!module || !nextStringId)
+      return failure();
+
+    SmallVector<char> bytes(op.getStr().begin(), op.getStr().end());
+    bytes.push_back(0);
+    auto bytesRef = StringRef(bytes.data(), bytes.size());
+
+    LLVM::GlobalOp global;
+    {
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+
+      SmallString<32> name;
+      name.append("_sv_str_");
+      name.append(Twine((*nextStringId)++).str());
+
+      auto i8Ty = rewriter.getI8Type();
+      auto globalType = LLVM::LLVMArrayType::get(i8Ty, bytes.size());
+      global = LLVM::GlobalOp::create(rewriter, op.getLoc(), globalType,
+                                      /*isConstant=*/true,
+                                      LLVM::Linkage::Internal, name,
+                                      rewriter.getStringAttr(bytesRef),
+                                      /*alignment=*/0);
+    }
+
+    Type expectedType = typeConverter->convertType(op.getType());
+    Value addr = rewriter.create<LLVM::AddressOfOp>(op.getLoc(), global);
+    if (addr.getType() != expectedType)
+      addr = rewriter.create<LLVM::BitcastOp>(op.getLoc(), expectedType, addr);
+    rewriter.replaceOp(op, addr);
+    return success();
+  }
+
+  unsigned *nextStringId;
+};
 
 struct ModelOpLowering : public OpConversionPattern<arc::ModelOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -696,11 +742,12 @@ void LowerArcToLLVMPass::runOnOperation() {
   LLVMConversionTarget target(getContext());
   target.addLegalOp<mlir::ModuleOp>();
   target.addLegalOp<scf::YieldOp>(); // quirk of SCF dialect conversion
-  // Keep Sim formatting/printing ops around until `sim-lower-console` runs.
-  target.addLegalOp<sim::FormatLitOp, sim::FormatDecOp, sim::FormatHexOp,
-                    sim::FormatBinOp, sim::FormatCharOp,
-                    sim::FormatStringConcatOp, sim::PrintFormattedProcOp,
-                    sim::TerminateOp>();
+	  // Keep Sim formatting/printing ops around until `sim-lower-console` runs.
+	  target.addLegalOp<sim::FormatLitOp, sim::FormatDecOp, sim::FormatHexOp,
+	                    sim::FormatBinOp, sim::FormatRealOp, sim::FormatCharOp,
+	                    sim::FormatStrOp,
+	                    sim::FormatStringConcatOp, sim::PrintFormattedProcOp,
+	                    sim::TerminateOp>();
 
   // Setup the arc dialect type conversion.
   LLVMTypeConverter converter(&getContext());
@@ -725,6 +772,7 @@ void LowerArcToLLVMPass::runOnOperation() {
 
   // Setup the conversion patterns.
   ConversionPatternSet patterns(&getContext(), converter);
+  unsigned nextStringId = 0;
 
   // MLIR patterns.
   populateSCFToControlFlowConversionPatterns(patterns);
@@ -741,6 +789,7 @@ void LowerArcToLLVMPass::runOnOperation() {
   populateHWToLLVMTypeConversions(converter);
   populateCombToArithConversionPatterns(converter, patterns);
   populateCombToLLVMConversionPatterns(converter, patterns);
+  patterns.add<ConstantStrOpLowering>(converter, &getContext(), &nextStringId);
 
   // Arc patterns.
   // clang-format off

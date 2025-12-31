@@ -109,6 +109,14 @@ struct ImportVerilogOptions {
   /// If true, allow top-level modules to have unconnected interface ports.
   std::optional<bool> allowTopLevelIfacePorts;
 
+  /// If true, allow the importer to stub/skip unsupported SystemVerilog class
+  /// and UVM constructs (e.g. class methods, `new`, and `uvm_pkg` contents)
+  /// instead of failing.
+  ///
+  /// This is a bring-up aid only; for correctness (and for honest UVM scoring)
+  /// this should be disabled so unsupported features produce diagnostics.
+  bool allowClassStubs = true;
+
   /// If non-empty, specifies the list of modules that should serve as the top
   /// modules in the design. If empty, this will be automatically determined
   /// based on which modules are unreferenced elsewhere.

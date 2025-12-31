@@ -24,6 +24,7 @@ set(libs
   CIRCTMooreToCore
   CIRCTSupport
   CIRCTTransforms
+  CIRCTLTL
   CIRCTVerif
   CIRCTSeq
   CIRCTSV
