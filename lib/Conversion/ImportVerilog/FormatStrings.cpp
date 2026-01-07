@@ -142,6 +142,9 @@ struct FormatStringParser {
     case 's':
       return emitString(arg, options);
 
+    case 'p':
+      return emitPretty(arg, options);
+
     default:
       return mlir::emitError(loc)
              << "unsupported format specifier `" << fullSpecifier << "`";
@@ -282,6 +285,25 @@ struct FormatStringParser {
 
     return mlir::emitError(context.convertLocation(arg.sourceRange))
            << "expression cannot be formatted as string";
+  }
+
+  /// Emit a "pretty" formatted value (%p). This is used heavily by UVM report
+  /// macros to print aggregates. For now, attempt to treat the argument as a
+  /// string / format string, and fall back to a deterministic placeholder.
+  LogicalResult emitPretty(const slang::ast::Expression &arg,
+                           const FormatOptions &options) {
+    if (options.width)
+      return mlir::emitError(loc)
+             << "pretty format specifier with width not supported";
+
+    if (auto value = context.convertRvalueExpression(
+            arg, builder.getType<moore::FormatStringType>())) {
+      fragments.push_back(value);
+      return success();
+    }
+
+    emitLiteral("<unsupported %p>");
+    return success();
   }
 
   /// Emit an expression argument with the appropriate default formatting.

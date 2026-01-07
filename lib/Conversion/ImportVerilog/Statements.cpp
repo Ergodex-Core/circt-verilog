@@ -212,11 +212,52 @@ struct StmtVisitor {
           return failure();
         }
       }
+
+      // Some system tasks may not be classified by slang as a SystemCallInfo
+      // (and thus won't reach visitSystemCall). Handle `$timeformat` here as
+      // a fallback.
+      if (!call->getSubroutineName().compare("$timeformat")) {
+        auto args = call->arguments();
+        if (args.size() != 4)
+          return emitError(loc) << "`$timeformat` expects 4 arguments";
+
+        auto unitConst = context.evaluateConstant(*args[0]);
+        auto precisionConst = context.evaluateConstant(*args[1]);
+        auto suffixConst = context.evaluateConstant(*args[2]);
+        auto minWidthConst = context.evaluateConstant(*args[3]);
+
+        if (!unitConst.isInteger() || !precisionConst.isInteger() ||
+            !minWidthConst.isInteger())
+          return emitError(loc)
+                 << "`$timeformat` unit/precision/minWidth must be integers";
+        if (!suffixConst.isString())
+          return emitError(loc) << "`$timeformat` suffix must be a string";
+
+        auto unit = unitConst.integer().as<int32_t>();
+        auto precision = precisionConst.integer().as<int32_t>();
+        auto minWidth = minWidthConst.integer().as<int32_t>();
+        if (!unit || !precision || !minWidth)
+          return emitError(loc) << "`$timeformat` arguments out of range";
+
+        auto suffixAttr = builder.getStringAttr(StringRef(suffixConst.str()));
+        moore::TimeFormatBIOp::create(builder, loc, *unit, *precision,
+                                      suffixAttr, *minWidth);
+        return success();
+      }
     }
 
     auto value = context.convertRvalueExpression(stmt.expr);
-    if (!value)
+    if (!value) {
+      auto diag = mlir::emitError(loc, "failed to convert expression statement");
+      diag.attachNote(loc) << "expression kind: "
+                           << slang::ast::toString(stmt.expr.kind);
+      if (const auto *call = stmt.expr.as_if<slang::ast::CallExpression>()) {
+        diag.attachNote(loc) << "call target: " << call->getSubroutineName();
+        if (call->thisClass())
+          diag.attachNote(loc) << "call has explicit receiver";
+      }
       return failure();
+    }
 
     // Expressions like calls to void functions return a dummy value that has no
     // uses. If the returned value is trivially dead, remove it.
@@ -503,6 +544,99 @@ struct StmtVisitor {
 
     // If control never reaches the exit block, remove it and mark control flow
     // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  /// Handle `randcase` statements.
+  ///
+  /// These are used by the chapter-18 random stability tests. Lower them to a
+  /// runtime selection based on `$urandom`, so that RNG state controls
+  /// (`get_randstate` / `set_randstate`) can influence the choice.
+  LogicalResult visit(const slang::ast::RandCaseStatement &stmt) {
+    if (stmt.items.empty())
+      return success();
+
+    auto i32Ty =
+        moore::IntType::get(context.getContext(), /*width=*/32, moore::Domain::TwoValued);
+
+    SmallVector<Value> weights;
+    weights.reserve(stmt.items.size());
+
+    Value total =
+        moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0, /*isSigned=*/true);
+    for (const auto &item : stmt.items) {
+      Value w = context.convertRvalueExpression(*item.expr);
+      if (!w)
+        return failure();
+      w = context.materializeConversion(i32Ty, w, /*isSigned=*/false, loc);
+      if (!w)
+        return failure();
+      weights.push_back(w);
+      total = moore::AddOp::create(builder, loc, total, w).getResult();
+    }
+
+    Value zero =
+        moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0, /*isSigned=*/true);
+    Value nonZero = moore::NeOp::create(builder, loc, total, zero);
+    nonZero = builder.createOrFold<moore::BoolCastOp>(loc, nonZero);
+    nonZero = moore::ToBuiltinBoolOp::create(builder, loc, nonZero);
+
+    Value r = moore::UrandomBIOp::create(builder, loc, nullptr);
+    Value pick = moore::ModUOp::create(builder, loc, r, total).getResult();
+
+    Block &exitBlock = createBlock();
+    Block &checkBlock = createBlock();
+    checkBlock.addArgument(i32Ty, loc);
+
+    cf::CondBranchOp::create(builder, loc, nonZero, &checkBlock, ValueRange{pick},
+                             &exitBlock, ValueRange{});
+
+    builder.setInsertionPointToEnd(&checkBlock);
+    Value remaining = checkBlock.getArgument(0);
+
+    for (size_t i = 0, e = stmt.items.size(); i < e; ++i) {
+      Block &matchBlock = createBlock();
+      Block *nextBlock = nullptr;
+      if (i + 1 < e) {
+        nextBlock = &createBlock();
+        nextBlock->addArgument(i32Ty, loc);
+      } else {
+        nextBlock = &exitBlock;
+      }
+
+      Value w = weights[i];
+      Value cond = moore::UltOp::create(builder, loc, remaining, w);
+      cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+      cond = moore::ToBuiltinBoolOp::create(builder, loc, cond);
+
+      Value nextRemaining = moore::SubOp::create(builder, loc, remaining, w).getResult();
+
+      if (i + 1 < e)
+        cf::CondBranchOp::create(builder, loc, cond, &matchBlock, ValueRange{},
+                                 nextBlock, ValueRange{nextRemaining});
+      else
+        cf::CondBranchOp::create(builder, loc, cond, &matchBlock, nextBlock);
+
+      // Generate the selected item.
+      builder.setInsertionPointToEnd(&matchBlock);
+      if (failed(context.convertStatement(*stmt.items[i].stmt)))
+        return failure();
+      if (!isTerminated())
+        cf::BranchOp::create(builder, loc, &exitBlock);
+
+      // Continue with the next item.
+      if (i + 1 < e) {
+        builder.setInsertionPointToEnd(nextBlock);
+        remaining = nextBlock->getArgument(0);
+      }
+    }
+
     if (exitBlock.hasNoPredecessors()) {
       exitBlock.erase();
       setTerminated();
@@ -842,6 +976,14 @@ struct StmtVisitor {
 
     // Handle assertion statements that don't have an action block.
     if (stmt.ifTrue && stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
+      // Moore assertion ops currently require a `moore.procedure` parent. When
+      // an immediate assertion appears inside a function/task body that is
+      // lowered as an isolated region (e.g. `func.func`), keep the condition
+      // evaluation for side effects but otherwise drop the assertion.
+      if (!builder.getInsertionBlock() ||
+          !isa<moore::ProcedureOp>(builder.getInsertionBlock()->getParentOp()))
+        return success();
+
       auto defer = moore::DeferAssert::Immediate;
       if (stmt.isFinal)
         defer = moore::DeferAssert::Final;
@@ -1019,6 +1161,35 @@ struct StmtVisitor {
       // Calls to `$exit` from outside a `program` are ignored. Since we don't
       // yet support programs, there is nothing to do here.
       // TODO: Fix this once we support programs.
+      return true;
+    }
+
+    if (subroutine.name == "$timeformat") {
+      if (args.size() != 4)
+        return emitError(loc) << "`$timeformat` expects 4 arguments";
+
+      auto unitConst = context.evaluateConstant(*args[0]);
+      auto precisionConst = context.evaluateConstant(*args[1]);
+      auto suffixConst = context.evaluateConstant(*args[2]);
+      auto minWidthConst = context.evaluateConstant(*args[3]);
+
+      if (!unitConst.isInteger() || !precisionConst.isInteger() ||
+          !minWidthConst.isInteger())
+        return emitError(loc)
+               << "`$timeformat` unit/precision/minWidth must be integers";
+      if (!suffixConst.isString())
+        return emitError(loc) << "`$timeformat` suffix must be a string";
+
+      auto unit = unitConst.integer().as<int32_t>();
+      auto precision = precisionConst.integer().as<int32_t>();
+      auto minWidth = minWidthConst.integer().as<int32_t>();
+      if (!unit || !precision || !minWidth)
+        return emitError(loc) << "`$timeformat` arguments out of range";
+
+      auto suffixAttr =
+          builder.getStringAttr(StringRef(suffixConst.str()));
+      moore::TimeFormatBIOp::create(builder, loc, *unit, *precision, suffixAttr,
+                                    *minWidth);
       return true;
     }
 

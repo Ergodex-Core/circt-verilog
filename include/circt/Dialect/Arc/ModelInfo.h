@@ -27,7 +27,17 @@ struct StateInfo {
   enum Type { Input, Output, Register, Memory, Wire } type;
   std::string name;
   unsigned offset;
+  /// The semantic bit width of the state. For 4-state values modeled as a
+  /// `{unknown, value}` struct, this reflects the bit width of the `value`
+  /// field rather than the padded storage size.
   unsigned numBits;
+  /// The number of bytes used by the state's in-memory storage representation.
+  unsigned storageBytes = 0;
+  /// For 4-state values modeled as a `{unknown, value}` struct, these indicate
+  /// the byte offsets (relative to `offset`) for the `value` and `unknown`
+  /// fields. For all other values these remain 0.
+  unsigned valueOffset = 0;
+  unsigned unknownOffset = 0;
   unsigned memoryStride = 0; // byte separation between memory words
   unsigned memoryDepth = 0;  // number of words in a memory
 };

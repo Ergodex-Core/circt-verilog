@@ -527,6 +527,29 @@ LogicalResult PrintFormattedProcOp::canonicalize(PrintFormattedProcOp op,
   return failure();
 }
 
+LogicalResult TimeFormatProcOp::verify() {
+  // Keep verifier logic in sync with PrintFormattedProcOp.
+  auto *parentOp = getOperation()->getParentOp();
+
+  if (!parentOp)
+    return emitOpError("must be within a procedural region.");
+
+  if (isa_and_nonnull<hw::HWDialect>(parentOp->getDialect())) {
+    if (!isa<hw::TriggeredOp>(parentOp))
+      return emitOpError("must be within a procedural region.");
+    return success();
+  }
+
+  if (isa_and_nonnull<sv::SVDialect>(parentOp->getDialect())) {
+    if (!parentOp->hasTrait<sv::ProceduralRegion>())
+      return emitOpError("must be within a procedural region.");
+    return success();
+  }
+
+  // Don't fail for dialects that are not explicitly handled.
+  return success();
+}
+
 OpFoldResult StringConstantOp::fold(FoldAdaptor adaptor) {
   return adaptor.getLiteralAttr();
 }
@@ -577,7 +600,6 @@ OpFoldResult IntToStringOp::fold(FoldAdaptor adaptor) {
   }
   std::reverse(result.begin(), result.end());
   return StringAttr::get(getContext(), result);
-  return {};
 }
 
 //===----------------------------------------------------------------------===//

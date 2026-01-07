@@ -2551,6 +2551,21 @@ def DisplayBIOp : Builtin<"display"> {
   let assemblyFormat = "$message attr-dict";
 }
 
+def TimeFormatBIOp : Builtin<"timeformat"> {
+  let summary = "Set SystemVerilog `$timeformat` state";
+  let description = [{
+    Set the global time formatting state used by `%t` formatting in
+    `$display`/`$write`/`$sformatf`.
+
+    See IEEE 1800-2017 § 20.4.3 "$timeformat".
+  }];
+  let arguments = (ins I32Attr:$unit, I32Attr:$precision, StrAttr:$suffix,
+                   I32Attr:$minWidth);
+  let assemblyFormat = [{
+    $unit `,` $precision `,` $suffix `,` $minWidth attr-dict
+  }];
+}
+
 def SeverityInfo : I32EnumAttrCase<"Info", 0, "info">;
 def SeverityWarning : I32EnumAttrCase<"Warning", 1, "warning">;
 def SeverityError : I32EnumAttrCase<"Error", 2, "error">;

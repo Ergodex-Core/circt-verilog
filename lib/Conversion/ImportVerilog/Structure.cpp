@@ -42,7 +42,8 @@ static void guessNamespacePrefix(const slang::ast::Symbol &symbol,
                                  SmallString<64> &prefix) {
   if (symbol.kind != slang::ast::SymbolKind::Package)
     return;
-  guessNamespacePrefix(symbol.getParentScope()->asSymbol(), prefix);
+  if (const auto *parent = symbol.getParentScope())
+    guessNamespacePrefix(parent->asSymbol(), prefix);
   if (!symbol.name.empty()) {
     prefix += symbol.name;
     prefix += "::";
@@ -205,6 +206,12 @@ struct RootVisitor : public BaseVisitor {
 
     OpBuilder::InsertionGuard guard(builder);
 
+    auto it = context.orderedRootOps.upper_bound(varNode.location);
+    if (it == context.orderedRootOps.end())
+      builder.setInsertionPointToEnd(context.intoModuleOp.getBody());
+    else
+      builder.setInsertionPoint(it->second);
+
     Value initial;
     if (const auto *init = varNode.getInitializer()) {
       initial = context.convertRvalueExpression(*init, loweredType);
@@ -212,11 +219,21 @@ struct RootVisitor : public BaseVisitor {
         return failure();
     }
 
-    auto it = context.orderedRootOps.upper_bound(varNode.location);
-    if (it == context.orderedRootOps.end())
-      builder.setInsertionPointToEnd(context.intoModuleOp.getBody());
-    else
-      builder.setInsertionPoint(it->second);
+    // Treat top-level string variables as compile-time constants. sv-tests
+    // uses these as labels in UVM macros; lowering them to storage currently
+    // introduces LLHD vars that are not legalizable through the Arc pipeline.
+    if (isa<moore::StringType>(loweredType)) {
+      if (!initial) {
+        mlir::emitError(loc,
+                        "top-level string variable without initializer is "
+                        "unsupported");
+        return failure();
+      }
+      if (auto *defOp = initial.getDefiningOp())
+        context.orderedRootOps.insert(it, {varNode.location, defOp});
+      context.valueSymbols.insert(&varNode, initial);
+      return success();
+    }
 
     auto varOp = moore::VariableOp::create(
         builder, loc,
