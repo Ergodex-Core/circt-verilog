@@ -41,8 +41,64 @@ using mlir::ConversionConfig;
 static constexpr StringLiteral kArcilatorProcIdAttr = "arcilator.proc_id";
 static constexpr StringLiteral kArcilatorWaitIdAttr = "arcilator.wait_id";
 static constexpr StringLiteral kArcilatorSigIdAttr = "arcilator.sig_id";
+static constexpr StringLiteral kArcilatorSigOffsetAttr = "arcilator.sig_offset";
+static constexpr StringLiteral kArcilatorSigTotalWidthAttr =
+    "arcilator.sig_total_width";
+static constexpr StringLiteral kArcilatorSigDynExtractAttr =
+    "arcilator.sig_dyn_extract";
 static constexpr StringLiteral kArcilatorNeedsSchedulerAttr =
     "arcilator.needs_scheduler";
+
+static Value stripCasts(Value value) {
+  while (auto castOp =
+             value.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (castOp.getInputs().size() != 1)
+      break;
+    value = castOp.getInputs().front();
+  }
+  return value;
+}
+
+static Attribute getZeroHWAttr(OpBuilder &builder, Type type) {
+  if (auto intTy = dyn_cast<IntegerType>(type))
+    return builder.getIntegerAttr(intTy, 0);
+  if (auto arrayTy = dyn_cast<hw::ArrayType>(type)) {
+    Attribute elementZero = getZeroHWAttr(builder, arrayTy.getElementType());
+    if (!elementZero)
+      return {};
+    SmallVector<Attribute> elements(arrayTy.getNumElements(), elementZero);
+    return builder.getArrayAttr(elements);
+  }
+  if (auto arrayTy = dyn_cast<hw::UnpackedArrayType>(type)) {
+    Attribute elementZero = getZeroHWAttr(builder, arrayTy.getElementType());
+    if (!elementZero)
+      return {};
+    SmallVector<Attribute> elements(arrayTy.getNumElements(), elementZero);
+    return builder.getArrayAttr(elements);
+  }
+  if (auto structTy = dyn_cast<hw::StructType>(type)) {
+    SmallVector<Attribute> fields;
+    fields.reserve(structTy.getElements().size());
+    for (auto field : structTy.getElements()) {
+      Attribute fieldZero = getZeroHWAttr(builder, field.type);
+      if (!fieldZero)
+        return {};
+      fields.push_back(fieldZero);
+    }
+    return builder.getArrayAttr(fields);
+  }
+  return {};
+}
+
+static Value createZeroHWConstant(OpBuilder &builder, Location loc, Type type) {
+  if (auto intTy = dyn_cast<IntegerType>(type))
+    return hw::ConstantOp::create(builder, loc, type,
+                                  builder.getIntegerAttr(intTy, 0));
+  Attribute zero = getZeroHWAttr(builder, type);
+  if (auto arrayAttr = dyn_cast_or_null<ArrayAttr>(zero))
+    return hw::AggregateConstantOp::create(builder, loc, type, arrayAttr);
+  return {};
+}
 
 static mlir::func::FuncOp getOrInsertFunc(mlir::ModuleOp module, StringRef name,
                                           mlir::FunctionType type) {
@@ -93,6 +149,9 @@ static bool needsCycleScheduler(llhd::ProcessOp op) {
   // signal drives, at which point they become eligible for cycle scheduling.
   if (!op.getResults().empty())
     return false;
+  // Also schedule one-shot processes that end in `llhd.halt` so we can model the
+  // "run once then stop" semantics via the runtime PC state.
+  bool hasHalt = !op.getOps<llhd::HaltOp>().empty();
   bool hasDelay = false;
   bool hasWideObserved = false;
   op.walk([&](llhd::WaitOp wait) {
@@ -104,7 +163,7 @@ static bool needsCycleScheduler(llhd::ProcessOp op) {
         hasWideObserved = true;
     }
   });
-  return hasDelay || hasWideObserved;
+  return hasHalt || hasDelay || hasWideObserved;
 }
 
 static bool isRematerializableForPolling(Operation *op) {
@@ -205,6 +264,15 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       module, "__arcilator_wait_change",
       rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI64Type()},
                                {rewriter.getI1Type()}));
+  (void)getOrInsertFunc(
+      module, "__arcilator_frame_store_u64",
+      rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type(),
+                                rewriter.getI64Type()},
+                               {}));
+  (void)getOrInsertFunc(
+      module, "__arcilator_frame_load_u64",
+      rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                               {rewriter.getI64Type()}));
 
   // Insert the dispatch block as the new entry. If the original entry block has
   // captured values as arguments, move those captures to the dispatch block so
@@ -234,6 +302,44 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   rewriter.setInsertionPointToEnd(exitBlock);
   arc::OutputOp::create(rewriter, loc, ValueRange{});
 
+  // If there are no waits, avoid the full PC-based state dispatch and hoisting.
+  // We only need to model "run once then stop" semantics for one-shot processes
+  // ending in `llhd.halt`.
+  SmallVector<llhd::WaitOp> waits;
+  execOp.walk([&](llhd::WaitOp w) { waits.push_back(w); });
+
+  // Replace halts with a pc update + exit.
+  SmallVector<llhd::HaltOp> halts;
+  execOp.walk([&](llhd::HaltOp h) { halts.push_back(h); });
+  for (auto haltOp : halts) {
+    if (!haltOp.getYieldOperands().empty())
+      return haltOp.emitOpError() << "scheduled halt with yield operands unsupported";
+    rewriter.setInsertionPoint(haltOp);
+    // Use an out-of-range state id to make the dispatch default to exit.
+    Value doneStateVal = buildI32Constant(rewriter, haltOp.getLoc(), 0xFFFFFFFFu);
+    rewriter.create<mlir::func::CallOp>(haltOp.getLoc(), "__arcilator_set_pc",
+                                        TypeRange{},
+                                        ValueRange{procIdVal, doneStateVal});
+    rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(haltOp, exitBlock);
+  }
+
+  if (waits.empty()) {
+    rewriter.setInsertionPointToEnd(dispatchBlock);
+    Value pc =
+        rewriter
+            .create<mlir::func::CallOp>(loc, "__arcilator_get_pc",
+                                        rewriter.getI32Type(),
+                                        ValueRange{procIdVal})
+            .getResult(0);
+
+    // Only state 0 is valid for one-shot processes without waits.
+    rewriter.create<mlir::cf::SwitchOp>(loc, pc, exitBlock, ValueRange{},
+                                        ArrayRef<int32_t>{0},
+                                        ArrayRef<Block *>{entryBlock},
+                                        ArrayRef<ValueRange>{ValueRange{}});
+    return success();
+  }
+
   // The scheduler dispatch can jump directly to any wait state, bypassing the
   // original entry block. Hoist any constant-like definitions that are shared
   // across blocks into the dispatch block so they dominate all possible entry
@@ -244,6 +350,19 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       continue;
     for (Operation &op : block.without_terminator()) {
       if (!isRematerializableForPolling(&op))
+        continue;
+      // Avoid hoisting computed dataflow values into the dispatch block. Those
+      // values may be semantically tied to a particular suspension point (e.g.
+      // edge detection across `llhd.wait`) and are handled via frame-spilling
+      // below. Only hoist constants and "handle" computations (inout handles /
+      // signal declarations) to keep dominance valid without changing meaning.
+      bool isHandleLike = isa<llhd::SignalOp>(op) || op.hasTrait<OpTrait::ConstantLike>();
+      if (!isHandleLike) {
+        isHandleLike = llvm::any_of(op.getResultTypes(), [](Type ty) {
+          return isa<hw::InOutType>(ty);
+        });
+      }
+      if (!isHandleLike)
         continue;
       bool usedOutsideBlock = false;
       for (Value result : op.getResults()) {
@@ -260,14 +379,60 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         hoistable.push_back(&op);
     }
   }
+
+  // Hoisting to the dispatch block changes the "used outside block" property
+  // of all transitively referenced operands. Ensure we hoist a closed set of
+  // rematerializable dependency ops to avoid introducing dominance violations.
+  DenseSet<Operation *> hoistSet;
+  SmallVector<Operation *> worklist;
   for (Operation *op : hoistable)
+    if (hoistSet.insert(op).second)
+      worklist.push_back(op);
+
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    for (Value operand : op->getOperands()) {
+      if (isa<BlockArgument>(operand))
+        continue;
+      Operation *defOp = operand.getDefiningOp();
+      if (!defOp)
+        continue;
+      if (defOp->getBlock() == dispatchBlock || defOp->getBlock() == exitBlock)
+        continue;
+      if (!isRematerializableForPolling(defOp))
+        continue;
+      if (hoistSet.insert(defOp).second)
+        worklist.push_back(defOp);
+    }
+  }
+
+  SmallVector<Operation *> hoistOrder;
+  DenseSet<Operation *> hoistVisited;
+  auto visit = [&](Operation *op, auto &self) -> void {
+    if (!op || !hoistSet.contains(op) || !hoistVisited.insert(op).second)
+      return;
+    for (Value operand : op->getOperands())
+      if (Operation *defOp = operand.getDefiningOp())
+        if (hoistSet.contains(defOp))
+          self(defOp, self);
+    hoistOrder.push_back(op);
+  };
+
+  // Visit hoist candidates in region order for deterministic output.
+  for (Block &block : region) {
+    if (&block == dispatchBlock || &block == exitBlock)
+      continue;
+    for (Operation &op : block.without_terminator())
+      if (hoistSet.contains(&op))
+        visit(&op, visit);
+  }
+
+  for (Operation *op : hoistOrder)
     op->moveBefore(dispatchBlock, dispatchBlock->end());
 
   // Split each `llhd.wait` into its own block so we don't re-run side effects in
   // the pre-wait block while waiting.
   SmallVector<std::pair<Block *, llhd::WaitOp>> waitBlocks;
-  SmallVector<llhd::WaitOp> waits;
-  execOp.walk([&](llhd::WaitOp w) { waits.push_back(w); });
   for (auto w : waits) {
     auto *parent = w->getBlock();
     auto insertIt = std::next(Region::iterator(parent));
@@ -342,13 +507,34 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         if (failed(remat))
           return waitOp.emitOpError() << "could not rematerialize observed value";
         Value curObs = *remat;
-        auto intTy = dyn_cast<IntegerType>(curObs.getType());
-        if (!intTy || intTy.getWidth() > 64)
-          return waitOp.emitOpError() << "unsupported observed value type";
-        Value ext = curObs;
-        if (intTy.getWidth() < 64)
-          ext = comb::createZExt(rewriter, waitOp.getLoc(), curObs, 64);
-        sig = comb::XorOp::create(rewriter, waitOp.getLoc(), sig, ext, true);
+
+        auto foldIntIntoSig = [&](Value intVal) -> LogicalResult {
+          auto intTy = dyn_cast<IntegerType>(intVal.getType());
+          if (!intTy || intTy.getWidth() > 64)
+            return failure();
+          Value ext = intVal;
+          if (intTy.getWidth() < 64)
+            ext = comb::createZExt(rewriter, waitOp.getLoc(), intVal, 64);
+          sig = comb::XorOp::create(rewriter, waitOp.getLoc(), sig, ext, true);
+          return success();
+        };
+
+        // Common SV/Moore lowering represents 4-state values as a struct of
+        // `{value, unknown}`. Fold all integer struct fields into the wait
+        // signature so change detection works for `logic`-typed clocks.
+        if (succeeded(foldIntIntoSig(curObs)))
+          continue;
+        if (auto structTy = dyn_cast<hw::StructType>(curObs.getType())) {
+          for (auto field : structTy.getElements()) {
+            Value fieldVal = rewriter.createOrFold<hw::StructExtractOp>(
+                waitOp.getLoc(), curObs, field);
+            if (failed(foldIntIntoSig(fieldVal)))
+              return waitOp.emitOpError() << "unsupported observed value type";
+          }
+          continue;
+        }
+
+        return waitOp.emitOpError() << "unsupported observed value type";
       }
       ready = rewriter
                   .create<mlir::func::CallOp>(waitOp.getLoc(),
@@ -385,20 +571,6 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   }
 
   // Replace halts with a pc update + exit.
-  SmallVector<llhd::HaltOp> halts;
-  execOp.walk([&](llhd::HaltOp h) { halts.push_back(h); });
-  for (auto haltOp : halts) {
-    if (!haltOp.getYieldOperands().empty())
-      return haltOp.emitOpError() << "scheduled halt with yield operands unsupported";
-    rewriter.setInsertionPoint(haltOp);
-    // Use an out-of-range state id to make the dispatch default to exit.
-    Value doneStateVal = buildI32Constant(rewriter, haltOp.getLoc(), 0xFFFFFFFFu);
-    rewriter.create<mlir::func::CallOp>(haltOp.getLoc(), "__arcilator_set_pc",
-                                        TypeRange{},
-                                        ValueRange{procIdVal, doneStateVal});
-    rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(haltOp, exitBlock);
-  }
-
   rewriter.setInsertionPointToEnd(dispatchBlock);
   Value pc =
       rewriter
@@ -420,6 +592,134 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   }
   rewriter.create<mlir::cf::SwitchOp>(loc, pc, exitBlock, ValueRange{},
                                       caseValues, caseDests, caseOperands);
+
+  // Spilling: any SSA value defined in one scheduler state and used in another
+  // must be preserved across suspension/resume. Model this with a simple
+  // per-process frame array managed by the runtime.
+  auto canSpillType = [&](Type ty) -> bool {
+    if (isa<hw::InOutType>(ty))
+      return false;
+    int64_t bw = hw::getBitWidth(ty);
+    return bw > 0 && bw <= 64;
+  };
+  auto packToI64 = [&](Value value) -> FailureOr<Value> {
+    Type ty = value.getType();
+    int64_t bw = hw::getBitWidth(ty);
+    if (bw <= 0 || bw > 64)
+      return failure();
+    Location loc = value.getLoc();
+    Value bits = value;
+    auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
+    if (!isa<IntegerType>(ty))
+      bits = rewriter.createOrFold<hw::BitcastOp>(loc, intTy, value);
+    if (bw < 64)
+      bits = comb::createZExt(rewriter, loc, bits, 64);
+    return bits;
+  };
+  auto unpackFromI64 = [&](Value packed, Type ty, Location loc) -> FailureOr<Value> {
+    int64_t bw = hw::getBitWidth(ty);
+    if (bw <= 0 || bw > 64)
+      return failure();
+    Value bits = packed;
+    if (bw < 64)
+      bits = comb::ExtractOp::create(rewriter, loc, packed, 0,
+                                     static_cast<unsigned>(bw));
+    if (isa<IntegerType>(ty))
+      return bits;
+    auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
+    return rewriter.createOrFold<hw::BitcastOp>(loc, ty, bits);
+  };
+
+  DenseMap<Value, uint32_t> spillSlots;
+  uint32_t nextSlot = 0;
+  for (Block *block : stateBlocks) {
+    for (Operation &op : block->getOperations()) {
+      for (Value result : op.getResults()) {
+        if (!canSpillType(result.getType()))
+          continue;
+        bool crossBlockUse = llvm::any_of(result.getUses(), [&](OpOperand &use) {
+          return use.getOwner()->getBlock() != block;
+        });
+        if (crossBlockUse)
+          spillSlots.try_emplace(result, nextSlot++);
+      }
+    }
+  }
+
+  // Emit stores at the end of the defining blocks.
+  DenseMap<Block *, SmallVector<std::pair<Value, uint32_t>>> storesByBlock;
+  for (auto [value, slot] : spillSlots) {
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      continue;
+    Block *defBlock = defOp->getBlock();
+    storesByBlock[defBlock].push_back({value, slot});
+  }
+  for (auto &it : storesByBlock) {
+    Block *defBlock = it.first;
+    auto &values = it.second;
+    rewriter.setInsertionPoint(defBlock->getTerminator());
+    for (auto [value, slot] : values) {
+      auto packed = packToI64(value);
+      if (failed(packed))
+        return execOp.emitOpError() << "cannot spill value of type "
+                                    << value.getType();
+      Value slotVal = buildI32Constant(rewriter, value.getLoc(), slot);
+      rewriter.create<mlir::func::CallOp>(
+          value.getLoc(), "__arcilator_frame_store_u64", TypeRange{},
+          ValueRange{procIdVal, slotVal, *packed});
+    }
+  }
+
+  // Replace cross-block uses with loads from the frame.
+  DenseMap<Block *, DenseMap<uint32_t, Value>> loadCache;
+  auto getSpillLoad = [&](Block *block, uint32_t slot, Type ty,
+                          Location loc) -> FailureOr<Value> {
+    auto &blockCache = loadCache[block];
+    if (auto it = blockCache.find(slot); it != blockCache.end())
+      return it->second;
+
+    OpBuilder::InsertionGuard g(rewriter);
+    if (block == dispatchBlock) {
+      Operation *procIdDef = procIdVal.getDefiningOp();
+      if (!procIdDef)
+        return failure();
+      rewriter.setInsertionPointAfter(procIdDef);
+    } else {
+      rewriter.setInsertionPointToStart(block);
+    }
+
+    Value slotVal = buildI32Constant(rewriter, loc, slot);
+    Value loaded =
+        rewriter
+            .create<mlir::func::CallOp>(loc, "__arcilator_frame_load_u64",
+                                        rewriter.getI64Type(),
+                                        ValueRange{procIdVal, slotVal})
+            .getResult(0);
+    auto unpacked = unpackFromI64(loaded, ty, loc);
+    if (failed(unpacked))
+      return failure();
+    blockCache.try_emplace(slot, *unpacked);
+    return *unpacked;
+  };
+
+  for (auto [value, slot] : spillSlots) {
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+      continue;
+    Block *defBlock = defOp->getBlock();
+    for (OpOperand &use : llvm::make_early_inc_range(value.getUses())) {
+      Operation *user = use.getOwner();
+      Block *useBlock = user->getBlock();
+      if (useBlock == defBlock)
+        continue;
+      auto repl = getSpillLoad(useBlock, slot, value.getType(), user->getLoc());
+      if (failed(repl))
+        return execOp.emitOpError()
+               << "cannot reload spilled value of type " << value.getType();
+      use.set(*repl);
+    }
+  }
 
   return success();
 }
@@ -466,6 +766,131 @@ static std::optional<uint64_t> getConstantLowBit(Value value) {
   if (auto cst = value.getDefiningOp<hw::ConstantOp>())
     return cst.getValue().getZExtValue();
   return std::nullopt;
+}
+
+struct ResolvedRuntimeSignal {
+  IntegerAttr sigIdAttr;
+  uint64_t baseOffset = 0;
+  uint64_t totalWidth = 0;
+  Value dynamicOffset;
+  Operation *dynamicOffsetOp = nullptr;
+};
+
+static LogicalResult resolveRuntimeSignal(Value handle, ResolvedRuntimeSignal &out) {
+  handle = stripCasts(handle);
+  Operation *defOp = handle.getDefiningOp();
+  if (!defOp)
+    return failure();
+
+  if (auto sigIdAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
+    out.sigIdAttr = sigIdAttr;
+    if (auto offAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigOffsetAttr))
+      out.baseOffset = static_cast<uint64_t>(offAttr.getInt());
+    if (auto widthAttr =
+            defOp->getAttrOfType<IntegerAttr>(kArcilatorSigTotalWidthAttr))
+      out.totalWidth = static_cast<uint64_t>(widthAttr.getInt());
+    if (out.totalWidth == 0) {
+      Type ty = handle.getType();
+      if (auto inoutTy = dyn_cast<hw::InOutType>(ty))
+        ty = inoutTy.getElementType();
+      int64_t bw = hw::getBitWidth(ty);
+      if (bw > 0)
+        out.totalWidth = static_cast<uint64_t>(bw);
+    }
+    return success();
+  }
+
+  if (auto cast = dyn_cast<mlir::UnrealizedConversionCastOp>(defOp)) {
+    if (!cast->hasAttr(kArcilatorSigDynExtractAttr))
+      return failure();
+    if (cast.getInputs().size() != 2)
+      return failure();
+    ResolvedRuntimeSignal base;
+    if (failed(resolveRuntimeSignal(cast.getInputs().front(), base)))
+      return failure();
+    out = base;
+
+    Value dynOffset = cast.getInputs()[1];
+    if (auto lowBit = getConstantLowBit(dynOffset)) {
+      out.baseOffset += *lowBit;
+      return success();
+    }
+
+    if (out.dynamicOffset)
+      return failure();
+    out.dynamicOffset = dynOffset;
+    out.dynamicOffsetOp = defOp;
+    return success();
+  }
+
+  if (auto ex = dyn_cast<llhd::SigExtractOp>(defOp)) {
+    ResolvedRuntimeSignal base;
+    if (failed(resolveRuntimeSignal(ex.getInput(), base)))
+      return failure();
+    out = base;
+
+    if (auto lowBit = getConstantLowBit(ex.getLowBit())) {
+      out.baseOffset += *lowBit;
+      return success();
+    }
+
+    // Only support a single dynamic extract in the chain.
+    if (out.dynamicOffset)
+      return failure();
+    out.dynamicOffset = ex.getLowBit();
+    out.dynamicOffsetOp = defOp;
+    return success();
+  }
+
+  auto accumulateStructFieldOffset = [&](Type structTy,
+                                         StringAttr field) -> FailureOr<uint64_t> {
+    if (auto inoutTy = dyn_cast<hw::InOutType>(structTy))
+      structTy = inoutTy.getElementType();
+    auto hwStructTy = dyn_cast<hw::StructType>(structTy);
+    if (!hwStructTy)
+      return failure();
+    auto fieldIndexOpt = hwStructTy.getFieldIndex(field);
+    if (!fieldIndexOpt)
+      return failure();
+
+    uint64_t fieldOffset = 0;
+    auto elements = hwStructTy.getElements();
+    for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
+      int64_t w = hw::getBitWidth(elements[i].type);
+      if (w <= 0)
+        return failure();
+      fieldOffset += static_cast<uint64_t>(w);
+    }
+    return fieldOffset;
+  };
+
+  if (auto field = dyn_cast<llhd::SigStructExtractOp>(defOp)) {
+    ResolvedRuntimeSignal base;
+    if (failed(resolveRuntimeSignal(field.getInput(), base)))
+      return failure();
+    auto fieldOffset =
+        accumulateStructFieldOffset(field.getInput().getType(), field.getFieldAttr());
+    if (failed(fieldOffset))
+      return failure();
+    out = base;
+    out.baseOffset += *fieldOffset;
+    return success();
+  }
+
+  if (auto field = dyn_cast<sv::StructFieldInOutOp>(defOp)) {
+    ResolvedRuntimeSignal base;
+    if (failed(resolveRuntimeSignal(field.getInput(), base)))
+      return failure();
+    auto fieldOffset =
+        accumulateStructFieldOffset(field.getInput().getType(), field.getFieldAttr());
+    if (failed(fieldOffset))
+      return failure();
+    out = base;
+    out.baseOffset += *fieldOffset;
+    return success();
+  }
+
+  return failure();
 }
 
 static std::optional<bool> getConstantBoolValue(Value value) {
@@ -705,12 +1130,22 @@ static LogicalResult sinkProcessResultDrives(llhd::ProcessOp proc) {
 /// the process region so that later conversions do not have to model inout
 /// storage for these cases.
 static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
-  if (!proc.getBody().hasOneBlock())
-    return failure();
-
-  Block &block = proc.getBody().front();
   if (!proc.getOps<llhd::WaitOp>().empty())
     return failure();
+
+  // Keep this transformation simple: bail out if the process contains nested
+  // regions that can access values from above. This is a best-effort conversion
+  // intended for single-shot processes.
+  WalkResult regionCheck = proc.getBody().walk([](Operation *op) -> WalkResult {
+    if (op->getNumRegions() > 0 &&
+        !op->hasTrait<OpTrait::IsIsolatedFromAbove>())
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (regionCheck.wasInterrupted())
+    return failure();
+
+  Block &entryBlock = proc.getBody().front();
 
   auto module = proc->getParentOfType<hw::HWModuleOp>();
   if (!module)
@@ -729,24 +1164,27 @@ static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
   SmallVector<llhd::PrbOp> probes;
   SmallVector<llhd::ConstantTimeOp> times;
 
-  for (Operation &op : block) {
-    if (auto ex = dyn_cast<llhd::SigExtractOp>(op)) {
-      extracts.push_back(ex);
-      baseSignals.insert(ex.getInput());
-    } else if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
-      drives.push_back(drv);
-      if (auto timeOp = drv.getTime().getDefiningOp<llhd::ConstantTimeOp>())
-        times.push_back(timeOp);
-    } else if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
-      probes.push_back(prb);
-    } else if (isa<llhd::WaitOp>(op)) {
-      return failure();
+  for (Block &block : proc.getBody()) {
+    for (Operation &op : block) {
+      if (auto ex = dyn_cast<llhd::SigExtractOp>(op)) {
+        extracts.push_back(ex);
+        baseSignals.insert(ex.getInput());
+      } else if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
+        drives.push_back(drv);
+        if (auto timeOp = drv.getTime().getDefiningOp<llhd::ConstantTimeOp>())
+          times.push_back(timeOp);
+      } else if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
+        probes.push_back(prb);
+      } else if (isa<llhd::WaitOp>(op)) {
+        return failure();
+      }
     }
   }
 
   struct AliasInfo {
     Value base;
-    uint64_t offset = 0;
+    Value lowBit;
+    std::optional<uint64_t> constLowBit;
     unsigned width = 0;
   };
   DenseMap<Value, AliasInfo> aliasInfo;
@@ -759,18 +1197,17 @@ static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
         return failure();
     }
 
-    auto lowBit = getConstantLowBit(ex.getLowBit());
-    if (!lowBit)
-      return failure();
-
     auto inoutTy = dyn_cast<hw::InOutType>(ex.getResult().getType());
     if (!inoutTy)
       return failure();
     auto elemTy = dyn_cast<IntegerType>(inoutTy.getElementType());
     if (!elemTy)
       return failure();
+    if (!isa<IntegerType>(ex.getLowBit().getType()))
+      return failure();
 
-    aliasInfo[ex.getResult()] = {ex.getInput(), *lowBit,
+    aliasInfo[ex.getResult()] = {ex.getInput(), ex.getLowBit(),
+                                 getConstantLowBit(ex.getLowBit()),
                                  static_cast<unsigned>(elemTy.getWidth())};
   }
 
@@ -792,17 +1229,49 @@ static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
       baseSignals.insert(sig);
   }
 
-  for (Value base : baseSignals) {
-    auto it = signalOps.find(base);
-    if (it == signalOps.end())
-      return failure();
+  auto isAllowedSimpleSignalUser = [&](Operation *op) {
+    return proc->isAncestor(op) &&
+           isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp>(op);
+  };
 
-    for (OpOperand &use : base.getUses()) {
-      if (!proc->isAncestor(use.getOwner()))
-        return failure();
-      if (!isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp>(use.getOwner()))
-        return failure();
+  for (Value base : baseSignals) {
+    // Direct `llhd.signal`.
+    if (signalOps.find(base) != signalOps.end()) {
+      for (OpOperand &use : base.getUses())
+        if (!isAllowedSimpleSignalUser(use.getOwner()))
+          return failure();
+      continue;
     }
+
+    // `llhd.sig.struct_extract` of a process-local struct signal (commonly used
+    // for four-valued storage). The root signal may be referenced by multiple
+    // field-extract ops, but all extracted handles must be local to this
+    // process.
+    if (auto field = base.getDefiningOp<llhd::SigStructExtractOp>()) {
+      for (OpOperand &use : base.getUses())
+        if (!isAllowedSimpleSignalUser(use.getOwner()))
+          return failure();
+
+      Value root = field.getInput();
+      auto rootIt = signalOps.find(root);
+      if (rootIt == signalOps.end())
+        return failure();
+      if (!isa<hw::StructType>(rootIt->second.getInit().getType()))
+        return failure();
+
+      for (OpOperand &use : root.getUses()) {
+        auto otherField = dyn_cast<llhd::SigStructExtractOp>(use.getOwner());
+        if (!otherField)
+          return failure();
+        for (OpOperand &fieldUse : otherField.getResult().getUses())
+          if (!isAllowedSimpleSignalUser(fieldUse.getOwner()))
+            return failure();
+      }
+
+      continue;
+    }
+
+    return failure();
   }
 
   for (llhd::DrvOp drv : drives) {
@@ -812,89 +1281,305 @@ static LogicalResult lowerSimpleProcessSignals(llhd::ProcessOp proc) {
       return failure();
   }
 
-  DenseMap<Value, Value> current;
-  auto getCurrent = [&](OpBuilder &builder, Location loc, Value base) -> Value {
-    if (auto it = current.find(base); it != current.end())
-      return it->second;
-    auto sigIt = signalOps.find(base);
-    if (sigIt == signalOps.end())
-      return {};
-    Value init = sigIt->second.getInit();
-    current[base] = init;
-    return init;
+  if (baseSignals.empty())
+    return failure();
+
+  SmallVector<Value> baseList;
+  baseList.reserve(baseSignals.size());
+  for (Value base : baseSignals)
+    baseList.push_back(base);
+
+  llvm::sort(baseList, [](Value a, Value b) {
+    Operation *aDef = a.getDefiningOp();
+    Operation *bDef = b.getDefiningOp();
+    if (aDef && bDef && aDef->getBlock() == bDef->getBlock())
+      return aDef->isBeforeInBlock(bDef);
+    return a.getAsOpaquePointer() < b.getAsOpaquePointer();
+  });
+
+  DenseMap<Value, unsigned> baseIndex;
+  baseIndex.reserve(baseList.size());
+  for (auto it : llvm::enumerate(baseList))
+    baseIndex.try_emplace(it.value(), static_cast<unsigned>(it.index()));
+
+  SmallVector<Type> baseElemTypes;
+  baseElemTypes.reserve(baseList.size());
+  for (Value base : baseList) {
+    auto inoutTy = dyn_cast<hw::InOutType>(base.getType());
+    if (!inoutTy)
+      return failure();
+    baseElemTypes.push_back(inoutTy.getElementType());
+  }
+
+  DenseMap<Block *, unsigned> baseArgStart;
+  for (Block &block : proc.getBody()) {
+    if (&block == &entryBlock)
+      continue;
+    unsigned start = block.getNumArguments();
+    baseArgStart.try_emplace(&block, start);
+    for (Type ty : baseElemTypes)
+      block.addArgument(ty, proc.getLoc());
+  }
+
+  SmallVector<Value> entryInit;
+  entryInit.reserve(baseList.size());
+  OpBuilder entryBuilder(&entryBlock, entryBlock.begin());
+  for (Value base : baseList) {
+    Value init;
+    if (auto sigIt = signalOps.find(base); sigIt != signalOps.end()) {
+      init = sigIt->second.getInit();
+    } else if (auto field = base.getDefiningOp<llhd::SigStructExtractOp>()) {
+      Value root = field.getInput();
+      auto rootIt = signalOps.find(root);
+      if (rootIt == signalOps.end())
+        return failure();
+      Value rootInit = rootIt->second.getInit();
+      init = entryBuilder.createOrFold<hw::StructExtractOp>(
+          proc.getLoc(), rootInit, field.getFieldAttr());
+    } else {
+      return failure();
+    }
+    entryInit.push_back(init);
+  }
+
+  auto getCurrentForBlock = [&](Block &block) -> SmallVector<Value> {
+    SmallVector<Value> cur;
+    cur.reserve(baseList.size());
+    if (&block == &entryBlock) {
+      cur.append(entryInit.begin(), entryInit.end());
+      return cur;
+    }
+    auto it = baseArgStart.find(&block);
+    if (it == baseArgStart.end())
+      return cur;
+    unsigned start = it->second;
+    for (unsigned i = 0, e = baseList.size(); i != e; ++i)
+      cur.push_back(block.getArgument(start + i));
+    return cur;
+  };
+
+  auto appendValuesToTerminator = [&](Operation *terminator, Block *succ,
+                                     ValueRange values) -> LogicalResult {
+    if (auto br = dyn_cast<mlir::cf::BranchOp>(terminator)) {
+      if (br.getDest() != succ)
+        return failure();
+      for (Value v : values)
+        br.getDestOperandsMutable().append(v);
+      return success();
+    }
+    if (auto condBr = dyn_cast<mlir::cf::CondBranchOp>(terminator)) {
+      if (condBr.getTrueDest() == succ) {
+        for (Value v : values)
+          condBr.getTrueDestOperandsMutable().append(v);
+        return success();
+      }
+      if (condBr.getFalseDest() == succ) {
+        for (Value v : values)
+          condBr.getFalseDestOperandsMutable().append(v);
+        return success();
+      }
+      return failure();
+    }
+    if (auto sw = dyn_cast<mlir::cf::SwitchOp>(terminator)) {
+      if (sw.getDefaultDestination() == succ) {
+        for (Value v : values)
+          sw.getDefaultOperandsMutable().append(v);
+        return success();
+      }
+      for (auto it : llvm::enumerate(sw.getCaseDestinations())) {
+        if (it.value() != succ)
+          continue;
+        for (Value v : values)
+          sw.getCaseOperandsMutable(it.index()).append(v);
+        return success();
+      }
+      return failure();
+    }
+    if (isa<llhd::HaltOp>(terminator))
+      return success();
+    return failure();
   };
 
   SmallVector<Operation *> toErase;
   OpBuilder builder(proc);
-  for (Operation &op : llvm::make_early_inc_range(block)) {
-    if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
-      builder.setInsertionPoint(prb);
-      Location loc = prb.getLoc();
-      Value sig = prb.getSignal();
-      Value replacement;
-      if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
-        Value baseCur = getCurrent(builder, loc, alias->second.base);
-        if (!baseCur)
-          return failure();
-        replacement = builder.createOrFold<comb::ExtractOp>(
-            loc, builder.getIntegerType(alias->second.width), baseCur,
-            alias->second.offset);
-      } else {
-        replacement = getCurrent(builder, loc, sig);
-        if (!replacement)
-          return failure();
-      }
-      prb.replaceAllUsesWith(replacement);
-      toErase.push_back(prb);
-      continue;
-    }
+  for (Block &block : proc.getBody()) {
+    SmallVector<Value> currentVals = getCurrentForBlock(block);
+    if (currentVals.size() != baseList.size())
+      return failure();
 
-    if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
-      builder.setInsertionPoint(drv);
-      Location loc = drv.getLoc();
-      Value sig = drv.getSignal();
-      Value value = drv.getValue();
-      if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
-        Value base = alias->second.base;
-        Value baseCur = getCurrent(builder, loc, base);
-        if (!baseCur)
-          return failure();
-        auto baseTy = dyn_cast<IntegerType>(baseCur.getType());
-        auto valTy = dyn_cast<IntegerType>(value.getType());
-        if (!baseTy || !valTy)
-          return failure();
+    for (Operation &op : llvm::make_early_inc_range(block)) {
+      if (auto prb = dyn_cast<llhd::PrbOp>(op)) {
+        builder.setInsertionPoint(prb);
+        Location loc = prb.getLoc();
+        Value sig = prb.getSignal();
+        Value replacement;
 
-        unsigned bw = baseTy.getWidth();
-        unsigned sliceWidth = alias->second.width;
-        uint64_t offset = alias->second.offset;
-        if (sliceWidth == 0 || bw == 0 || sliceWidth > bw ||
-            offset + sliceWidth > bw)
-          return failure();
+        if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
+          auto idxIt = baseIndex.find(alias->second.base);
+          if (idxIt == baseIndex.end())
+            return failure();
+          Value baseCur = currentVals[idxIt->second];
+          auto baseTy = dyn_cast<IntegerType>(baseCur.getType());
+          if (!baseTy)
+            return failure();
 
-        APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(bw) << offset;
-        APInt clearMask = APInt::getAllOnes(bw) ^ sliceMask;
-        Value clearCst = hw::ConstantOp::create(
-            builder, loc, builder.getIntegerAttr(baseTy, clearMask));
-        Value cleared = builder.createOrFold<comb::AndOp>(loc, baseCur, clearCst);
+          if (alias->second.constLowBit) {
+            replacement = builder.createOrFold<comb::ExtractOp>(
+                loc, builder.getIntegerType(alias->second.width), baseCur,
+                *alias->second.constLowBit);
+          } else {
+            Value shiftAmt = alias->second.lowBit;
+            auto shiftTy = dyn_cast<IntegerType>(shiftAmt.getType());
+            if (!shiftTy)
+              return failure();
 
-        Value widened = value;
-        if (bw > sliceWidth) {
-          Value pad = hw::ConstantOp::create(
-              builder, loc,
-              builder.getIntegerAttr(builder.getIntegerType(bw - sliceWidth), 0));
-          widened = builder.createOrFold<comb::ConcatOp>(loc, pad, widened);
+            unsigned bw = baseTy.getWidth();
+            if (shiftTy.getWidth() < bw) {
+              Value pad = hw::ConstantOp::create(
+                  builder, loc,
+                  builder.getIntegerAttr(
+                      builder.getIntegerType(bw - shiftTy.getWidth()), 0));
+              shiftAmt =
+                  builder.createOrFold<comb::ConcatOp>(loc, pad, shiftAmt);
+            } else if (shiftTy.getWidth() > bw) {
+              shiftAmt = comb::ExtractOp::create(builder, loc, shiftAmt, 0, bw);
+            }
+            if (bw > 0) {
+              Value mask = hw::ConstantOp::create(
+                  builder, loc,
+                  builder.getIntegerAttr(builder.getIntegerType(bw),
+                                         APInt(bw, bw - 1)));
+              shiftAmt = builder.createOrFold<comb::AndOp>(loc, shiftAmt, mask);
+            }
+
+            Value shifted =
+                builder.createOrFold<comb::ShrUOp>(loc, baseCur, shiftAmt);
+            replacement = builder.createOrFold<comb::ExtractOp>(
+                loc, builder.getIntegerType(alias->second.width), shifted, 0);
+          }
+        } else {
+          auto idxIt = baseIndex.find(sig);
+          if (idxIt == baseIndex.end())
+            return failure();
+          replacement = currentVals[idxIt->second];
         }
 
-        Value shiftAmt =
-            hw::ConstantOp::create(builder, loc, builder.getIntegerType(bw), offset);
-        Value shifted = builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
-        Value updated = builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
-        current[base] = updated;
-      } else {
-        current[sig] = value;
+        prb.replaceAllUsesWith(replacement);
+        toErase.push_back(prb);
+        continue;
       }
-      toErase.push_back(drv);
-      continue;
+
+      if (auto drv = dyn_cast<llhd::DrvOp>(op)) {
+        builder.setInsertionPoint(drv);
+        Location loc = drv.getLoc();
+        Value sig = drv.getSignal();
+        Value value = drv.getValue();
+
+        if (auto alias = aliasInfo.find(sig); alias != aliasInfo.end()) {
+          auto idxIt = baseIndex.find(alias->second.base);
+          if (idxIt == baseIndex.end())
+            return failure();
+          unsigned baseIdx = idxIt->second;
+
+          Value baseCur = currentVals[baseIdx];
+          auto baseTy = dyn_cast<IntegerType>(baseCur.getType());
+          auto valTy = dyn_cast<IntegerType>(value.getType());
+          if (!baseTy || !valTy)
+            return failure();
+
+          unsigned bw = baseTy.getWidth();
+          unsigned sliceWidth = alias->second.width;
+          if (sliceWidth == 0 || bw == 0 || sliceWidth > bw)
+            return failure();
+
+          Value widened = value;
+          if (bw > sliceWidth) {
+            Value pad = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(
+                    builder.getIntegerType(bw - sliceWidth), 0));
+            widened = builder.createOrFold<comb::ConcatOp>(loc, pad, widened);
+          }
+
+          if (alias->second.constLowBit) {
+            uint64_t offset = *alias->second.constLowBit;
+            if (offset + sliceWidth > bw)
+              return failure();
+
+            APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(bw) << offset;
+            APInt clearMask = APInt::getAllOnes(bw) ^ sliceMask;
+            Value clearCst = hw::ConstantOp::create(
+                builder, loc, builder.getIntegerAttr(baseTy, clearMask));
+            Value cleared =
+                builder.createOrFold<comb::AndOp>(loc, baseCur, clearCst);
+
+            Value shiftAmt = hw::ConstantOp::create(
+                builder, loc, builder.getIntegerAttr(baseTy, offset));
+            Value shifted =
+                builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
+            Value updated =
+                builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
+            currentVals[baseIdx] = updated;
+          } else {
+            Value shiftAmt = alias->second.lowBit;
+            auto shiftTy = dyn_cast<IntegerType>(shiftAmt.getType());
+            if (!shiftTy)
+              return failure();
+
+            if (shiftTy.getWidth() < bw) {
+              Value pad = hw::ConstantOp::create(
+                  builder, loc,
+                  builder.getIntegerAttr(
+                      builder.getIntegerType(bw - shiftTy.getWidth()), 0));
+              shiftAmt =
+                  builder.createOrFold<comb::ConcatOp>(loc, pad, shiftAmt);
+            } else if (shiftTy.getWidth() > bw) {
+              shiftAmt = comb::ExtractOp::create(builder, loc, shiftAmt, 0, bw);
+            }
+            if (bw > 0) {
+              Value mask = hw::ConstantOp::create(
+                  builder, loc,
+                  builder.getIntegerAttr(builder.getIntegerType(bw),
+                                         APInt(bw, bw - 1)));
+              shiftAmt = builder.createOrFold<comb::AndOp>(loc, shiftAmt, mask);
+            }
+
+            Value sliceMaskBase = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(
+                    baseTy, APInt::getAllOnes(sliceWidth).zext(bw)));
+            Value sliceMask =
+                builder.createOrFold<comb::ShlOp>(loc, sliceMaskBase, shiftAmt);
+            Value allOnes = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(baseTy, APInt::getAllOnes(bw)));
+            Value clearMask =
+                builder.createOrFold<comb::XorOp>(loc, allOnes, sliceMask, true);
+            Value cleared =
+                builder.createOrFold<comb::AndOp>(loc, baseCur, clearMask);
+
+            Value shifted =
+                builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
+            Value updated =
+                builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
+            currentVals[baseIdx] = updated;
+          }
+        } else {
+          auto idxIt = baseIndex.find(sig);
+          if (idxIt == baseIndex.end())
+            return failure();
+          currentVals[idxIt->second] = value;
+        }
+
+        toErase.push_back(drv);
+        continue;
+      }
+    }
+
+    Operation *term = block.getTerminator();
+    for (Block *succ : block.getSuccessors()) {
+      if (failed(appendValuesToTerminator(term, succ, currentVals)))
+        return failure();
     }
   }
 
@@ -960,7 +1645,8 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
 
   struct AliasInfo {
     Value base;
-    uint64_t offset = 0;
+    Value lowBit;
+    std::optional<uint64_t> constLowBit;
     unsigned width = 0;
   };
   DenseMap<Value, AliasInfo> aliasInfo;
@@ -973,18 +1659,17 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
         return failure();
     }
 
-    auto lowBit = getConstantLowBit(ex.getLowBit());
-    if (!lowBit)
-      return failure();
-
     auto inoutTy = dyn_cast<hw::InOutType>(ex.getResult().getType());
     if (!inoutTy)
       return failure();
     auto elemTy = dyn_cast<IntegerType>(inoutTy.getElementType());
     if (!elemTy)
       return failure();
+    if (!isa<IntegerType>(ex.getLowBit().getType()))
+      return failure();
 
-    aliasInfo[ex.getResult()] = {ex.getInput(), *lowBit,
+    aliasInfo[ex.getResult()] = {ex.getInput(), ex.getLowBit(),
+                                 getConstantLowBit(ex.getLowBit()),
                                  static_cast<unsigned>(elemTy.getWidth())};
   }
 
@@ -1005,17 +1690,44 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
       baseSignals.insert(sig);
   }
 
-  for (Value base : baseSignals) {
-    auto it = signalOps.find(base);
-    if (it == signalOps.end())
-      return failure();
+  auto isAllowedSimpleSignalUser = [&](Operation *op) {
+    return fin->isAncestor(op) &&
+           isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp>(op);
+  };
 
-    for (OpOperand &use : base.getUses()) {
-      if (!fin->isAncestor(use.getOwner()))
-        return failure();
-      if (!isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp>(use.getOwner()))
-        return failure();
+  for (Value base : baseSignals) {
+    if (signalOps.find(base) != signalOps.end()) {
+      for (OpOperand &use : base.getUses())
+        if (!isAllowedSimpleSignalUser(use.getOwner()))
+          return failure();
+      continue;
     }
+
+    if (auto field = base.getDefiningOp<llhd::SigStructExtractOp>()) {
+      for (OpOperand &use : base.getUses())
+        if (!isAllowedSimpleSignalUser(use.getOwner()))
+          return failure();
+
+      Value root = field.getInput();
+      auto rootIt = signalOps.find(root);
+      if (rootIt == signalOps.end())
+        return failure();
+      if (!isa<hw::StructType>(rootIt->second.getInit().getType()))
+        return failure();
+
+      for (OpOperand &use : root.getUses()) {
+        auto otherField = dyn_cast<llhd::SigStructExtractOp>(use.getOwner());
+        if (!otherField)
+          return failure();
+        for (OpOperand &fieldUse : otherField.getResult().getUses())
+          if (!isAllowedSimpleSignalUser(fieldUse.getOwner()))
+            return failure();
+      }
+
+      continue;
+    }
+
+    return failure();
   }
 
   for (llhd::DrvOp drv : drives) {
@@ -1029,10 +1741,22 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
   auto getCurrent = [&](OpBuilder &builder, Location loc, Value base) -> Value {
     if (auto it = current.find(base); it != current.end())
       return it->second;
-    auto sigIt = signalOps.find(base);
-    if (sigIt == signalOps.end())
+
+    Value init;
+    if (auto sigIt = signalOps.find(base); sigIt != signalOps.end()) {
+      init = sigIt->second.getInit();
+    } else if (auto field = base.getDefiningOp<llhd::SigStructExtractOp>()) {
+      Value root = field.getInput();
+      auto rootIt = signalOps.find(root);
+      if (rootIt == signalOps.end())
+        return {};
+      Value rootInit = rootIt->second.getInit();
+      init = builder.createOrFold<hw::StructExtractOp>(loc, rootInit,
+                                                       field.getFieldAttr());
+    } else {
       return {};
-    Value init = sigIt->second.getInit();
+    }
+
     current[base] = init;
     return init;
   };
@@ -1049,9 +1773,43 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
         Value baseCur = getCurrent(builder, loc, alias->second.base);
         if (!baseCur)
           return failure();
-        replacement = builder.createOrFold<comb::ExtractOp>(
-            loc, builder.getIntegerType(alias->second.width), baseCur,
-            alias->second.offset);
+        auto baseTy = dyn_cast<IntegerType>(baseCur.getType());
+        if (!baseTy)
+          return failure();
+
+        if (alias->second.constLowBit) {
+          replacement = builder.createOrFold<comb::ExtractOp>(
+              loc, builder.getIntegerType(alias->second.width), baseCur,
+              *alias->second.constLowBit);
+        } else {
+          Value shiftAmt = alias->second.lowBit;
+          auto shiftTy = dyn_cast<IntegerType>(shiftAmt.getType());
+          if (!shiftTy)
+            return failure();
+
+          unsigned bw = baseTy.getWidth();
+          if (shiftTy.getWidth() < bw) {
+            Value pad = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(builder.getIntegerType(bw - shiftTy.getWidth()),
+                                       0));
+            shiftAmt = builder.createOrFold<comb::ConcatOp>(loc, pad, shiftAmt);
+          } else if (shiftTy.getWidth() > bw) {
+            shiftAmt = comb::ExtractOp::create(builder, loc, shiftAmt, 0, bw);
+          }
+          if (bw > 0) {
+            Value mask = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(builder.getIntegerType(bw),
+                                       APInt(bw, bw - 1)));
+            shiftAmt = builder.createOrFold<comb::AndOp>(loc, shiftAmt, mask);
+          }
+
+          Value shifted =
+              builder.createOrFold<comb::ShrUOp>(loc, baseCur, shiftAmt);
+          replacement = builder.createOrFold<comb::ExtractOp>(
+              loc, builder.getIntegerType(alias->second.width), shifted, 0);
+        }
       } else {
         replacement = getCurrent(builder, loc, sig);
         if (!replacement)
@@ -1079,17 +1837,8 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
 
         unsigned bw = baseTy.getWidth();
         unsigned sliceWidth = alias->second.width;
-        uint64_t offset = alias->second.offset;
-        if (sliceWidth == 0 || bw == 0 || sliceWidth > bw ||
-            offset + sliceWidth > bw)
+        if (sliceWidth == 0 || bw == 0 || sliceWidth > bw)
           return failure();
-
-        APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(bw) << offset;
-        APInt clearMask = APInt::getAllOnes(bw) ^ sliceMask;
-        Value clearCst = hw::ConstantOp::create(
-            builder, loc, builder.getIntegerAttr(baseTy, clearMask));
-        Value cleared =
-            builder.createOrFold<comb::AndOp>(loc, baseCur, clearCst);
 
         Value widened = value;
         if (bw > sliceWidth) {
@@ -1099,13 +1848,67 @@ static LogicalResult lowerSimpleFinalSignals(llhd::FinalOp fin) {
                                      0));
           widened = builder.createOrFold<comb::ConcatOp>(loc, pad, widened);
         }
+        if (alias->second.constLowBit) {
+          uint64_t offset = *alias->second.constLowBit;
+          if (offset + sliceWidth > bw)
+            return failure();
 
-        Value shiftAmt = hw::ConstantOp::create(builder, loc,
-                                                builder.getIntegerType(bw),
-                                                offset);
-        Value shifted = builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
-        Value updated = builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
-        current[base] = updated;
+          APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(bw) << offset;
+          APInt clearMask = APInt::getAllOnes(bw) ^ sliceMask;
+          Value clearCst = hw::ConstantOp::create(
+              builder, loc, builder.getIntegerAttr(baseTy, clearMask));
+          Value cleared =
+              builder.createOrFold<comb::AndOp>(loc, baseCur, clearCst);
+
+          Value shiftAmt = hw::ConstantOp::create(
+              builder, loc, builder.getIntegerAttr(baseTy, offset));
+          Value shifted =
+              builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
+          Value updated =
+              builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
+          current[base] = updated;
+        } else {
+          Value shiftAmt = alias->second.lowBit;
+          auto shiftTy = dyn_cast<IntegerType>(shiftAmt.getType());
+          if (!shiftTy)
+            return failure();
+
+          if (shiftTy.getWidth() < bw) {
+            Value pad = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(builder.getIntegerType(bw - shiftTy.getWidth()),
+                                       0));
+            shiftAmt = builder.createOrFold<comb::ConcatOp>(loc, pad, shiftAmt);
+          } else if (shiftTy.getWidth() > bw) {
+            shiftAmt = comb::ExtractOp::create(builder, loc, shiftAmt, 0, bw);
+          }
+          if (bw > 0) {
+            Value mask = hw::ConstantOp::create(
+                builder, loc,
+                builder.getIntegerAttr(builder.getIntegerType(bw),
+                                       APInt(bw, bw - 1)));
+            shiftAmt = builder.createOrFold<comb::AndOp>(loc, shiftAmt, mask);
+          }
+
+          Value sliceMaskBase = hw::ConstantOp::create(
+              builder, loc,
+              builder.getIntegerAttr(baseTy,
+                                     APInt::getAllOnes(sliceWidth).zext(bw)));
+          Value sliceMask =
+              builder.createOrFold<comb::ShlOp>(loc, sliceMaskBase, shiftAmt);
+          Value allOnes = hw::ConstantOp::create(
+              builder, loc, builder.getIntegerAttr(baseTy, APInt::getAllOnes(bw)));
+          Value clearMask =
+              builder.createOrFold<comb::XorOp>(loc, allOnes, sliceMask, true);
+          Value cleared =
+              builder.createOrFold<comb::AndOp>(loc, baseCur, clearMask);
+
+          Value shifted =
+              builder.createOrFold<comb::ShlOp>(loc, widened, shiftAmt);
+          Value updated =
+              builder.createOrFold<comb::OrOp>(loc, cleared, shifted);
+          current[base] = updated;
+        }
       } else {
         current[sig] = value;
       }
@@ -1743,7 +2546,24 @@ static LogicalResult convert(llhd::CombinationalOp op,
 
   // Collect the SSA values defined outside but used inside the body region.
   auto cloneIntoBody = [](Operation *op) {
-    return op->hasTrait<OpTrait::ConstantLike>();
+    // Keep runtime signal handle tokens local to the region. Those handles carry
+    // `arcilator.sig_*` attributes on their defining ops which are required by
+    // the best-effort LLHD `{prb,drv}` lowerings. Passing them as block
+    // arguments would drop the attributes.
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return true;
+    if (op->hasAttr(kArcilatorSigIdAttr) ||
+        op->hasAttr(kArcilatorSigOffsetAttr) ||
+        op->hasAttr(kArcilatorSigTotalWidthAttr))
+      return true;
+    // Avoid capturing LLHD signal handles (and derived inout field handles) as
+    // `arc.execute` operands. Those handles carry `arcilator.sig_*` attributes
+    // on their defining ops which are required by the best-effort
+    // `llhd.{prb,drv}` lowerings; passing them as block arguments would drop
+    // the attributes and cause drives/reads to be erased.
+    return isa<llhd::SignalOp, llhd::PrbOp, llhd::SigExtractOp,
+               llhd::SigStructExtractOp, llhd::SigArrayGetOp,
+               llhd::SigArraySliceOp, sv::StructFieldInOutOp>(op);
   };
   auto operands =
       mlir::makeRegionIsolatedFromAbove(rewriter, op.getBody(), cloneIntoBody);
@@ -1798,7 +2618,20 @@ static LogicalResult convert(llhd::ProcessOp op, llhd::ProcessOp::Adaptor adapto
     return failure();
 
   auto cloneIntoBody = [](Operation *inner) {
-    return inner->hasTrait<OpTrait::ConstantLike>();
+    // Avoid capturing LLHD signal handles (and derived inout field handles) as
+    // `arc.execute` operands. Those handles carry `arcilator.sig_*` attributes
+    // on their defining ops which are required by the best-effort
+    // `llhd.{prb,drv}` lowerings; passing them as block arguments would drop
+    // the attributes and cause drives/reads to be erased.
+    if (inner->hasTrait<OpTrait::ConstantLike>())
+      return true;
+    if (inner->hasAttr(kArcilatorSigIdAttr) ||
+        inner->hasAttr(kArcilatorSigOffsetAttr) ||
+        inner->hasAttr(kArcilatorSigTotalWidthAttr))
+      return true;
+    return isa<llhd::SignalOp, llhd::PrbOp, llhd::SigExtractOp,
+               llhd::SigStructExtractOp, llhd::SigArrayGetOp,
+               llhd::SigArraySliceOp, sv::StructFieldInOutOp>(inner);
   };
   auto operands =
       mlir::makeRegionIsolatedFromAbove(rewriter, op.getBody(), cloneIntoBody);
@@ -1865,23 +2698,45 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
   LogicalResult
   matchAndRewrite(llhd::SignalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // For scheduled simulation, treat some integer signals as runtime-managed
+    // For scheduled simulation, treat some LLHD signals as runtime-managed
     // storage, using a stable integer id as the "signal handle" after type
-    // conversion. This is a minimal model that enables cross-process variables
-    // and events (lowered as integer bumps) without implementing full LLHD
-    // signal semantics.
+    // conversion. This enables delay/wait processes and interface field storage
+    // without implementing full LLHD signal semantics.
     auto sigIdAttr = op->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr);
-    auto convertedTy =
-        dyn_cast_or_null<IntegerType>(typeConverter->convertType(op.getType()));
-    if (sigIdAttr && convertedTy && convertedTy.getWidth() >= 32 &&
-        convertedTy.getWidth() <= 64) {
-      uint64_t sigId = static_cast<uint64_t>(sigIdAttr.getInt());
-      APInt sigIdBits(convertedTy.getWidth(), sigId);
-      Value handle = hw::ConstantOp::create(rewriter, op.getLoc(), sigIdBits);
-      if (auto cstOp = handle.getDefiningOp<hw::ConstantOp>())
-        cstOp->setAttr(kArcilatorSigIdAttr, sigIdAttr);
-      rewriter.replaceOp(op, handle);
-      return success();
+    if (sigIdAttr) {
+      bool needsRuntimeStorage = false;
+      for (Operation *user : op.getResult().getUsers()) {
+        if (isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp,
+                llhd::SigStructExtractOp, llhd::SigArrayGetOp,
+                sv::StructFieldInOutOp>(user)) {
+          needsRuntimeStorage = true;
+          break;
+        }
+      }
+
+      Type convertedTy = typeConverter->convertType(op.getType());
+      int64_t totalWidth = convertedTy ? hw::getBitWidth(convertedTy) : -1;
+      if (needsRuntimeStorage && totalWidth > 0 && totalWidth <= 64) {
+        Value handle;
+        if (auto intTy = dyn_cast<IntegerType>(convertedTy)) {
+          uint64_t sigId = static_cast<uint64_t>(sigIdAttr.getInt());
+          APInt sigIdBits(intTy.getWidth(), sigId);
+          handle = hw::ConstantOp::create(rewriter, op.getLoc(), sigIdBits);
+        } else {
+          handle = createZeroHWConstant(rewriter, op.getLoc(), convertedTy);
+        }
+        if (handle) {
+          if (auto *defOp = handle.getDefiningOp()) {
+            defOp->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+            defOp->setAttr(kArcilatorSigOffsetAttr,
+                           rewriter.getI32IntegerAttr(0));
+            defOp->setAttr(kArcilatorSigTotalWidthAttr,
+                           rewriter.getI32IntegerAttr(totalWidth));
+          }
+          rewriter.replaceOp(op, handle);
+          return success();
+        }
+      }
     }
 
     rewriter.replaceOp(op, adaptor.getInit());
@@ -1896,27 +2751,22 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
   LogicalResult
   matchAndRewrite(llhd::PrbOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value handle = adaptor.getSignal();
-    while (auto castOp =
-               handle.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-      if (castOp.getInputs().size() != 1)
-        break;
-      handle = castOp.getInputs().front();
-    }
-    auto *defOp = handle.getDefiningOp();
-    auto sigIdAttr =
-        defOp ? defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)
-              : IntegerAttr();
-    if (!sigIdAttr) {
+    Value handle = stripCasts(adaptor.getSignal());
+    ResolvedRuntimeSignal resolved;
+    if (failed(resolveRuntimeSignal(handle, resolved)) || !resolved.sigIdAttr) {
       rewriter.replaceOp(op, adaptor.getSignal());
       return success();
     }
+    auto sigIdAttr = resolved.sigIdAttr;
+    uint64_t sliceOffset = resolved.baseOffset;
+    uint64_t totalWidth = resolved.totalWidth;
 
-    auto resultTy =
-        dyn_cast_or_null<IntegerType>(typeConverter->convertType(op.getType()));
-    if (!resultTy || resultTy.getWidth() > 64)
-      return rewriter.notifyMatchFailure(op,
-                                         "unsupported probed signal type");
+    Type convertedTy = typeConverter->convertType(op.getType());
+    int64_t resultWidth = convertedTy ? hw::getBitWidth(convertedTy) : -1;
+    if (!convertedTy || resultWidth <= 0 || resultWidth > 64)
+      return rewriter.notifyMatchFailure(op, "unsupported probed signal type");
+    if (totalWidth == 0 || totalWidth > 64)
+      return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
 
     auto module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
@@ -1939,20 +2789,7 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
     }
     Value procIdVal = buildI32Constant(rewriter, op.getLoc(), procId);
 
-    Value sigIdVal;
-    if (handle.getType() == rewriter.getI32Type()) {
-      sigIdVal = handle;
-    } else if (auto sigIntTy = dyn_cast<IntegerType>(handle.getType())) {
-      if (sigIntTy.getWidth() < 32)
-        return rewriter.notifyMatchFailure(op,
-                                           "signal handle is too narrow");
-      sigIdVal = comb::ExtractOp::create(rewriter, op.getLoc(),
-                                         rewriter.getI32Type(), handle, 0);
-    } else if (isa<llhd::SignalOp>(defOp)) {
-      sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
-    } else {
-      return rewriter.notifyMatchFailure(op, "signal handle is not an integer");
-    }
+    Value sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
 
     Value loaded =
         rewriter
@@ -1960,15 +2797,57 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
                                         rewriter.getI64Type(),
                                         ValueRange{sigIdVal, procIdVal})
             .getResult(0);
-    if (resultTy.getWidth() == 64) {
-      rewriter.replaceOp(op, loaded);
+    Value bitsVal = loaded;
+    if (resolved.dynamicOffset) {
+      Value offsetVal = resolved.dynamicOffset;
+      auto offsetTy = dyn_cast<IntegerType>(offsetVal.getType());
+      if (!offsetTy)
+        return rewriter.notifyMatchFailure(op, "unsupported dynamic extract index");
+      if (offsetTy.getWidth() < 64)
+        offsetVal = comb::createZExt(rewriter, op.getLoc(), offsetVal, 64);
+      else if (offsetTy.getWidth() > 64)
+        offsetVal = comb::ExtractOp::create(rewriter, op.getLoc(), offsetVal, 0, 64);
+
+      if (sliceOffset != 0) {
+        Value baseOff = buildI64Constant(rewriter, op.getLoc(), sliceOffset);
+        offsetVal =
+            comb::AddOp::create(rewriter, op.getLoc(), baseOff, offsetVal, true);
+      }
+      offsetVal = rewriter.createOrFold<comb::AndOp>(
+          op.getLoc(), offsetVal, buildI64Constant(rewriter, op.getLoc(), 63));
+
+      Value shifted =
+          rewriter.createOrFold<comb::ShrUOp>(op.getLoc(), loaded, offsetVal);
+      bitsVal = shifted;
+      if (resultWidth != 64) {
+        bitsVal = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                          rewriter.getIntegerType(resultWidth),
+                                          shifted, 0);
+      }
+    } else {
+      if (sliceOffset + static_cast<uint64_t>(resultWidth) > 64)
+        return rewriter.notifyMatchFailure(
+            op, "signal slice exceeds 64-bit runtime storage");
+      if (resultWidth != 64 || sliceOffset != 0) {
+        bitsVal = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                          rewriter.getIntegerType(resultWidth),
+                                          loaded, sliceOffset);
+      }
+    }
+
+    if (bitsVal.getType() == convertedTy) {
+      rewriter.replaceOp(op, bitsVal);
       return success();
     }
 
-    Value truncated = comb::ExtractOp::create(
-        rewriter, op.getLoc(), rewriter.getIntegerType(resultTy.getWidth()),
-        loaded, 0);
-    rewriter.replaceOp(op, truncated);
+    Value casted =
+        rewriter.createOrFold<hw::BitcastOp>(op.getLoc(), convertedTy, bitsVal);
+    rewriter.replaceOp(op, casted);
+
+    if (resolved.dynamicOffsetOp &&
+        llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                     [](Value v) { return v.use_empty(); }))
+      rewriter.eraseOp(resolved.dynamicOffsetOp);
     return success();
   }
 };
@@ -1980,30 +2859,42 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
   LogicalResult
   matchAndRewrite(llhd::DrvOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value handle = adaptor.getSignal();
-    while (auto castOp =
-               handle.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-      if (castOp.getInputs().size() != 1)
-        break;
-      handle = castOp.getInputs().front();
-    }
-    auto *defOp = handle.getDefiningOp();
-    auto sigIdAttr =
-        defOp ? defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)
-              : IntegerAttr();
-    if (!sigIdAttr) {
+    Value handle = stripCasts(adaptor.getSignal());
+    ResolvedRuntimeSignal resolved;
+    if (failed(resolveRuntimeSignal(handle, resolved)) || !resolved.sigIdAttr) {
       rewriter.eraseOp(op);
       return success();
     }
+    auto sigIdAttr = resolved.sigIdAttr;
 
-    auto valueTy = dyn_cast<IntegerType>(adaptor.getValue().getType());
-    if (!valueTy || valueTy.getWidth() > 64)
+    Type rawValueTy = adaptor.getValue().getType();
+    int64_t valueWidth = hw::getBitWidth(rawValueTy);
+    if (valueWidth <= 0 || valueWidth > 64)
       return rewriter.notifyMatchFailure(op, "unsupported driven value type");
+
+    auto valueTy = rewriter.getIntegerType(valueWidth);
+    Value valueInt = adaptor.getValue();
+    if (valueInt.getType() != valueTy) {
+      valueInt =
+          rewriter.createOrFold<hw::BitcastOp>(op.getLoc(), valueTy, valueInt);
+    }
+
+    uint64_t sliceOffset = resolved.baseOffset;
+    uint64_t totalWidth = resolved.totalWidth;
+    if (totalWidth == 0 || totalWidth > 64)
+      return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
+    if (!resolved.dynamicOffset &&
+        sliceOffset + static_cast<uint64_t>(valueTy.getWidth()) > totalWidth)
+      return rewriter.notifyMatchFailure(op, "signal slice exceeds runtime width");
 
     auto module = op->getParentOfType<mlir::ModuleOp>();
     if (!module)
       return rewriter.notifyMatchFailure(op, "missing module for runtime hook");
 
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_load_u64",
+        rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                                 {rewriter.getI64Type()}));
     (void)getOrInsertFunc(
         module, "__arcilator_sig_store_u64",
         rewriter.getFunctionType(
@@ -2022,29 +2913,123 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
     }
     Value procIdVal = buildI32Constant(rewriter, op.getLoc(), procId);
 
-    Value sigIdVal;
-    if (handle.getType() == rewriter.getI32Type()) {
-      sigIdVal = handle;
-    } else if (auto sigIntTy = dyn_cast<IntegerType>(handle.getType())) {
-      if (sigIntTy.getWidth() < 32)
-        return rewriter.notifyMatchFailure(op,
-                                           "signal handle is too narrow");
-      sigIdVal = comb::ExtractOp::create(rewriter, op.getLoc(),
-                                         rewriter.getI32Type(), handle, 0);
-    } else if (isa<llhd::SignalOp>(defOp)) {
-      sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
-    } else {
-      return rewriter.notifyMatchFailure(op, "signal handle is not an integer");
+    Value sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
+
+    Location loc = op.getLoc();
+    Value value64 = valueInt;
+    if (static_cast<uint64_t>(valueWidth) < 64)
+      value64 = comb::createZExt(rewriter, loc, value64, 64);
+
+    if (resolved.dynamicOffset) {
+      Value offsetVal = resolved.dynamicOffset;
+      auto offsetTy = dyn_cast<IntegerType>(offsetVal.getType());
+      if (!offsetTy)
+        return rewriter.notifyMatchFailure(op, "unsupported dynamic extract index");
+      if (offsetTy.getWidth() < 64)
+        offsetVal = comb::createZExt(rewriter, loc, offsetVal, 64);
+      else if (offsetTy.getWidth() > 64)
+        offsetVal = comb::ExtractOp::create(rewriter, loc, offsetVal, 0, 64);
+
+      if (sliceOffset != 0) {
+        Value baseOff = buildI64Constant(rewriter, loc, sliceOffset);
+        offsetVal = comb::AddOp::create(rewriter, loc, baseOff, offsetVal, true);
+      }
+      offsetVal = rewriter.createOrFold<comb::AndOp>(
+          loc, offsetVal, buildI64Constant(rewriter, loc, 63));
+
+      APInt totalMask = APInt::getAllOnes(64);
+      if (totalWidth < 64)
+        totalMask = APInt::getAllOnes(totalWidth).zext(64);
+      Value totalMaskCst = hw::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(rewriter.getI64Type(), totalMask));
+
+      APInt sliceMaskBase = APInt::getAllOnes(static_cast<unsigned>(valueWidth));
+      if (valueWidth < 64)
+        sliceMaskBase = sliceMaskBase.zext(64);
+      Value sliceMaskBaseCst = hw::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(rewriter.getI64Type(), sliceMaskBase));
+      Value sliceMask =
+          rewriter.createOrFold<comb::ShlOp>(loc, sliceMaskBaseCst, offsetVal);
+      sliceMask = rewriter.createOrFold<comb::AndOp>(loc, sliceMask, totalMaskCst);
+      Value clearMask =
+          rewriter.createOrFold<comb::XorOp>(loc, totalMaskCst, sliceMask, true);
+
+      Value cur =
+          rewriter
+              .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+                                          rewriter.getI64Type(),
+                                          ValueRange{sigIdVal, procIdVal})
+              .getResult(0);
+      Value curMasked = rewriter.createOrFold<comb::AndOp>(loc, cur, totalMaskCst);
+      Value cleared = rewriter.createOrFold<comb::AndOp>(loc, curMasked, clearMask);
+
+      Value shiftedVal = rewriter.createOrFold<comb::ShlOp>(loc, value64, offsetVal);
+      Value inserted = rewriter.createOrFold<comb::AndOp>(loc, shiftedVal, sliceMask);
+      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, inserted);
+      Value storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, totalMaskCst);
+
+      rewriter.create<mlir::func::CallOp>(loc, "__arcilator_sig_store_u64",
+                                          TypeRange{},
+                                          ValueRange{sigIdVal, storeVal, procIdVal});
+      rewriter.eraseOp(op);
+      if (resolved.dynamicOffsetOp &&
+          llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                       [](Value v) { return v.use_empty(); }))
+        rewriter.eraseOp(resolved.dynamicOffsetOp);
+      return success();
     }
 
-    Value value64 = adaptor.getValue();
-    if (valueTy.getWidth() < 64)
-      value64 = comb::createZExt(rewriter, op.getLoc(), value64, 64);
+    if (sliceOffset != 0) {
+      Value shiftAmt = buildI64Constant(rewriter, loc, sliceOffset);
+      value64 = rewriter.createOrFold<comb::ShlOp>(loc, value64, shiftAmt);
+    }
 
-    rewriter.create<mlir::func::CallOp>(op.getLoc(), "__arcilator_sig_store_u64",
+    APInt totalMask = APInt::getAllOnes(64);
+    if (totalWidth < 64)
+      totalMask = APInt::getAllOnes(totalWidth).zext(64);
+    Value totalMaskCst = hw::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(rewriter.getI64Type(), totalMask));
+
+    const bool isFullWrite =
+        (sliceOffset == 0 && static_cast<uint64_t>(valueWidth) == totalWidth);
+    Value storeVal;
+    if (isFullWrite) {
+      storeVal = rewriter.createOrFold<comb::AndOp>(loc, value64, totalMaskCst);
+    } else {
+      Value cur =
+          rewriter
+              .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+                                          rewriter.getI64Type(),
+                                          ValueRange{sigIdVal, procIdVal})
+              .getResult(0);
+
+      unsigned sliceWidth = static_cast<unsigned>(valueWidth);
+      APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(64) << sliceOffset;
+      Value sliceMaskCst = hw::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(rewriter.getI64Type(), sliceMask));
+      APInt clearMask = APInt::getAllOnes(64) ^ sliceMask;
+      Value clearMaskCst = hw::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(rewriter.getI64Type(), clearMask));
+
+      Value cleared = rewriter.createOrFold<comb::AndOp>(loc, cur, clearMaskCst);
+      Value inserted = rewriter.createOrFold<comb::AndOp>(loc, value64, sliceMaskCst);
+      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, inserted);
+      storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, totalMaskCst);
+    }
+
+    rewriter.create<mlir::func::CallOp>(loc, "__arcilator_sig_store_u64",
                                         TypeRange{},
-                                        ValueRange{sigIdVal, value64, procIdVal});
+                                        ValueRange{sigIdVal, storeVal, procIdVal});
     rewriter.eraseOp(op);
+
+    if (resolved.dynamicOffsetOp &&
+        llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                     [](Value v) { return v.use_empty(); }))
+      rewriter.eraseOp(resolved.dynamicOffsetOp);
     return success();
   }
 };
@@ -2071,6 +3056,52 @@ struct SigExtractOpConversion : public OpConversionPattern<llhd::SigExtractOp> {
       return rewriter.notifyMatchFailure(op, "expected integer element type");
 
     Value inputVal = adaptor.getInput();
+    Value inputHandle = stripCasts(inputVal);
+    if (auto *defOp = inputHandle.getDefiningOp()) {
+      if (auto sigIdAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
+        auto lowBit = getConstantLowBit(op.getLowBit());
+        if (!lowBit) {
+          // Preserve dynamic bit selects on runtime-managed signals for the
+          // probe/drive conversions, which lower them to load/shift/extract or
+          // load/modify/store sequences.
+          auto dyn = rewriter.create<mlir::UnrealizedConversionCastOp>(
+              op.getLoc(), TypeRange{outTy},
+              ValueRange{inputVal, adaptor.getLowBit()});
+          dyn->setAttr(kArcilatorSigDynExtractAttr, rewriter.getUnitAttr());
+          rewriter.replaceOp(op, dyn.getResult(0));
+          return success();
+        }
+
+        uint64_t baseOffset = 0;
+        if (auto offAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigOffsetAttr))
+          baseOffset = static_cast<uint64_t>(offAttr.getInt());
+        uint64_t totalWidth = 0;
+        if (auto widthAttr =
+                defOp->getAttrOfType<IntegerAttr>(kArcilatorSigTotalWidthAttr))
+          totalWidth = static_cast<uint64_t>(widthAttr.getInt());
+        if (totalWidth == 0)
+          totalWidth = static_cast<uint64_t>(hw::getBitWidth(inputVal.getType()));
+
+        uint64_t newOffset = baseOffset + *lowBit;
+        if (totalWidth == 0 || totalWidth > 64 ||
+            newOffset + outTy.getWidth() > totalWidth)
+          return rewriter.notifyMatchFailure(op, "extract slice exceeds runtime width");
+
+        Value handleBits = hw::ConstantOp::create(
+            rewriter, op.getLoc(),
+            rewriter.getIntegerAttr(outTy, 0));
+        if (auto *newDef = handleBits.getDefiningOp()) {
+          newDef->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+          newDef->setAttr(kArcilatorSigOffsetAttr,
+                          rewriter.getI32IntegerAttr(newOffset));
+          newDef->setAttr(kArcilatorSigTotalWidthAttr,
+                          rewriter.getI32IntegerAttr(totalWidth));
+        }
+        rewriter.replaceOp(op, handleBits);
+        return success();
+      }
+    }
+
     auto inTy = dyn_cast<IntegerType>(inputVal.getType());
     if (!inTy)
       return rewriter.notifyMatchFailure(op, "expected integer input type");
@@ -2120,6 +3151,57 @@ struct SigStructExtractOpConversion
     if (!isa<hw::StructType>(adaptor.getInput().getType()))
       return rewriter.notifyMatchFailure(
           op, "expected struct input after conversion");
+    Value inputHandle = stripCasts(adaptor.getInput());
+    if (auto *defOp = inputHandle.getDefiningOp()) {
+      if (auto sigIdAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
+        uint64_t baseOffset = 0;
+        if (auto offAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigOffsetAttr))
+          baseOffset = static_cast<uint64_t>(offAttr.getInt());
+        uint64_t totalWidth = 0;
+        if (auto widthAttr =
+                defOp->getAttrOfType<IntegerAttr>(kArcilatorSigTotalWidthAttr))
+          totalWidth = static_cast<uint64_t>(widthAttr.getInt());
+        if (totalWidth == 0)
+          totalWidth =
+              static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
+        if (totalWidth == 0 || totalWidth > 64)
+          return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
+
+        auto structTy = type_cast<hw::StructType>(adaptor.getInput().getType());
+        auto fieldIndexOpt = structTy.getFieldIndex(op.getFieldAttr());
+        if (!fieldIndexOpt)
+          return rewriter.notifyMatchFailure(op, "unknown struct field");
+        uint64_t fieldOffset = 0;
+        auto elements = structTy.getElements();
+        for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
+          int64_t w = hw::getBitWidth(elements[i].type);
+          if (w <= 0)
+            return rewriter.notifyMatchFailure(op, "unsupported struct field width");
+          fieldOffset += static_cast<uint64_t>(w);
+        }
+        Type fieldTy = elements[*fieldIndexOpt].type;
+        int64_t fieldWidth = hw::getBitWidth(fieldTy);
+        if (fieldWidth <= 0)
+          return rewriter.notifyMatchFailure(op, "unsupported extracted field type");
+        uint64_t newOffset = baseOffset + fieldOffset;
+        if (newOffset + static_cast<uint64_t>(fieldWidth) > totalWidth)
+          return rewriter.notifyMatchFailure(op, "struct field slice exceeds runtime width");
+
+        Value handleToken = createZeroHWConstant(rewriter, op.getLoc(), fieldTy);
+        if (!handleToken)
+          return rewriter.notifyMatchFailure(op, "failed to materialize handle token");
+        if (auto *newDef = handleToken.getDefiningOp()) {
+          newDef->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+          newDef->setAttr(kArcilatorSigOffsetAttr,
+                          rewriter.getI32IntegerAttr(newOffset));
+          newDef->setAttr(kArcilatorSigTotalWidthAttr,
+                          rewriter.getI32IntegerAttr(totalWidth));
+        }
+        rewriter.replaceOp(op, handleToken);
+        return success();
+      }
+    }
+
     rewriter.replaceOpWithNewOp<hw::StructExtractOp>(op, adaptor.getInput(),
                                                      op.getFieldAttr());
     return success();
@@ -2137,6 +3219,53 @@ struct SigArrayGetOpConversion
     if (!isa<hw::ArrayType>(adaptor.getInput().getType()))
       return rewriter.notifyMatchFailure(
           op, "expected array input after conversion");
+    Value inputHandle = stripCasts(adaptor.getInput());
+    if (auto *defOp = inputHandle.getDefiningOp()) {
+      if (auto sigIdAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
+        auto indexOpt = getConstantLowBit(op.getIndex());
+        if (!indexOpt)
+          return rewriter.notifyMatchFailure(op, "non-constant array index on runtime signal");
+
+        uint64_t baseOffset = 0;
+        if (auto offAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigOffsetAttr))
+          baseOffset = static_cast<uint64_t>(offAttr.getInt());
+        uint64_t totalWidth = 0;
+        if (auto widthAttr =
+                defOp->getAttrOfType<IntegerAttr>(kArcilatorSigTotalWidthAttr))
+          totalWidth = static_cast<uint64_t>(widthAttr.getInt());
+        if (totalWidth == 0)
+          totalWidth =
+              static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
+        if (totalWidth == 0 || totalWidth > 64)
+          return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
+
+        auto arrayTy = type_cast<hw::ArrayType>(adaptor.getInput().getType());
+        Type elementTy = arrayTy.getElementType();
+        int64_t elemWidth = hw::getBitWidth(elementTy);
+        if (elemWidth <= 0)
+          return rewriter.notifyMatchFailure(op, "unsupported array element width");
+        uint64_t idx = *indexOpt;
+        if (idx >= arrayTy.getNumElements())
+          return rewriter.notifyMatchFailure(op, "array index out of bounds");
+        uint64_t newOffset = baseOffset + idx * static_cast<uint64_t>(elemWidth);
+        if (newOffset + static_cast<uint64_t>(elemWidth) > totalWidth)
+          return rewriter.notifyMatchFailure(op, "array element slice exceeds runtime width");
+
+        Value handleToken = createZeroHWConstant(rewriter, op.getLoc(), elementTy);
+        if (!handleToken)
+          return rewriter.notifyMatchFailure(op, "failed to materialize handle token");
+        if (auto *newDef = handleToken.getDefiningOp()) {
+          newDef->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+          newDef->setAttr(kArcilatorSigOffsetAttr,
+                          rewriter.getI32IntegerAttr(newOffset));
+          newDef->setAttr(kArcilatorSigTotalWidthAttr,
+                          rewriter.getI32IntegerAttr(totalWidth));
+        }
+        rewriter.replaceOp(op, handleToken);
+        return success();
+      }
+    }
+
     rewriter.replaceOpWithNewOp<hw::ArrayGetOp>(op, adaptor.getInput(),
                                                 adaptor.getIndex());
     return success();
@@ -2153,6 +3282,57 @@ struct StructFieldInOutOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     if (!isa<hw::StructType>(adaptor.getInput().getType()))
       return rewriter.notifyMatchFailure(op, "expected struct input after conversion");
+    Value inputHandle = stripCasts(adaptor.getInput());
+    if (auto *defOp = inputHandle.getDefiningOp()) {
+      if (auto sigIdAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
+        uint64_t baseOffset = 0;
+        if (auto offAttr = defOp->getAttrOfType<IntegerAttr>(kArcilatorSigOffsetAttr))
+          baseOffset = static_cast<uint64_t>(offAttr.getInt());
+        uint64_t totalWidth = 0;
+        if (auto widthAttr =
+                defOp->getAttrOfType<IntegerAttr>(kArcilatorSigTotalWidthAttr))
+          totalWidth = static_cast<uint64_t>(widthAttr.getInt());
+        if (totalWidth == 0)
+          totalWidth =
+              static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
+        if (totalWidth == 0 || totalWidth > 64)
+          return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
+
+        auto structTy = type_cast<hw::StructType>(adaptor.getInput().getType());
+        auto fieldIndexOpt = structTy.getFieldIndex(op.getFieldAttr());
+        if (!fieldIndexOpt)
+          return rewriter.notifyMatchFailure(op, "unknown struct field");
+        uint64_t fieldOffset = 0;
+        auto elements = structTy.getElements();
+        for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
+          int64_t w = hw::getBitWidth(elements[i].type);
+          if (w <= 0)
+            return rewriter.notifyMatchFailure(op, "unsupported struct field width");
+          fieldOffset += static_cast<uint64_t>(w);
+        }
+        Type fieldTy = elements[*fieldIndexOpt].type;
+        int64_t fieldWidth = hw::getBitWidth(fieldTy);
+        if (fieldWidth <= 0)
+          return rewriter.notifyMatchFailure(op, "unsupported extracted field type");
+        uint64_t newOffset = baseOffset + fieldOffset;
+        if (newOffset + static_cast<uint64_t>(fieldWidth) > totalWidth)
+          return rewriter.notifyMatchFailure(op, "struct field slice exceeds runtime width");
+
+        Value handleToken = createZeroHWConstant(rewriter, op.getLoc(), fieldTy);
+        if (!handleToken)
+          return rewriter.notifyMatchFailure(op, "failed to materialize handle token");
+        if (auto *newDef = handleToken.getDefiningOp()) {
+          newDef->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+          newDef->setAttr(kArcilatorSigOffsetAttr,
+                          rewriter.getI32IntegerAttr(newOffset));
+          newDef->setAttr(kArcilatorSigTotalWidthAttr,
+                          rewriter.getI32IntegerAttr(totalWidth));
+        }
+        rewriter.replaceOp(op, handleToken);
+        return success();
+      }
+    }
+
     rewriter.replaceOpWithNewOp<hw::StructExtractOp>(op, adaptor.getInput(),
                                                      op.getFieldAttr());
     return success();
@@ -2439,14 +3619,21 @@ void ConvertToArcsPass::runOnOperation() {
       auto procIdAttr = proc->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr);
       uint32_t procId =
           procIdAttr ? static_cast<uint32_t>(procIdAttr.getInt()) : 0;
-      auto cloneIntoBody = [](Operation *inner) {
-        // Clone constants and LLHD signal/probe declarations into the body so
-        // scheduled-process pre-lowering does not capture `!hw.inout` values as
-        // `arc.execute` operands (those would require unresolved
-        // materializations during type conversion).
-        return inner->hasTrait<OpTrait::ConstantLike>() ||
-               isa<llhd::SignalOp, llhd::PrbOp>(inner);
-      };
+	      auto cloneIntoBody = [](Operation *inner) {
+		        // Clone constants and LLHD signal/probe declarations into the body so
+		        // scheduled-process pre-lowering does not capture `!hw.inout` values as
+		        // `arc.execute` operands (those would require unresolved
+		        // materializations during type conversion).
+		        if (inner->hasTrait<OpTrait::ConstantLike>())
+		          return true;
+		        if (inner->hasAttr(kArcilatorSigIdAttr) ||
+		            inner->hasAttr(kArcilatorSigOffsetAttr) ||
+		            inner->hasAttr(kArcilatorSigTotalWidthAttr))
+		          return true;
+		        return isa<llhd::SignalOp, llhd::PrbOp, llhd::SigExtractOp,
+		                   llhd::SigStructExtractOp, llhd::SigArrayGetOp,
+		                   llhd::SigArraySliceOp, sv::StructFieldInOutOp>(inner);
+		      };
       schedulerRewriter.setInsertionPoint(proc);
       auto operands = mlir::makeRegionIsolatedFromAbove(
           schedulerRewriter, proc.getBody(), cloneIntoBody);
@@ -2635,6 +3822,51 @@ void ConvertToArcsPass::runOnOperation() {
   });
   for (Operation *op : toEraseGeneric)
     op->erase();
+
+  // Lower boolean conversions from 4-state `{value, unknown}` structs. These
+  // commonly arise from `moore.to_builtin_bool` and must be resolved before
+  // lowering to LLVM.
+  SmallVector<mlir::UnrealizedConversionCastOp> boolCastsToErase;
+  getOperation().walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
+      return;
+    Value input = cast.getInputs().front();
+    auto structTy = dyn_cast<hw::StructType>(input.getType());
+    if (!structTy)
+      return;
+    auto outTy = dyn_cast<IntegerType>(cast.getResult(0).getType());
+    if (!outTy || outTy.getWidth() != 1)
+      return;
+    auto valueFieldTy = dyn_cast_or_null<IntegerType>(structTy.getFieldType("value"));
+    auto unknownFieldTy =
+        dyn_cast_or_null<IntegerType>(structTy.getFieldType("unknown"));
+    if (!valueFieldTy || !unknownFieldTy ||
+        valueFieldTy.getWidth() != unknownFieldTy.getWidth())
+      return;
+
+    OpBuilder b(cast);
+    Location loc = cast.getLoc();
+    Value valueBits = b.createOrFold<hw::StructExtractOp>(
+        loc, input, b.getStringAttr("value"));
+    Value unknownBits = b.createOrFold<hw::StructExtractOp>(
+        loc, input, b.getStringAttr("unknown"));
+
+    Value zeroValue = hw::ConstantOp::create(b, loc, valueFieldTy, 0);
+    Value zeroUnknown = hw::ConstantOp::create(b, loc, unknownFieldTy, 0);
+    Value valueNeZero =
+        comb::ICmpOp::create(b, loc, comb::ICmpPredicate::ne, valueBits,
+                             zeroValue, /*twoState=*/true);
+    Value unknownEqZero =
+        comb::ICmpOp::create(b, loc, comb::ICmpPredicate::eq, unknownBits,
+                             zeroUnknown, /*twoState=*/true);
+    Value boolVal =
+        comb::AndOp::create(b, loc, valueNeZero, unknownEqZero, true);
+
+    cast.getResult(0).replaceAllUsesWith(boolVal);
+    boolCastsToErase.push_back(cast);
+  });
+  for (auto cast : boolCastsToErase)
+    cast.erase();
 
   // Outline operations into arcs.
   Converter outliner;

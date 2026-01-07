@@ -113,6 +113,8 @@ LogicalResult ProceduralizeSimPass::proceduralizePrintOps(
         auto fmtVal = getFormattedValue(fmtOp);
         assert(!!fmtVal && "Unexpected foramtting fragment op.");
         arguments.insert(fmtVal);
+        if (auto fvInt = llvm::dyn_cast<FormatFVIntOp>(fmtOp))
+          arguments.insert(fvInt.getUnknown());
       }
     }
   }

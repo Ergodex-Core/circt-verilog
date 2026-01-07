@@ -13,6 +13,7 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Moore/MooreTypes.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
@@ -742,12 +743,13 @@ void LowerArcToLLVMPass::runOnOperation() {
   LLVMConversionTarget target(getContext());
   target.addLegalOp<mlir::ModuleOp>();
   target.addLegalOp<scf::YieldOp>(); // quirk of SCF dialect conversion
-	  // Keep Sim formatting/printing ops around until `sim-lower-console` runs.
-	  target.addLegalOp<sim::FormatLitOp, sim::FormatDecOp, sim::FormatHexOp,
-	                    sim::FormatBinOp, sim::FormatRealOp, sim::FormatCharOp,
-	                    sim::FormatStrOp,
-	                    sim::FormatStringConcatOp, sim::PrintFormattedProcOp,
-	                    sim::TerminateOp>();
+  // Keep Sim formatting/printing ops around until `sim-lower-console` runs.
+  target.addLegalOp<sim::FormatLitOp, sim::FormatDecOp, sim::FormatHexOp,
+                    sim::FormatBinOp, sim::FormatRealOp, sim::FormatCharOp,
+                    sim::FormatIntOp, sim::FormatFVIntOp, sim::FormatTimeOp,
+                    sim::FormatStrOp, sim::FormatToStringOp,
+                    sim::FormatStringConcatOp, sim::PrintFormattedProcOp,
+                    sim::TimeFormatProcOp, sim::TerminateOp>();
 
   // Setup the arc dialect type conversion.
   LLVMTypeConverter converter(&getContext());
@@ -768,6 +770,9 @@ void LowerArcToLLVMPass::runOnOperation() {
   });
   converter.addConversion([&](hw::StringType type) {
     return LLVM::LLVMPointerType::get(type.getContext());
+  });
+  converter.addConversion([&](moore::IntType type) {
+    return IntegerType::get(type.getContext(), type.getWidth());
   });
 
   // Setup the conversion patterns.

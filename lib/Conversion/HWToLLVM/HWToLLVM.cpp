@@ -20,6 +20,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <functional>
 
 namespace circt {
 #define GEN_PASS_DEF_CONVERTHWTOLLVM
@@ -369,22 +370,208 @@ struct BitcastOpConversion : public ConvertOpToLLVMPattern<hw::BitcastOp> {
   LogicalResult
   matchAndRewrite(hw::BitcastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Type srcTy = hw::getCanonicalType(op.getInput().getType());
+    Type dstTy = hw::getCanonicalType(op.getResult().getType());
+    Type resultTy = typeConverter->convertType(dstTy);
 
-    Type resultTy = typeConverter->convertType(op.getResult().getType());
+    // Trivial case: already the desired LLVM type.
+    if (adaptor.getInput().getType() == resultTy) {
+      rewriter.replaceOp(op, adaptor.getInput());
+      return success();
+    }
 
-    auto oneC = rewriter.createOrFold<LLVM::ConstantOp>(
-        op->getLoc(), rewriter.getI32Type(), rewriter.getI32IntegerAttr(1));
+    int64_t srcWidth = hw::getBitWidth(srcTy);
+    int64_t dstWidth = hw::getBitWidth(dstTy);
+    if (srcWidth < 0 || dstWidth < 0 || srcWidth != dstWidth)
+      return rewriter.notifyMatchFailure(op, "unsupported bitcast types");
+    if (srcWidth == 0) {
+      rewriter.replaceOpWithNewOp<LLVM::UndefOp>(op, resultTy);
+      return success();
+    }
 
-    auto ptr = LLVM::AllocaOp::create(
-        rewriter, op->getLoc(),
-        LLVM::LLVMPointerType::get(rewriter.getContext()),
-        adaptor.getInput().getType(), oneC,
-        /*alignment=*/4);
+    auto wideIntTy =
+        IntegerType::get(rewriter.getContext(), static_cast<unsigned>(srcWidth));
 
-    LLVM::StoreOp::create(rewriter, op->getLoc(), adaptor.getInput(), ptr);
+    auto makeConst = [&](Type ty, uint64_t value) -> Value {
+      auto intTy = cast<IntegerType>(ty);
+      return LLVM::ConstantOp::create(
+          rewriter, loc, ty,
+          rewriter.getIntegerAttr(ty, APInt(intTy.getWidth(), value)));
+    };
 
-    rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, resultTy, ptr);
+    auto zextOrTrunc = [&](Value v, Type ty) -> Value {
+      if (v.getType() == ty)
+        return v;
+      auto srcIntTy = dyn_cast<IntegerType>(v.getType());
+      auto dstIntTy = dyn_cast<IntegerType>(ty);
+      if (!srcIntTy || !dstIntTy)
+        return {};
+      if (srcIntTy.getWidth() < dstIntTy.getWidth())
+        return LLVM::ZExtOp::create(rewriter, loc, ty, v);
+      return LLVM::TruncOp::create(rewriter, loc, ty, v);
+    };
 
+    std::function<Value(Value, Type)> flatten;
+    flatten = [&](Value v, Type hwTy) -> Value {
+      hwTy = hw::getCanonicalType(hwTy);
+      if (auto intTy = dyn_cast<IntegerType>(hwTy)) {
+        if (intTy == v.getType())
+          return v;
+        return zextOrTrunc(v, intTy);
+      }
+
+      if (auto arrTy = dyn_cast<hw::ArrayType>(hwTy)) {
+        int64_t width = hw::getBitWidth(arrTy);
+        if (width <= 0)
+          return makeConst(wideIntTy, 0);
+        auto outTy = IntegerType::get(rewriter.getContext(),
+                                      static_cast<unsigned>(width));
+        Value acc = makeConst(outTy, 0);
+        int64_t offset = 0;
+        int64_t elemWidth = hw::getBitWidth(arrTy.getElementType());
+        if (elemWidth < 0)
+          return {};
+        for (int64_t i = static_cast<int64_t>(arrTy.getNumElements()) - 1;
+             i >= 0; --i) {
+          uint32_t llvmIndex = HWToLLVMEndianessConverter::convertToLLVMEndianess(
+              hwTy, static_cast<uint32_t>(i));
+          Value elem = LLVM::ExtractValueOp::create(rewriter, loc, v, llvmIndex);
+          Value elemBits = flatten(elem, arrTy.getElementType());
+          if (!elemBits)
+            return {};
+          elemBits = zextOrTrunc(elemBits, outTy);
+          if (offset != 0) {
+            Value shamt = makeConst(outTy, static_cast<uint64_t>(offset));
+            elemBits = LLVM::ShlOp::create(rewriter, loc, outTy, elemBits, shamt);
+          }
+          acc = LLVM::OrOp::create(rewriter, loc, outTy, acc, elemBits);
+          offset += elemWidth;
+        }
+        return acc;
+      }
+
+      if (auto structTy = dyn_cast<hw::StructType>(hwTy)) {
+        int64_t width = hw::getBitWidth(structTy);
+        if (width <= 0)
+          return makeConst(wideIntTy, 0);
+        auto outTy = IntegerType::get(rewriter.getContext(),
+                                      static_cast<unsigned>(width));
+        Value acc = makeConst(outTy, 0);
+        int64_t offset = 0;
+        auto fields = structTy.getElements();
+        for (int64_t i = static_cast<int64_t>(fields.size()) - 1; i >= 0; --i) {
+          Type fieldTy = fields[static_cast<size_t>(i)].type;
+          int64_t fieldWidth = hw::getBitWidth(fieldTy);
+          if (fieldWidth < 0)
+            return {};
+          uint32_t llvmIndex = HWToLLVMEndianessConverter::convertToLLVMEndianess(
+              hwTy, static_cast<uint32_t>(i));
+          Value field = LLVM::ExtractValueOp::create(rewriter, loc, v, llvmIndex);
+          Value fieldBits = flatten(field, fieldTy);
+          if (!fieldBits)
+            return {};
+          fieldBits = zextOrTrunc(fieldBits, outTy);
+          if (offset != 0) {
+            Value shamt = makeConst(outTy, static_cast<uint64_t>(offset));
+            fieldBits =
+                LLVM::ShlOp::create(rewriter, loc, outTy, fieldBits, shamt);
+          }
+          acc = LLVM::OrOp::create(rewriter, loc, outTy, acc, fieldBits);
+          offset += fieldWidth;
+        }
+        return acc;
+      }
+
+      return {};
+    };
+
+    std::function<Value(Value, Type)> unflatten;
+    unflatten = [&](Value bits, Type hwTy) -> Value {
+      hwTy = hw::getCanonicalType(hwTy);
+      if (auto intTy = dyn_cast<IntegerType>(hwTy))
+        return zextOrTrunc(bits, intTy);
+
+      if (auto arrTy = dyn_cast<hw::ArrayType>(hwTy)) {
+        Type llvmArrTy = typeConverter->convertType(hwTy);
+        if (!llvmArrTy)
+          return {};
+        Value arr = LLVM::UndefOp::create(rewriter, loc, llvmArrTy);
+        int64_t offset = 0;
+        int64_t elemWidth = hw::getBitWidth(arrTy.getElementType());
+        if (elemWidth < 0)
+          return {};
+        for (int64_t i = static_cast<int64_t>(arrTy.getNumElements()) - 1;
+             i >= 0; --i) {
+          Value cur = bits;
+          if (offset != 0) {
+            Value shamt = makeConst(bits.getType(), static_cast<uint64_t>(offset));
+            cur = LLVM::LShrOp::create(rewriter, loc, bits.getType(), cur, shamt);
+          }
+          Value elemBits = LLVM::TruncOp::create(
+              rewriter, loc,
+              IntegerType::get(rewriter.getContext(),
+                               static_cast<unsigned>(elemWidth)),
+              cur);
+          Value elemVal = unflatten(elemBits, arrTy.getElementType());
+          if (!elemVal)
+            return {};
+          uint32_t llvmIndex = HWToLLVMEndianessConverter::convertToLLVMEndianess(
+              hwTy, static_cast<uint32_t>(i));
+          arr = LLVM::InsertValueOp::create(rewriter, loc, arr, elemVal, llvmIndex);
+          offset += elemWidth;
+        }
+        return arr;
+      }
+
+      if (auto structTy = dyn_cast<hw::StructType>(hwTy)) {
+        Type llvmStructTy = typeConverter->convertType(hwTy);
+        if (!llvmStructTy)
+          return {};
+        Value st = LLVM::UndefOp::create(rewriter, loc, llvmStructTy);
+        int64_t offset = 0;
+        auto fields = structTy.getElements();
+        for (int64_t i = static_cast<int64_t>(fields.size()) - 1; i >= 0; --i) {
+          Type fieldTy = fields[static_cast<size_t>(i)].type;
+          int64_t fieldWidth = hw::getBitWidth(fieldTy);
+          if (fieldWidth < 0)
+            return {};
+          Value cur = bits;
+          if (offset != 0) {
+            Value shamt = makeConst(bits.getType(), static_cast<uint64_t>(offset));
+            cur = LLVM::LShrOp::create(rewriter, loc, bits.getType(), cur, shamt);
+          }
+          Value fieldBits = LLVM::TruncOp::create(
+              rewriter, loc,
+              IntegerType::get(rewriter.getContext(),
+                               static_cast<unsigned>(fieldWidth)),
+              cur);
+          Value fieldVal = unflatten(fieldBits, fieldTy);
+          if (!fieldVal)
+            return {};
+          uint32_t llvmIndex = HWToLLVMEndianessConverter::convertToLLVMEndianess(
+              hwTy, static_cast<uint32_t>(i));
+          st = LLVM::InsertValueOp::create(rewriter, loc, st, fieldVal, llvmIndex);
+          offset += fieldWidth;
+        }
+        return st;
+      }
+
+      return {};
+    };
+
+    Value srcBits = flatten(adaptor.getInput(), srcTy);
+    if (!srcBits)
+      return rewriter.notifyMatchFailure(op, "failed to flatten bitcast input");
+    srcBits = zextOrTrunc(srcBits, wideIntTy);
+    Value res = unflatten(srcBits, dstTy);
+    if (!res)
+      return rewriter.notifyMatchFailure(op,
+                                         "failed to unflatten bitcast output");
+    if (res.getType() != resultTy)
+      return rewriter.notifyMatchFailure(op, "bitcast result type mismatch");
+
+    rewriter.replaceOp(op, res);
     return success();
   }
 };

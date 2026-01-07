@@ -80,6 +80,7 @@ public:
   ValueChangeDump<{{ model.name }}Layout> vcd(std::basic_ostream<char> &os) {
     ValueChangeDump<{{ model.name }}Layout> vcd(os, storage.data());
     vcd.writeHeader();
+    os << "#0\\n";
     vcd.writeDumpvars();
     return vcd;
   }
@@ -118,13 +119,27 @@ class StateInfo:
   name: Optional[str]
   offset: int
   numBits: int
+  storageBytes: int
+  valueOffset: int
+  unknownOffset: int
   typ: StateType
   stride: Optional[int]
   depth: Optional[int]
 
   def decode(d: dict) -> "StateInfo":
-    return StateInfo(d["name"], d["offset"], d["numBits"], StateType(d["type"]),
-                     d.get("stride"), d.get("depth"))
+    num_bits = int(d.get("numBits", 0))
+    storage_bytes = int(d.get("storageBytes", (num_bits + 7) // 8))
+    return StateInfo(
+        d.get("name"),
+        int(d.get("offset", 0)),
+        num_bits,
+        storage_bytes,
+        int(d.get("valueOffset", 0)),
+        int(d.get("unknownOffset", 0)),
+        StateType(d["type"]),
+        d.get("stride"),
+        d.get("depth"),
+    )
 
 
 @dataclass
@@ -195,7 +210,12 @@ def group_state_by_hierarchy(
 # Process each model separately.
 def format_signal(state: StateInfo) -> str:
   fields = [
-      f"\"{state.name}\"", state.offset, state.numBits,
+      f"\"{state.name}\"",
+      state.offset,
+      state.numBits,
+      state.storageBytes,
+      state.valueOffset,
+      state.unknownOffset,
       f"Signal::{state.typ.value.capitalize()}"
   ]
   if state.typ == StateType.MEMORY:
@@ -268,7 +288,10 @@ def format_view_hierarchy(hierarchy: StateHierarchy, depth: int) -> str:
 
 
 def state_cpp_ref(state: StateInfo) -> str:
-  return f"*({state_cpp_type(state)}*)(state+{state.offset})"
+  off = state.offset
+  if state.valueOffset != state.unknownOffset:
+    off += state.valueOffset
+  return f"*({state_cpp_type(state)}*)(state+{off})"
 
 
 def format_view_constructor(hierarchy: StateHierarchy, depth: int) -> str:

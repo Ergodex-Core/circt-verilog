@@ -51,6 +51,14 @@ void EarlyCodeMotionPass::runOnOperation() {
 }
 
 void EarlyCodeMotionPass::runOnProcess(llhd::ProcessOp proc) {
+  // This pass is designed around temporally-structured processes (i.e. those
+  // that suspend via `llhd.wait`). For single-shot processes without waits,
+  // hoisting probes and their dependent computations can interfere with later
+  // best-effort signal-to-SSA lowering (used by the arcilator Arc pipeline) and
+  // change the semantics of source-level blocking assignments.
+  if (proc.getOps<llhd::WaitOp>().empty())
+    return;
+
   llhd::TemporalRegionAnalysis trAnalysis = llhd::TemporalRegionAnalysis(proc);
   mlir::DominanceInfo dom(proc);
 

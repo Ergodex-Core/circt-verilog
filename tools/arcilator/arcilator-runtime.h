@@ -1,5 +1,6 @@
 // NOLINTBEGIN
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,9 @@ struct Signal {
   const char *name;
   unsigned offset;
   unsigned numBits;
+  unsigned storageBytes;
+  unsigned valueOffset;
+  unsigned unknownOffset;
   enum Type { Input, Output, Register, Memory, Wire } type;
   // for memories:
   unsigned stride;
@@ -49,6 +53,24 @@ public:
       : os(os), state(state) {}
 
   void writeHeader(bool withHierarchy = true) {
+    // Optional VCD scope reduction: limit hierarchy traversal depth.
+    // Depth is counted in hierarchy scopes under the top module scope:
+    //   0 => no hierarchy scopes (only ModelLayout::io)
+    //   1 => only the hierarchy root
+    //   2 => root + direct children (useful for "top + ports" sampling)
+    //   <0 or unset => unlimited (default)
+    auto getEnvInt = [](const char *key, int defaultValue) -> int {
+      const char *raw = std::getenv(key);
+      if (!raw || !*raw)
+        return defaultValue;
+      char *end = nullptr;
+      long val = std::strtol(raw, &end, 10);
+      if (end == raw)
+        return defaultValue;
+      return static_cast<int>(val);
+    };
+    const int maxDepth = getEnvInt("ARCILATOR_VCD_MAX_DEPTH", -1);
+
     os << "$date\n    October 21, 2015\n$end\n";
     os << "$version\n    Some cryptic MLIR magic\n$end\n";
     os << "$timescale 1ns $end\n";
@@ -57,8 +79,7 @@ public:
 
     auto writeSignal = [&](const Signal &state) {
       if (state.type != Signal::Memory) {
-        auto &signal =
-            allocSignal(state, state.offset, (state.numBits + 7) / 8);
+        auto &signal = allocSignal(state, state.offset, state.storageBytes);
         if (state.type == Signal::Register) {
           os << "$var reg " << state.numBits << " " << signal.abbrev << " "
              << state.name;
@@ -72,7 +93,7 @@ public:
       } else {
         for (unsigned i = 0; i < state.depth; ++i) {
           auto &signal = allocSignal(state, state.offset + i * state.stride,
-                                     (state.numBits + 7) / 8);
+                                     state.storageBytes);
           os << "$var reg " << state.numBits << " " << signal.abbrev << " "
              << state.name << "[" << i << "]";
           if (state.numBits > 1)
@@ -82,20 +103,22 @@ public:
       }
     };
 
-    std::function<void(const Hierarchy &)> writeHierarchy =
-        [&](const Hierarchy &hierarchy) {
+    std::function<void(const Hierarchy &, unsigned)> writeHierarchy =
+        [&](const Hierarchy &hierarchy, unsigned depth) {
           os << "$scope module " << hierarchy.name << " $end\n";
           for (unsigned i = 0; i < hierarchy.numStates; ++i)
             writeSignal(hierarchy.states[i]);
-          for (unsigned i = 0; i < hierarchy.numChildren; ++i)
-            writeHierarchy(hierarchy.children[i]);
+          if (maxDepth < 0 || depth < static_cast<unsigned>(maxDepth)) {
+            for (unsigned i = 0; i < hierarchy.numChildren; ++i)
+              writeHierarchy(hierarchy.children[i], depth + 1);
+          }
           os << "$upscope $end\n";
         };
 
     for (auto &port : ModelLayout::io)
       writeSignal(port);
-    if (withHierarchy)
-      writeHierarchy(ModelLayout::hierarchy);
+    if (withHierarchy && maxDepth != 0)
+      writeHierarchy(ModelLayout::hierarchy, 1);
 
     os << "$upscope $end\n";
     os << "$enddefinitions $end\n";
@@ -105,16 +128,37 @@ public:
     for (auto &signal : signals) {
       const uint8_t *valNew = state + signal.offset;
       uint8_t *valOld = &previousValues[0] + signal.previousOffset;
-      size_t numBytes = (signal.state.numBits + 7) / 8;
+      size_t numBytes = signal.state.storageBytes;
       bool unchanged = std::equal(valNew, valNew + numBytes, valOld);
       if (unchanged && !includeUnchanged)
         continue;
-      if (signal.state.numBits > 1)
-        os << 'b';
-      for (unsigned n = signal.state.numBits; n > 0; --n)
-        os << (valNew[(n - 1) / 8] & (1 << ((n - 1) % 8)) ? '1' : '0');
-      if (signal.state.numBits > 1)
-        os << ' ';
+
+      bool isFourState = signal.state.valueOffset != signal.state.unknownOffset;
+      if (!isFourState) {
+        if (signal.state.numBits > 1)
+          os << 'b';
+        for (unsigned n = signal.state.numBits; n > 0; --n)
+          os << (valNew[(n - 1) / 8] & (1 << ((n - 1) % 8)) ? '1' : '0');
+        if (signal.state.numBits > 1)
+          os << ' ';
+      } else {
+        const uint8_t *unknown = valNew + signal.state.unknownOffset;
+        const uint8_t *value = valNew + signal.state.valueOffset;
+        if (signal.state.numBits > 1)
+          os << 'b';
+        for (unsigned n = signal.state.numBits; n > 0; --n) {
+          const unsigned idx = (n - 1) / 8;
+          const uint8_t mask = 1u << ((n - 1) % 8);
+          const bool isX = (unknown[idx] & mask) != 0;
+          if (isX) {
+            os << 'x';
+            continue;
+          }
+          os << ((value[idx] & mask) != 0 ? '1' : '0');
+        }
+        if (signal.state.numBits > 1)
+          os << ' ';
+      }
       os << signal.abbrev << "\n";
       std::copy(valNew, valNew + numBytes, valOld);
     }
@@ -123,6 +167,7 @@ public:
   void writeDumpvars() {
     os << "$dumpvars\n";
     writeValues(true);
+    os << "$end\n";
   }
 
   void writeTimestep(size_t timeIncrement) {
@@ -218,6 +263,974 @@ extern "C" const char *circt_sv_string_substr(const char *str, int32_t start,
     return "";
   std::memcpy(out, str + startPos, outLen);
   out[outLen] = '\0';
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// `$display` / format-string helpers
+//===----------------------------------------------------------------------===//
+
+static inline uint8_t circt_sv_get_bit_le(const uint8_t *bytes,
+                                          uint32_t bitIndex) {
+  return (bytes[bitIndex / 8] >> (bitIndex % 8)) & 1u;
+}
+
+static inline uint32_t circt_sv_get_bits_le_masked(const uint8_t *bytes,
+                                                   uint32_t bitWidth,
+                                                   uint32_t bitIndex,
+                                                   uint32_t bitCount) {
+  uint32_t out = 0;
+  for (uint32_t i = 0; i < bitCount; ++i) {
+    uint32_t b = bitIndex + i;
+    if (b >= bitWidth)
+      break;
+    out |= static_cast<uint32_t>(circt_sv_get_bit_le(bytes, b)) << i;
+  }
+  return out;
+}
+
+static inline uint64_t circt_sv_pow10_u64(uint32_t exp) {
+  static constexpr uint64_t kPow10[] = {
+      1ull,
+      10ull,
+      100ull,
+      1000ull,
+      10000ull,
+      100000ull,
+      1000000ull,
+      10000000ull,
+      100000000ull,
+      1000000000ull,
+      10000000000ull,
+      100000000000ull,
+      1000000000000ull,
+      10000000000000ull,
+      100000000000000ull,
+      1000000000000000ull,
+      10000000000000000ull,
+      100000000000000000ull,
+      1000000000000000000ull,
+  };
+  if (exp >= (sizeof(kPow10) / sizeof(kPow10[0])))
+    return 0;
+  return kPow10[exp];
+}
+
+extern "C" void circt_sv_print_int(const void *data, int32_t bitWidth,
+                                   int32_t base, int32_t minWidth,
+                                   int32_t flags) {
+  // Flags are backend-defined; keep in sync with LowerSimConsole.
+  constexpr int32_t kUppercase = 1 << 0;
+  constexpr int32_t kLeftJustify = 1 << 1;
+  constexpr int32_t kPadZero = 1 << 2;
+  constexpr int32_t kSigned = 1 << 3;
+
+  if (bitWidth < 0)
+    bitWidth = 0;
+  if (minWidth < 0)
+    minWidth = 0;
+
+  const bool uppercase = (flags & kUppercase) != 0;
+  const bool leftJustify = (flags & kLeftJustify) != 0;
+  const bool padZero = (flags & kPadZero) != 0;
+  const bool isSigned = (flags & kSigned) != 0;
+
+  char padChar = padZero ? '0' : ' ';
+
+  // Handle zero-width integers.
+  if (bitWidth == 0) {
+    if (base == 10)
+      std::fputc('0', stdout);
+    return;
+  }
+
+  uint32_t bw = static_cast<uint32_t>(bitWidth);
+  auto numBytes = static_cast<uint32_t>((bw + 7u) / 8u);
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  if (!bytes) {
+    static const uint8_t zero = 0;
+    bytes = &zero;
+    numBytes = 1;
+  }
+
+  std::string out;
+  switch (base) {
+  case 2: {
+    out.reserve(bw);
+    for (uint32_t b = bw; b > 0; --b)
+      out.push_back(circt_sv_get_bit_le(bytes, b - 1) ? '1' : '0');
+    break;
+  }
+  case 8: {
+    uint32_t digits = (bw + 2u) / 3u;
+    out.reserve(digits);
+    for (uint32_t d = digits; d > 0; --d) {
+      uint32_t digit =
+          circt_sv_get_bits_le_masked(bytes, bw, (d - 1) * 3u, 3u);
+      out.push_back(static_cast<char>('0' + digit));
+    }
+    break;
+  }
+  case 16: {
+    uint32_t digits = (bw + 3u) / 4u;
+    out.reserve(digits);
+    for (uint32_t d = digits; d > 0; --d) {
+      uint32_t digit =
+          circt_sv_get_bits_le_masked(bytes, bw, (d - 1) * 4u, 4u);
+      if (digit < 10) {
+        out.push_back(static_cast<char>('0' + digit));
+      } else {
+        char baseChar = uppercase ? 'A' : 'a';
+        out.push_back(static_cast<char>(baseChar + (digit - 10)));
+      }
+    }
+    break;
+  }
+  case 10: {
+    uint32_t limbs = (bw + 31u) / 32u;
+    std::vector<uint32_t> value(limbs, 0);
+    for (uint32_t i = 0; i < limbs; ++i) {
+      uint32_t limb = 0;
+      for (uint32_t b = 0; b < 4; ++b) {
+        uint32_t byteIdx = i * 4u + b;
+        if (byteIdx < numBytes)
+          limb |= static_cast<uint32_t>(bytes[byteIdx]) << (8u * b);
+      }
+      value[i] = limb;
+    }
+    if (bw % 32u) {
+      uint32_t bitsInTop = bw % 32u;
+      uint32_t mask =
+          bitsInTop == 32u ? 0xFFFFFFFFu : ((1u << bitsInTop) - 1u);
+      value.back() &= mask;
+    }
+
+    bool neg = false;
+    if (isSigned)
+      neg = circt_sv_get_bit_le(bytes, bw - 1u) != 0;
+
+    if (neg) {
+      for (auto &limb : value)
+        limb = ~limb;
+      if (bw % 32u) {
+        uint32_t bitsInTop = bw % 32u;
+        uint32_t mask =
+            bitsInTop == 32u ? 0xFFFFFFFFu : ((1u << bitsInTop) - 1u);
+        value.back() &= mask;
+      }
+      uint64_t carry = 1;
+      for (auto &limb : value) {
+        uint64_t sum = static_cast<uint64_t>(limb) + carry;
+        limb = static_cast<uint32_t>(sum);
+        carry = sum >> 32;
+        if (!carry)
+          break;
+      }
+    }
+
+    auto isZero = [&]() {
+      for (auto limb : value)
+        if (limb != 0)
+          return false;
+      return true;
+    };
+
+    std::string digits;
+    if (isZero()) {
+      digits = "0";
+    } else {
+      while (!isZero()) {
+        uint64_t rem = 0;
+        for (uint32_t i = value.size(); i > 0; --i) {
+          uint64_t cur = (rem << 32) | value[i - 1];
+          value[i - 1] = static_cast<uint32_t>(cur / 10);
+          rem = cur % 10;
+        }
+        digits.push_back(static_cast<char>('0' + rem));
+      }
+      std::reverse(digits.begin(), digits.end());
+    }
+
+    if (neg)
+      out.push_back('-');
+    out.append(digits);
+    break;
+  }
+  default:
+    std::fputs("<unsupported base>", stdout);
+    return;
+  }
+
+  // Trim leading zeros for minimum-width formatting.
+  size_t firstNonZero = out.find_first_not_of('0');
+  if (firstNonZero == std::string::npos) {
+    out.erase(0, out.size() - 1);
+  } else if (firstNonZero > 0) {
+    out.erase(0, firstNonZero);
+  }
+
+  int32_t padCount = 0;
+  if (minWidth > 0 && static_cast<int32_t>(out.size()) < minWidth)
+    padCount = minWidth - static_cast<int32_t>(out.size());
+  if (!leftJustify) {
+    for (int32_t i = 0; i < padCount; ++i)
+      std::fputc(padChar, stdout);
+  }
+  std::fwrite(out.data(), 1, out.size(), stdout);
+  if (leftJustify) {
+    for (int32_t i = 0; i < padCount; ++i)
+      std::fputc(padChar, stdout);
+  }
+}
+
+extern "C" void circt_sv_print_fvint(const void *valueData,
+                                     const void *unknownData, int32_t bitWidth,
+                                     int32_t base, int32_t minWidth,
+                                     int32_t flags) {
+  // Flags are backend-defined; keep in sync with LowerSimConsole.
+  constexpr int32_t kUppercase = 1 << 0;
+  constexpr int32_t kLeftJustify = 1 << 1;
+  constexpr int32_t kPadZero = 1 << 2;
+  constexpr int32_t kSigned = 1 << 3;
+
+  (void)kSigned; // Signedness is ignored for unknown-containing values.
+
+  if (bitWidth < 0)
+    bitWidth = 0;
+  if (minWidth < 0)
+    minWidth = 0;
+
+  const bool uppercase = (flags & kUppercase) != 0;
+  const bool leftJustify = (flags & kLeftJustify) != 0;
+  const bool padZero = (flags & kPadZero) != 0;
+
+  char padChar = padZero ? '0' : ' ';
+
+  // Handle zero-width integers.
+  if (bitWidth == 0) {
+    if (base == 10)
+      std::fputc('0', stdout);
+    return;
+  }
+
+  uint32_t bw = static_cast<uint32_t>(bitWidth);
+  uint32_t numBytes = static_cast<uint32_t>((bw + 7u) / 8u);
+
+  const auto *valueBytes = static_cast<const uint8_t *>(valueData);
+  const auto *unknownBytes = static_cast<const uint8_t *>(unknownData);
+  static const uint8_t zero = 0;
+  if (!valueBytes)
+    valueBytes = &zero;
+  if (!unknownBytes)
+    unknownBytes = &zero;
+
+  bool anyUnknown = false;
+  for (uint32_t i = 0; i < numBytes; ++i) {
+    if (unknownBytes[i] != 0) {
+      anyUnknown = true;
+      break;
+    }
+  }
+
+  // Fast path: no unknowns.
+  if (!anyUnknown) {
+    circt_sv_print_int(valueBytes, bitWidth, base, minWidth, flags);
+    return;
+  }
+
+  std::string out;
+  switch (base) {
+  case 2: {
+    out.reserve(bw);
+    for (uint32_t b = bw; b > 0; --b) {
+      uint8_t u = circt_sv_get_bit_le(unknownBytes, b - 1);
+      if (!u) {
+        out.push_back(circt_sv_get_bit_le(valueBytes, b - 1) ? '1' : '0');
+      } else {
+        bool isZ = circt_sv_get_bit_le(valueBytes, b - 1) != 0;
+        char c = isZ ? (uppercase ? 'Z' : 'z') : (uppercase ? 'X' : 'x');
+        out.push_back(c);
+      }
+    }
+    break;
+  }
+  case 8:
+  case 16: {
+    const uint32_t groupBits = base == 8 ? 3u : 4u;
+    uint32_t digits = (bw + (groupBits - 1u)) / groupBits;
+    out.reserve(digits);
+
+    for (uint32_t d = digits; d > 0; --d) {
+      uint32_t startBit = (d - 1u) * groupBits;
+      uint32_t bitsThisDigit =
+          std::min(groupBits, bw > startBit ? (bw - startBit) : 0u);
+      if (bitsThisDigit == 0) {
+        out.push_back('0');
+        continue;
+      }
+
+      uint32_t digitUnknown =
+          circt_sv_get_bits_le_masked(unknownBytes, bw, startBit, groupBits);
+      if (digitUnknown == 0) {
+        uint32_t digitVal =
+            circt_sv_get_bits_le_masked(valueBytes, bw, startBit, groupBits);
+        if (digitVal < 10) {
+          out.push_back(static_cast<char>('0' + digitVal));
+        } else {
+          char baseChar = uppercase ? 'A' : 'a';
+          out.push_back(static_cast<char>(baseChar + (digitVal - 10)));
+        }
+        continue;
+      }
+
+      uint32_t mask =
+          bitsThisDigit == 32u ? 0xFFFFFFFFu : ((1u << bitsThisDigit) - 1u);
+      uint32_t digitVal =
+          circt_sv_get_bits_le_masked(valueBytes, bw, startBit, groupBits) &
+          mask;
+      digitUnknown &= mask;
+
+      // If the entire digit is unknown, preserve `z` when all bits are Z.
+      if (digitUnknown == mask) {
+        if (digitVal == mask) {
+          out.push_back(uppercase ? 'Z' : 'z');
+          continue;
+        }
+        if (digitVal == 0) {
+          out.push_back(uppercase ? 'X' : 'x');
+          continue;
+        }
+      }
+
+      out.push_back(uppercase ? 'X' : 'x');
+    }
+    break;
+  }
+  case 10: {
+    // Decimal formatting with any unknowns prints `x` (or `z` if all Z).
+    bool allUnknown = true;
+    bool allZ = true;
+    for (uint32_t b = 0; b < bw; ++b) {
+      uint8_t u = circt_sv_get_bit_le(unknownBytes, b);
+      if (!u) {
+        allUnknown = false;
+        break;
+      }
+      if (circt_sv_get_bit_le(valueBytes, b) == 0)
+        allZ = false;
+    }
+    if (allUnknown && allZ) {
+      std::fputc(uppercase ? 'Z' : 'z', stdout);
+    } else {
+      std::fputc(uppercase ? 'X' : 'x', stdout);
+    }
+    return;
+  }
+  default:
+    std::fputs("<unsupported base>", stdout);
+    return;
+  }
+
+  // Trim leading zeros for minimum-width formatting.
+  size_t firstNonZero = out.find_first_not_of('0');
+  if (firstNonZero == std::string::npos) {
+    out.erase(0, out.size() - 1);
+  } else if (firstNonZero > 0) {
+    out.erase(0, firstNonZero);
+  }
+
+  int32_t padCount = 0;
+  if (minWidth > 0 && static_cast<int32_t>(out.size()) < minWidth)
+    padCount = minWidth - static_cast<int32_t>(out.size());
+  if (!leftJustify) {
+    for (int32_t i = 0; i < padCount; ++i)
+      std::fputc(padChar, stdout);
+  }
+  std::fwrite(out.data(), 1, out.size(), stdout);
+  if (leftJustify) {
+    for (int32_t i = 0; i < padCount; ++i)
+      std::fputc(padChar, stdout);
+  }
+}
+
+// Global `$timeformat` state used by `%t`.
+static int32_t circt_sv_timeformat_unit = -15;      // femtoseconds
+static int32_t circt_sv_timeformat_precision = 0;   // digits after decimal
+static const char *circt_sv_timeformat_suffix = ""; // no suffix by default
+static int32_t circt_sv_timeformat_min_width = 20;  // slang-style default
+
+extern "C" void circt_sv_set_timeformat(int32_t unit, int32_t precision,
+                                        const char *suffix,
+                                        int32_t minFieldWidth) {
+  // Clamp to a reasonable range (IEEE 1800 allows -15..0 for units).
+  if (unit < -15)
+    unit = -15;
+  if (unit > 0)
+    unit = 0;
+  if (precision < 0)
+    precision = 0;
+  if (precision > 18)
+    precision = 18;
+  if (minFieldWidth < 0)
+    minFieldWidth = 0;
+
+  circt_sv_timeformat_unit = unit;
+  circt_sv_timeformat_precision = precision;
+  circt_sv_timeformat_suffix = suffix ? suffix : "";
+  circt_sv_timeformat_min_width = minFieldWidth;
+}
+
+extern "C" void circt_sv_print_time(int64_t timeFs, int32_t widthOverride) {
+  int32_t unit = circt_sv_timeformat_unit;
+  int32_t precision = circt_sv_timeformat_precision;
+  const char *suffix = circt_sv_timeformat_suffix ? circt_sv_timeformat_suffix
+                                                  : "";
+
+  int32_t fieldWidth =
+      widthOverride >= 0 ? widthOverride : circt_sv_timeformat_min_width;
+  if (fieldWidth < 0)
+    fieldWidth = 0;
+  if (precision < 0)
+    precision = 0;
+  if (precision > 18)
+    precision = 18;
+
+  bool neg = timeFs < 0;
+  uint64_t absFs = 0;
+  if (neg) {
+    // Avoid UB on INT64_MIN negation.
+    absFs = static_cast<uint64_t>(-(timeFs + 1)) + 1;
+  } else {
+    absFs = static_cast<uint64_t>(timeFs);
+  }
+
+  uint32_t unitPow = static_cast<uint32_t>(unit + 15);
+  uint64_t unitFs = circt_sv_pow10_u64(unitPow);
+  if (unitFs == 0)
+    unitFs = 1;
+
+  uint64_t scale = circt_sv_pow10_u64(static_cast<uint32_t>(precision));
+  if (scale == 0)
+    scale = 1;
+
+  __int128 numerator = static_cast<__int128>(absFs) * static_cast<__int128>(scale);
+  // Round to the nearest representable value at the requested precision.
+  numerator += static_cast<__int128>(unitFs) / 2;
+  uint64_t scaled = static_cast<uint64_t>(numerator / unitFs);
+
+  uint64_t intPart = precision == 0 ? scaled : (scaled / scale);
+  uint64_t fracPart = precision == 0 ? 0 : (scaled % scale);
+
+  std::string num;
+  if (neg)
+    num.push_back('-');
+  num.append(std::to_string(intPart));
+  if (precision > 0) {
+    num.push_back('.');
+    auto fracStr = std::to_string(fracPart);
+    if (fracStr.size() < static_cast<size_t>(precision))
+      num.append(static_cast<size_t>(precision) - fracStr.size(), '0');
+    num.append(fracStr);
+  }
+
+  if (fieldWidth > 0 && static_cast<int32_t>(num.size()) < fieldWidth) {
+    int32_t padCount = fieldWidth - static_cast<int32_t>(num.size());
+    for (int32_t i = 0; i < padCount; ++i)
+      std::fputc(' ', stdout);
+  }
+  std::fwrite(num.data(), 1, num.size(), stdout);
+  if (suffix && *suffix)
+    std::fputs(suffix, stdout);
+}
+
+//===----------------------------------------------------------------------===//
+// `$sformatf` helpers (format string -> runtime string)
+//===----------------------------------------------------------------------===//
+
+static inline std::string circt_sv_format_int_to_string(const void *data,
+                                                        int32_t bitWidth,
+                                                        int32_t base,
+                                                        int32_t minWidth,
+                                                        int32_t flags) {
+  // Flags are backend-defined; keep in sync with LowerSimConsole.
+  constexpr int32_t kUppercase = 1 << 0;
+  constexpr int32_t kLeftJustify = 1 << 1;
+  constexpr int32_t kPadZero = 1 << 2;
+  constexpr int32_t kSigned = 1 << 3;
+
+  if (bitWidth < 0)
+    bitWidth = 0;
+  if (minWidth < 0)
+    minWidth = 0;
+
+  const bool uppercase = (flags & kUppercase) != 0;
+  const bool leftJustify = (flags & kLeftJustify) != 0;
+  const bool padZero = (flags & kPadZero) != 0;
+  const bool isSigned = (flags & kSigned) != 0;
+
+  char padChar = padZero ? '0' : ' ';
+
+  if (bitWidth == 0) {
+    if (base == 10)
+      return "0";
+    return "";
+  }
+
+  uint32_t bw = static_cast<uint32_t>(bitWidth);
+  auto numBytes = static_cast<uint32_t>((bw + 7u) / 8u);
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  if (!bytes) {
+    static const uint8_t zero = 0;
+    bytes = &zero;
+    numBytes = 1;
+  }
+
+  std::string out;
+  switch (base) {
+  case 2: {
+    out.reserve(bw);
+    for (uint32_t b = bw; b > 0; --b)
+      out.push_back(circt_sv_get_bit_le(bytes, b - 1) ? '1' : '0');
+    break;
+  }
+  case 8: {
+    uint32_t digits = (bw + 2u) / 3u;
+    out.reserve(digits);
+    for (uint32_t d = digits; d > 0; --d) {
+      uint32_t digit =
+          circt_sv_get_bits_le_masked(bytes, bw, (d - 1) * 3u, 3u);
+      out.push_back(static_cast<char>('0' + digit));
+    }
+    break;
+  }
+  case 16: {
+    uint32_t digits = (bw + 3u) / 4u;
+    out.reserve(digits);
+    for (uint32_t d = digits; d > 0; --d) {
+      uint32_t digit =
+          circt_sv_get_bits_le_masked(bytes, bw, (d - 1) * 4u, 4u);
+      if (digit < 10) {
+        out.push_back(static_cast<char>('0' + digit));
+      } else {
+        char baseChar = uppercase ? 'A' : 'a';
+        out.push_back(static_cast<char>(baseChar + (digit - 10)));
+      }
+    }
+    break;
+  }
+  case 10: {
+    uint32_t limbs = (bw + 31u) / 32u;
+    std::vector<uint32_t> value(limbs, 0);
+    for (uint32_t i = 0; i < limbs; ++i) {
+      uint32_t limb = 0;
+      for (uint32_t b = 0; b < 4; ++b) {
+        uint32_t byteIdx = i * 4u + b;
+        if (byteIdx < numBytes)
+          limb |= static_cast<uint32_t>(bytes[byteIdx]) << (8u * b);
+      }
+      value[i] = limb;
+    }
+    if (bw % 32u) {
+      uint32_t bitsInTop = bw % 32u;
+      uint32_t mask =
+          bitsInTop == 32u ? 0xFFFFFFFFu : ((1u << bitsInTop) - 1u);
+      value.back() &= mask;
+    }
+
+    bool neg = false;
+    if (isSigned)
+      neg = circt_sv_get_bit_le(bytes, bw - 1u) != 0;
+
+    if (neg) {
+      for (auto &limb : value)
+        limb = ~limb;
+      if (bw % 32u) {
+        uint32_t bitsInTop = bw % 32u;
+        uint32_t mask =
+            bitsInTop == 32u ? 0xFFFFFFFFu : ((1u << bitsInTop) - 1u);
+        value.back() &= mask;
+      }
+      uint64_t carry = 1;
+      for (auto &limb : value) {
+        uint64_t sum = static_cast<uint64_t>(limb) + carry;
+        limb = static_cast<uint32_t>(sum);
+        carry = sum >> 32;
+        if (!carry)
+          break;
+      }
+    }
+
+    auto isZero = [&]() {
+      for (auto limb : value)
+        if (limb != 0)
+          return false;
+      return true;
+    };
+
+    std::string digits;
+    if (isZero()) {
+      digits = "0";
+    } else {
+      while (!isZero()) {
+        uint64_t rem = 0;
+        for (uint32_t i = value.size(); i > 0; --i) {
+          uint64_t cur = (rem << 32) | value[i - 1];
+          value[i - 1] = static_cast<uint32_t>(cur / 10);
+          rem = cur % 10;
+        }
+        digits.push_back(static_cast<char>('0' + rem));
+      }
+      std::reverse(digits.begin(), digits.end());
+    }
+
+    if (neg)
+      out.push_back('-');
+    out.append(digits);
+    break;
+  }
+  default:
+    return "<unsupported base>";
+  }
+
+  // Trim leading zeros for minimum-width formatting.
+  size_t firstNonZero = out.find_first_not_of('0');
+  if (firstNonZero == std::string::npos) {
+    out.erase(0, out.size() - 1);
+  } else if (firstNonZero > 0) {
+    out.erase(0, firstNonZero);
+  }
+
+  int32_t padCount = 0;
+  if (minWidth > 0 && static_cast<int32_t>(out.size()) < minWidth)
+    padCount = minWidth - static_cast<int32_t>(out.size());
+
+  std::string formatted;
+  if (!leftJustify)
+    formatted.append(static_cast<size_t>(padCount), padChar);
+  formatted.append(out);
+  if (leftJustify)
+    formatted.append(static_cast<size_t>(padCount), padChar);
+  return formatted;
+}
+
+static inline std::string
+circt_sv_format_fvint_to_string(const void *valueData, const void *unknownData,
+                                int32_t bitWidth, int32_t base, int32_t minWidth,
+                                int32_t flags) {
+  // Flags are backend-defined; keep in sync with LowerSimConsole.
+  constexpr int32_t kUppercase = 1 << 0;
+  constexpr int32_t kLeftJustify = 1 << 1;
+  constexpr int32_t kPadZero = 1 << 2;
+
+  if (bitWidth < 0)
+    bitWidth = 0;
+  if (minWidth < 0)
+    minWidth = 0;
+
+  const bool uppercase = (flags & kUppercase) != 0;
+  const bool leftJustify = (flags & kLeftJustify) != 0;
+  const bool padZero = (flags & kPadZero) != 0;
+
+  char padChar = padZero ? '0' : ' ';
+
+  if (bitWidth == 0) {
+    if (base == 10)
+      return "0";
+    return "";
+  }
+
+  uint32_t bw = static_cast<uint32_t>(bitWidth);
+  uint32_t numBytes = static_cast<uint32_t>((bw + 7u) / 8u);
+
+  const auto *valueBytes = static_cast<const uint8_t *>(valueData);
+  const auto *unknownBytes = static_cast<const uint8_t *>(unknownData);
+  static const uint8_t zero = 0;
+  if (!valueBytes)
+    valueBytes = &zero;
+  if (!unknownBytes)
+    unknownBytes = &zero;
+
+  bool anyUnknown = false;
+  for (uint32_t i = 0; i < numBytes; ++i) {
+    if (unknownBytes[i] != 0) {
+      anyUnknown = true;
+      break;
+    }
+  }
+  if (!anyUnknown) {
+    return circt_sv_format_int_to_string(valueBytes, bitWidth, base, minWidth,
+                                         flags);
+  }
+
+  std::string out;
+  switch (base) {
+  case 2: {
+    out.reserve(bw);
+    for (uint32_t b = bw; b > 0; --b) {
+      uint8_t u = circt_sv_get_bit_le(unknownBytes, b - 1);
+      if (!u) {
+        out.push_back(circt_sv_get_bit_le(valueBytes, b - 1) ? '1' : '0');
+      } else {
+        bool isZ = circt_sv_get_bit_le(valueBytes, b - 1) != 0;
+        char c = isZ ? (uppercase ? 'Z' : 'z') : (uppercase ? 'X' : 'x');
+        out.push_back(c);
+      }
+    }
+    break;
+  }
+  case 8:
+  case 16: {
+    const uint32_t groupBits = base == 8 ? 3u : 4u;
+    uint32_t digits = (bw + (groupBits - 1u)) / groupBits;
+    out.reserve(digits);
+
+    for (uint32_t d = digits; d > 0; --d) {
+      uint32_t startBit = (d - 1u) * groupBits;
+      uint32_t bitsThisDigit =
+          std::min(groupBits, bw > startBit ? (bw - startBit) : 0u);
+      if (bitsThisDigit == 0) {
+        out.push_back('0');
+        continue;
+      }
+
+      uint32_t digitUnknown =
+          circt_sv_get_bits_le_masked(unknownBytes, bw, startBit, groupBits);
+      if (digitUnknown == 0) {
+        uint32_t digitVal =
+            circt_sv_get_bits_le_masked(valueBytes, bw, startBit, groupBits);
+        if (digitVal < 10) {
+          out.push_back(static_cast<char>('0' + digitVal));
+        } else {
+          char baseChar = uppercase ? 'A' : 'a';
+          out.push_back(static_cast<char>(baseChar + (digitVal - 10)));
+        }
+        continue;
+      }
+
+      uint32_t mask =
+          bitsThisDigit == 32u ? 0xFFFFFFFFu : ((1u << bitsThisDigit) - 1u);
+      uint32_t digitVal =
+          circt_sv_get_bits_le_masked(valueBytes, bw, startBit, groupBits) &
+          mask;
+      digitUnknown &= mask;
+
+      if (digitUnknown == mask) {
+        if (digitVal == mask) {
+          out.push_back(uppercase ? 'Z' : 'z');
+          continue;
+        }
+        if (digitVal == 0) {
+          out.push_back(uppercase ? 'X' : 'x');
+          continue;
+        }
+      }
+
+      out.push_back(uppercase ? 'X' : 'x');
+    }
+    break;
+  }
+  case 10: {
+    bool allUnknown = true;
+    bool allZ = true;
+    for (uint32_t b = 0; b < bw; ++b) {
+      uint8_t u = circt_sv_get_bit_le(unknownBytes, b);
+      if (!u) {
+        allUnknown = false;
+        break;
+      }
+      if (circt_sv_get_bit_le(valueBytes, b) == 0)
+        allZ = false;
+    }
+    // For unknown decimal values, emit a single `x`/`z` without applying any
+    // minimum field width padding.
+    if (allUnknown && allZ)
+      return uppercase ? "Z" : "z";
+    return uppercase ? "X" : "x";
+  }
+  default:
+    return "<unsupported base>";
+  }
+
+  size_t firstNonZero = out.find_first_not_of('0');
+  if (firstNonZero == std::string::npos) {
+    out.erase(0, out.size() - 1);
+  } else if (firstNonZero > 0) {
+    out.erase(0, firstNonZero);
+  }
+
+  int32_t padCount = 0;
+  if (minWidth > 0 && static_cast<int32_t>(out.size()) < minWidth)
+    padCount = minWidth - static_cast<int32_t>(out.size());
+
+  std::string formatted;
+  if (!leftJustify)
+    formatted.append(static_cast<size_t>(padCount), padChar);
+  formatted.append(out);
+  if (leftJustify)
+    formatted.append(static_cast<size_t>(padCount), padChar);
+  return formatted;
+}
+
+static inline std::string circt_sv_format_time_to_string(int64_t timeFs,
+                                                         int32_t widthOverride) {
+  int32_t unit = circt_sv_timeformat_unit;
+  int32_t precision = circt_sv_timeformat_precision;
+  const char *suffix = circt_sv_timeformat_suffix ? circt_sv_timeformat_suffix
+                                                  : "";
+
+  int32_t fieldWidth =
+      widthOverride >= 0 ? widthOverride : circt_sv_timeformat_min_width;
+  if (fieldWidth < 0)
+    fieldWidth = 0;
+  if (precision < 0)
+    precision = 0;
+  if (precision > 18)
+    precision = 18;
+
+  bool neg = timeFs < 0;
+  uint64_t absFs = 0;
+  if (neg) {
+    absFs = static_cast<uint64_t>(-(timeFs + 1)) + 1;
+  } else {
+    absFs = static_cast<uint64_t>(timeFs);
+  }
+
+  uint32_t unitPow = static_cast<uint32_t>(unit + 15);
+  uint64_t unitFs = circt_sv_pow10_u64(unitPow);
+  if (unitFs == 0)
+    unitFs = 1;
+
+  uint64_t scale = circt_sv_pow10_u64(static_cast<uint32_t>(precision));
+  if (scale == 0)
+    scale = 1;
+
+  __int128 numerator =
+      static_cast<__int128>(absFs) * static_cast<__int128>(scale);
+  numerator += static_cast<__int128>(unitFs) / 2;
+  uint64_t scaled = static_cast<uint64_t>(numerator / unitFs);
+
+  uint64_t intPart = precision == 0 ? scaled : (scaled / scale);
+  uint64_t fracPart = precision == 0 ? 0 : (scaled % scale);
+
+  std::string num;
+  if (neg)
+    num.push_back('-');
+  num.append(std::to_string(intPart));
+  if (precision > 0) {
+    num.push_back('.');
+    auto fracStr = std::to_string(fracPart);
+    if (fracStr.size() < static_cast<size_t>(precision))
+      num.append(static_cast<size_t>(precision) - fracStr.size(), '0');
+    num.append(fracStr);
+  }
+
+  std::string out;
+  if (fieldWidth > 0 && static_cast<int32_t>(num.size()) < fieldWidth)
+    out.append(static_cast<size_t>(fieldWidth - static_cast<int32_t>(num.size())),
+               ' ');
+  out.append(num);
+  if (suffix && *suffix)
+    out.append(suffix);
+  return out;
+}
+
+struct CirctSvStringBuilder {
+  std::string buf;
+};
+
+extern "C" void *circt_sv_strbuilder_new() { return new CirctSvStringBuilder(); }
+
+extern "C" void circt_sv_strbuilder_append_bytes(void *builder,
+                                                 const char *bytes,
+                                                 int32_t len) {
+  if (!builder || !bytes || len <= 0)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  sb->buf.append(bytes, bytes + static_cast<size_t>(len));
+}
+
+extern "C" void circt_sv_strbuilder_append_cstr(void *builder,
+                                                const char *str) {
+  if (!builder || !str)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  sb->buf.append(str);
+}
+
+extern "C" void circt_sv_strbuilder_append_int(void *builder, const void *data,
+                                               int32_t bitWidth, int32_t base,
+                                               int32_t minWidth, int32_t flags) {
+  if (!builder)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  sb->buf.append(
+      circt_sv_format_int_to_string(data, bitWidth, base, minWidth, flags));
+}
+
+extern "C" void circt_sv_strbuilder_append_fvint(void *builder,
+                                                 const void *valueData,
+                                                 const void *unknownData,
+                                                 int32_t bitWidth, int32_t base,
+                                                 int32_t minWidth, int32_t flags) {
+  if (!builder)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  sb->buf.append(circt_sv_format_fvint_to_string(valueData, unknownData,
+                                                 bitWidth, base, minWidth, flags));
+}
+
+extern "C" void circt_sv_strbuilder_append_time(void *builder, int64_t timeFs,
+                                                int32_t widthOverride) {
+  if (!builder)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  sb->buf.append(circt_sv_format_time_to_string(timeFs, widthOverride));
+}
+
+extern "C" void circt_sv_strbuilder_append_char(void *builder, int32_t ch) {
+  if (!builder)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  sb->buf.push_back(
+      static_cast<char>(static_cast<unsigned char>(ch & 0xFF)));
+}
+
+extern "C" void circt_sv_strbuilder_append_real(void *builder, double value,
+                                                int32_t kind) {
+  if (!builder)
+    return;
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+
+  const char *fmt = "%f";
+  if (kind == 1)
+    fmt = "%e";
+  else if (kind == 2)
+    fmt = "%g";
+
+  int n = std::snprintf(nullptr, 0, fmt, value);
+  if (n <= 0)
+    return;
+  std::string tmp;
+  tmp.resize(static_cast<size_t>(n) + 1);
+  std::snprintf(tmp.data(), tmp.size(), fmt, value);
+  tmp.pop_back(); // drop NUL terminator
+  sb->buf.append(tmp);
+}
+
+extern "C" const char *circt_sv_strbuilder_finish(void *builder) {
+  if (!builder)
+    return "";
+  auto *sb = static_cast<CirctSvStringBuilder *>(builder);
+  size_t len = sb->buf.size();
+  char *out = static_cast<char *>(std::malloc(len + 1));
+  if (!out) {
+    delete sb;
+    return "";
+  }
+  if (len)
+    std::memcpy(out, sb->buf.data(), len);
+  out[len] = '\0';
+  delete sb;
   return out;
 }
 

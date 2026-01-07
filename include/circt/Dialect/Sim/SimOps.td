@@ -317,6 +317,75 @@ def FormatCharOp : SimOp<"fmt.char", [Pure]> {
   let assemblyFormat = "$value attr-dict `:` qualified(type($value))";
 }
 
+def FormatIntOp : SimOp<"fmt.int", [Pure]> {
+  let summary = "Integer format specifier with explicit width";
+  let description = [{
+    Format the given integer value as a string fragment according to the given
+    base and minimum field width.
+
+    This op acts as a lossless carrier for SystemVerilog `$display` / `$write`
+    integer format options (e.g. `%d/%0d`, `%h/%0h`, `%b/%0b`, `%o/%0o`) after
+    lowering to Sim dialects.
+
+    Attributes:
+    - `base`: the radix (expected: 2, 8, 10, or 16)
+    - `width`: minimum field width in digits (0 disables padding)
+    - `flags`: bitset used by backends (implementation-defined)
+  }];
+
+  let arguments = (ins AnyInteger:$value, I32Attr:$base, I32Attr:$width,
+                   I32Attr:$flags);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $base $width $flags $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatFVIntOp : SimOp<"fmt.fvint", [Pure, AllTypesMatch<["value", "unknown"]>]> {
+  let summary = "Four-valued integer format specifier";
+  let description = [{
+    Format a four-valued integer as a string fragment according to the given
+    base and minimum field width.
+
+    The integer is passed in split form as a `value` bitvector and an `unknown`
+    bitvector, matching the representation used by `circt::FVInt`:
+    - `unknown` bit = 0: `value` is 0 or 1.
+    - `unknown` bit = 1: `value` is 0 (X) or 1 (Z).
+
+    Attributes:
+    - `base`: the radix (expected: 2, 8, 10, or 16)
+    - `width`: minimum field width in digits (0 disables padding)
+    - `flags`: bitset used by backends (implementation-defined)
+  }];
+
+  let arguments = (ins AnyInteger:$value, AnyInteger:$unknown, I32Attr:$base,
+                   I32Attr:$width, I32Attr:$flags);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $base $width $flags $value `,` $unknown attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatTimeOp : SimOp<"fmt.time", [Pure]> {
+  let summary = "Time format specifier";
+  let description = [{
+    Format the given femtoseconds time value (`i64`) as a string fragment
+    according to the current SystemVerilog `$timeformat` state.
+
+    The `width` attribute, if present, overrides the current `$timeformat`
+    minimum field width for this formatting operation (corresponds to `%<w>t`).
+  }];
+
+  let arguments = (ins AnyInteger:$value, OptionalAttr<I32Attr>:$width);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $value (`,` `width` $width^)? attr-dict `:` qualified(type($value))
+  }];
+}
+
 def FormatStringConcatOp : SimOp<"fmt.concat", [Pure]> {
   let summary = "Concatenate format strings";
   let description = [{
@@ -361,6 +430,20 @@ def FormatStringConcatOp : SimOp<"fmt.concat", [Pure]> {
   }];
 }
 
+def FormatToStringOp : SimOp<"fmt.to_string", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Evaluate a format string to a runtime string";
+  let description = [{
+    Evaluate a `!sim.formatstring` DAG and produce a runtime string value
+    (`!hw.string`). This is used to implement `$sformatf` lowering when the
+    format string is not a single literal fragment.
+  }];
+
+  let arguments = (ins FormatStringType:$input);
+  let results = (outs HWStringType:$result);
+
+  let assemblyFormat = "$input attr-dict";
+}
+
 def PrintFormattedOp : SimOp<"print"> {
   let summary = "Print a formatted string on a given clock and condition";
   let description = [{
@@ -393,6 +476,24 @@ def PrintFormattedProcOp : SimOp<"proc.print", [MemoryEffects<[MemWrite]>]> {
   let hasVerifier = true;
   let hasCanonicalizeMethod = true;
   let assemblyFormat = "$input attr-dict";
+}
+
+def TimeFormatProcOp : SimOp<"proc.timeformat", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Set SystemVerilog `$timeformat` state within a procedural region";
+  let description = [{
+    Set the global time formatting state used by `%t` formatting in
+    `$display`/`$write`/`$sformatf`.
+
+    This operation must be within a procedural region.
+  }];
+
+  let arguments = (ins I32Attr:$unit, I32Attr:$precision, StrAttr:$suffix,
+                   I32Attr:$minWidth);
+  let hasVerifier = true;
+
+  let assemblyFormat = [{
+    $unit `,` $precision `,` $suffix `,` $minWidth attr-dict
+  }];
 }
 
 //===----------------------------------------------------------------------===//
