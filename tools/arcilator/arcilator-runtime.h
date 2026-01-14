@@ -11,6 +11,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct Signal {
@@ -134,30 +135,54 @@ public:
         continue;
 
       bool isFourState = signal.state.valueOffset != signal.state.unknownOffset;
-      if (!isFourState) {
-        if (signal.state.numBits > 1)
-          os << 'b';
+      auto emitBits = [&](auto &&emitChar) {
         for (unsigned n = signal.state.numBits; n > 0; --n)
-          os << (valNew[(n - 1) / 8] & (1 << ((n - 1) % 8)) ? '1' : '0');
-        if (signal.state.numBits > 1)
-          os << ' ';
+          emitChar(n - 1);
+      };
+      auto trimLeadingZeros = [&](std::string bits) -> std::string {
+        if (bits.empty())
+          return bits;
+        if (bits.find_first_not_of('x') == std::string::npos)
+          return "x";
+        auto first = bits.find_first_not_of('0');
+        if (first == std::string::npos)
+          return "0";
+        return bits.substr(first);
+      };
+      if (!isFourState) {
+        if (signal.state.numBits > 1) {
+          std::string bits;
+          bits.reserve(signal.state.numBits);
+          emitBits([&](unsigned bit) {
+            bits.push_back(valNew[bit / 8] & (1 << (bit % 8)) ? '1' : '0');
+          });
+          os << 'b' << trimLeadingZeros(std::move(bits)) << ' ';
+        } else {
+          os << (valNew[0] & 1 ? '1' : '0');
+        }
       } else {
         const uint8_t *unknown = valNew + signal.state.unknownOffset;
         const uint8_t *value = valNew + signal.state.valueOffset;
-        if (signal.state.numBits > 1)
-          os << 'b';
-        for (unsigned n = signal.state.numBits; n > 0; --n) {
-          const unsigned idx = (n - 1) / 8;
-          const uint8_t mask = 1u << ((n - 1) % 8);
-          const bool isX = (unknown[idx] & mask) != 0;
-          if (isX) {
+        if (signal.state.numBits > 1) {
+          std::string bits;
+          bits.reserve(signal.state.numBits);
+          emitBits([&](unsigned bit) {
+            const unsigned idx = bit / 8;
+            const uint8_t mask = 1u << (bit % 8);
+            if (unknown[idx] & mask) {
+              bits.push_back('x');
+              return;
+            }
+            bits.push_back(value[idx] & mask ? '1' : '0');
+          });
+          os << 'b' << trimLeadingZeros(std::move(bits)) << ' ';
+        } else {
+          const bool isX = (unknown[0] & 1u) != 0;
+          if (isX)
             os << 'x';
-            continue;
-          }
-          os << ((value[idx] & mask) != 0 ? '1' : '0');
+          else
+            os << (value[0] & 1u ? '1' : '0');
         }
-        if (signal.state.numBits > 1)
-          os << ' ';
       }
       os << signal.abbrev << "\n";
       std::copy(valNew, valNew + numBytes, valOld);
@@ -210,6 +235,49 @@ private:
 };
 
 // NOLINTEND
+
+static inline unsigned arcilator_unknown_storage_bytes(const Signal &sig) {
+  if (sig.valueOffset == sig.unknownOffset)
+    return 0;
+  if (sig.unknownOffset < sig.valueOffset)
+    return sig.valueOffset - sig.unknownOffset;
+  return sig.storageBytes - sig.unknownOffset;
+}
+
+static inline void arcilator_init_signal_x(uint8_t *state, const Signal &sig,
+                                           unsigned baseOffset) {
+  const unsigned unknownBytes = arcilator_unknown_storage_bytes(sig);
+  if (!unknownBytes)
+    return;
+  const unsigned start = baseOffset + sig.unknownOffset;
+  std::fill(state + start, state + start + unknownBytes, 0xFF);
+}
+
+static inline void arcilator_init_state_x(uint8_t *state, const Signal &sig) {
+  if (sig.type != Signal::Memory) {
+    arcilator_init_signal_x(state, sig, sig.offset);
+    return;
+  }
+
+  for (unsigned i = 0; i < sig.depth; ++i)
+    arcilator_init_signal_x(state, sig, sig.offset + i * sig.stride);
+}
+
+static inline void arcilator_init_state_x(uint8_t *state,
+                                          const Hierarchy &hierarchy) {
+  for (unsigned i = 0; i < hierarchy.numStates; ++i)
+    arcilator_init_state_x(state, hierarchy.states[i]);
+
+  for (unsigned i = 0; i < hierarchy.numChildren; ++i)
+    arcilator_init_state_x(state, hierarchy.children[i]);
+}
+
+template <class ModelLayout>
+static inline void arcilator_init_state_x(uint8_t *state) {
+  for (const auto &port : ModelLayout::io)
+    arcilator_init_state_x(state, port);
+  arcilator_init_state_x(state, ModelLayout::hierarchy);
+}
 
 extern "C" int32_t circt_sv_strcmp(const char *lhs, const char *rhs) {
   if (!lhs)
@@ -1328,6 +1396,7 @@ struct CirctSvClassObject {
   int32_t typeId = 0;
   std::unordered_map<int32_t, int32_t> i32Fields;
   std::unordered_map<int32_t, std::string> strFields;
+  std::unordered_map<int32_t, uintptr_t> ptrFields;
 };
 
 static std::unordered_map<int32_t, CirctSvClassObject> circt_sv_class_objects;
@@ -1389,6 +1458,24 @@ extern "C" void circt_sv_class_set_str(int32_t handle, int32_t fieldId,
   if (it == circt_sv_class_objects.end())
     it = circt_sv_class_objects.emplace(handle, CirctSvClassObject{}).first;
   it->second.strFields[fieldId] = value ? value : "";
+}
+
+extern "C" uint64_t circt_sv_class_get_ptr(int32_t handle, int32_t fieldId) {
+  auto it = circt_sv_class_objects.find(handle);
+  if (it == circt_sv_class_objects.end())
+    return 0;
+  auto jt = it->second.ptrFields.find(fieldId);
+  if (jt == it->second.ptrFields.end())
+    return 0;
+  return static_cast<uint64_t>(jt->second);
+}
+
+extern "C" void circt_sv_class_set_ptr(int32_t handle, int32_t fieldId,
+                                       uint64_t value) {
+  auto it = circt_sv_class_objects.find(handle);
+  if (it == circt_sv_class_objects.end())
+    it = circt_sv_class_objects.emplace(handle, CirctSvClassObject{}).first;
+  it->second.ptrFields[fieldId] = static_cast<uintptr_t>(value);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1554,7 +1641,24 @@ static bool circt_uvm_shims_enabled() {
 }
 
 static bool circt_uvm_phase_all_done_state = false;
+static bool circt_uvm_test_done_requested = false;
+static int64_t circt_uvm_objection_count = 0;
+
+static void circt_uvm_update_phase_all_done_state() {
+  if (!circt_uvm_shims_enabled())
+    return;
+  circt_uvm_phase_all_done_state =
+      circt_uvm_test_done_requested && (circt_uvm_objection_count <= 0);
+}
 static std::unordered_map<std::string, int32_t> circt_uvm_resource_db;
+static std::unordered_map<std::string, uintptr_t> circt_uvm_resource_db_ptr;
+static std::unordered_map<int32_t, std::string> circt_uvm_component_names;
+static std::vector<int32_t> circt_uvm_component_list;
+static std::unordered_set<int32_t> circt_uvm_component_seen;
+static std::unordered_map<int32_t, int32_t> circt_uvm_component_parent;
+static std::unordered_map<int32_t, std::vector<int32_t>>
+    circt_uvm_port_connections;
+static std::unordered_map<int32_t, int32_t> circt_uvm_analysis_imp_impl;
 
 static std::string circt_uvm_resource_db_key(const char *scope, const char *name) {
   std::string key;
@@ -1573,7 +1677,8 @@ extern "C" void circt_uvm_run_test(const char *test_name) {
   // calls measurable (non-vacuous).
   if (!circt_uvm_shims_enabled())
     return;
-  circt_uvm_phase_all_done_state = true;
+  circt_uvm_test_done_requested = true;
+  circt_uvm_update_phase_all_done_state();
 }
 
 extern "C" int32_t circt_uvm_coreservice_get() { return 1; }
@@ -1588,12 +1693,131 @@ extern "C" void circt_uvm_root_run_test(int32_t root, const char *test_name) {
   (void)test_name;
   if (!circt_uvm_shims_enabled())
     return;
-  circt_uvm_phase_all_done_state = true;
+  circt_uvm_test_done_requested = true;
+  circt_uvm_update_phase_all_done_state();
+}
+
+extern "C" void circt_uvm_raise_objection(int32_t comp) {
+  (void)comp;
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (circt_uvm_objection_count < INT64_MAX)
+    ++circt_uvm_objection_count;
+  circt_uvm_update_phase_all_done_state();
+}
+
+extern "C" void circt_uvm_drop_objection(int32_t comp) {
+  (void)comp;
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (circt_uvm_objection_count > 0)
+    --circt_uvm_objection_count;
+  circt_uvm_update_phase_all_done_state();
 }
 
 extern "C" void circt_uvm_resource_db_set(const char *scope, const char *name,
                                          int32_t value) {
   circt_uvm_resource_db[circt_uvm_resource_db_key(scope, name)] = value;
+}
+
+extern "C" int32_t circt_uvm_resource_db_get_i32(const char *scope,
+                                                 const char *name) {
+  auto it = circt_uvm_resource_db.find(circt_uvm_resource_db_key(scope, name));
+  if (it == circt_uvm_resource_db.end())
+    return 0;
+  return it->second;
+}
+
+extern "C" void circt_uvm_resource_db_set_ptr(const char *scope,
+                                              const char *name, uint64_t value) {
+  circt_uvm_resource_db_ptr[circt_uvm_resource_db_key(scope, name)] =
+      static_cast<uintptr_t>(value);
+}
+
+extern "C" uint64_t circt_uvm_resource_db_get_ptr(const char *scope,
+                                               const char *name) {
+  auto it =
+      circt_uvm_resource_db_ptr.find(circt_uvm_resource_db_key(scope, name));
+  if (it == circt_uvm_resource_db_ptr.end())
+    return 0;
+  return static_cast<uint64_t>(it->second);
+}
+
+extern "C" void circt_uvm_component_set_name(int32_t handle,
+                                             const char *name) {
+  circt_uvm_component_names[handle] = name ? name : "";
+}
+
+extern "C" void circt_uvm_component_register(int32_t handle, int32_t parent) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (handle == 0)
+    return;
+  if (circt_uvm_component_seen.insert(handle).second)
+    circt_uvm_component_list.push_back(handle);
+  circt_uvm_component_parent[handle] = parent;
+}
+
+extern "C" int32_t circt_uvm_component_count() {
+  return static_cast<int32_t>(circt_uvm_component_list.size());
+}
+
+extern "C" int32_t circt_uvm_component_get(int32_t idx) {
+  if (idx < 0)
+    return 0;
+  size_t pos = static_cast<size_t>(idx);
+  if (pos >= circt_uvm_component_list.size())
+    return 0;
+  return circt_uvm_component_list[pos];
+}
+
+extern "C" const char *circt_uvm_component_get_full_name(int32_t handle) {
+  auto it = circt_uvm_component_names.find(handle);
+  if (it == circt_uvm_component_names.end())
+    return "";
+  return it->second.c_str();
+}
+
+extern "C" void circt_uvm_port_connect(int32_t port, int32_t provider) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (port == 0 || provider == 0)
+    return;
+  circt_uvm_port_connections[port].push_back(provider);
+}
+
+extern "C" int32_t circt_uvm_port_conn_count(int32_t port) {
+  auto it = circt_uvm_port_connections.find(port);
+  if (it == circt_uvm_port_connections.end())
+    return 0;
+  return static_cast<int32_t>(it->second.size());
+}
+
+extern "C" int32_t circt_uvm_port_conn_get(int32_t port, int32_t idx) {
+  auto it = circt_uvm_port_connections.find(port);
+  if (it == circt_uvm_port_connections.end())
+    return 0;
+  if (idx < 0)
+    return 0;
+  size_t pos = static_cast<size_t>(idx);
+  if (pos >= it->second.size())
+    return 0;
+  return it->second[pos];
+}
+
+extern "C" void circt_uvm_analysis_imp_set_impl(int32_t imp, int32_t impl) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (imp == 0)
+    return;
+  circt_uvm_analysis_imp_impl[imp] = impl;
+}
+
+extern "C" int32_t circt_uvm_analysis_imp_get_impl(int32_t imp) {
+  auto it = circt_uvm_analysis_imp_impl.find(imp);
+  if (it == circt_uvm_analysis_imp_impl.end())
+    return 0;
+  return it->second;
 }
 
 extern "C" int32_t circt_uvm_report_server_get_server() { return 1; }

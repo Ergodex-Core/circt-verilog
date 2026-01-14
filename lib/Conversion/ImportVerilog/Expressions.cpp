@@ -15,6 +15,7 @@
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/types/AllTypes.h"
 #include "slang/syntax/AllSyntax.h"
+#include "slang/text/SourceManager.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/LTL/LTLOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -47,9 +48,26 @@ static Type getInterfaceSignalType(Type type) {
       width = 1;
     auto widthAttr = IntegerAttr::get(IntegerType::get(type.getContext(), 32),
                                       APInt(32, width));
-    return hw::IntType::get(widthAttr);
+    Type elemTy = hw::IntType::get(widthAttr);
+    if (intTy.getDomain() == moore::Domain::FourValued) {
+      SmallVector<hw::StructType::FieldInfo> fields;
+      fields.push_back(
+          {StringAttr::get(type.getContext(), "value"), elemTy});
+      fields.push_back(
+          {StringAttr::get(type.getContext(), "unknown"), elemTy});
+      return hw::StructType::get(type.getContext(), fields);
+    }
+    return elemTy;
   }
   return type;
+}
+
+static Value materializeStringValue(Context &context, Location loc,
+                                    StringRef value) {
+  auto fmt =
+      moore::FormatLiteralOp::create(context.builder, loc,
+                                    context.builder.getStringAttr(value));
+  return moore::FormatStringToStringOp::create(context.builder, loc, fmt);
 }
 
 static bool isVirtualInterfaceType(const slang::ast::Type *type) {
@@ -76,6 +94,156 @@ static bool isInterfaceMemberSymbol(const slang::ast::Symbol &symbol) {
     return iface->getDefinition().definitionKind ==
            slang::ast::DefinitionKind::Interface;
   return false;
+}
+
+/// Resolve an interface member symbol (e.g. produced by slang for `vif.sig`)
+/// inside a class method by finding a matching `virtual interface` class
+/// property in the current `this` class and loading its stored handle.
+static FailureOr<Value> resolveVirtualInterfaceHandleForMember(
+    Context &context, OpBuilder &builder, Location loc,
+    const slang::ast::ValueSymbol &memberSymbol) {
+  if (context.thisStack.empty() || context.thisClassStack.empty())
+    return failure();
+
+  const slang::ast::ClassType *thisClass = context.thisClassStack.back();
+  if (!thisClass)
+    return failure();
+
+  const slang::ast::Scope *memberScope = memberSymbol.getParentScope();
+  if (!memberScope)
+    return failure();
+  const auto *ifaceBody =
+      memberScope->asSymbol().as_if<slang::ast::InstanceBodySymbol>();
+  if (!ifaceBody || ifaceBody->getDefinition().definitionKind !=
+                        slang::ast::DefinitionKind::Interface)
+    return failure();
+  const slang::ast::DefinitionSymbol *ifaceDef = &ifaceBody->getDefinition();
+
+  const slang::ast::ClassPropertySymbol *selectedProp = nullptr;
+  const slang::ast::VirtualInterfaceType *selectedVifType = nullptr;
+  const slang::ast::ClassPropertySymbol *onlyVifProp = nullptr;
+  const slang::ast::VirtualInterfaceType *onlyVifType = nullptr;
+  bool hasMultipleVifs = false;
+
+  auto considerVifProp = [&](const slang::ast::ClassPropertySymbol &prop,
+                             const slang::ast::VirtualInterfaceType &vifTy) {
+    if (!onlyVifProp && !hasMultipleVifs) {
+      onlyVifProp = &prop;
+      onlyVifType = &vifTy;
+    } else {
+      hasMultipleVifs = true;
+      onlyVifProp = nullptr;
+      onlyVifType = nullptr;
+    }
+
+    if (&vifTy.iface.body.getDefinition() != ifaceDef)
+      return;
+    if (selectedProp && selectedProp != &prop) {
+      selectedProp = nullptr;
+      selectedVifType = nullptr;
+      hasMultipleVifs = true;
+      return;
+    }
+    selectedProp = &prop;
+    selectedVifType = &vifTy;
+  };
+
+  const slang::ast::ClassType *cur = thisClass;
+  while (cur) {
+    for (auto &prop : cur->membersOfType<slang::ast::ClassPropertySymbol>()) {
+      const slang::ast::Type &propTy = prop.getType();
+      auto *vifTy =
+          propTy.getCanonicalType().as_if<slang::ast::VirtualInterfaceType>();
+      if (!vifTy)
+        continue;
+      considerVifProp(prop, *vifTy);
+    }
+    const slang::ast::Type *base = cur->getBaseClass();
+    cur = base ? base->getCanonicalType().as_if<slang::ast::ClassType>() : nullptr;
+  }
+
+  if (!selectedProp) {
+    if (!hasMultipleVifs && onlyVifProp && onlyVifType) {
+      selectedProp = onlyVifProp;
+      selectedVifType = onlyVifType;
+    } else {
+      return failure();
+    }
+  }
+  if (!selectedVifType)
+    return failure();
+
+  auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                   moore::Domain::TwoValued);
+  auto ptrTy = moore::IntType::get(context.getContext(), /*width=*/64,
+                                   moore::Domain::TwoValued);
+
+  Value handleVal;
+  if (selectedProp->lifetime == slang::ast::VariableLifetime::Static) {
+    handleVal = moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0,
+                                          /*isSigned=*/true);
+  } else {
+    handleVal = context.thisStack.back();
+    handleVal =
+        context.materializeConversion(i32Ty, handleVal, /*isSigned=*/false, loc);
+    if (!handleVal)
+      return failure();
+  }
+
+  int32_t fieldId = context.getOrAssignClassFieldId(*selectedProp);
+  Value fieldIdVal =
+      moore::ConstantOp::create(builder, loc, i32Ty, fieldId, /*isSigned=*/true);
+
+  auto getOrCreateExternFunc = [&](StringRef name, FunctionType fnType) {
+    if (auto existing =
+            context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(name)) {
+      if (existing.getFunctionType() != fnType) {
+        mlir::emitError(loc, "conflicting declarations for `") << name << "`";
+        return mlir::func::FuncOp();
+      }
+      return existing;
+    }
+    OpBuilder::InsertionGuard g(context.builder);
+    context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+    context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+    auto fn = mlir::func::FuncOp::create(context.builder, loc, name, fnType);
+    fn.setPrivate();
+    return fn;
+  };
+
+  auto fnType = FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {ptrTy});
+  auto getPtrFn = getOrCreateExternFunc("circt_sv_class_get_ptr", fnType);
+  if (!getPtrFn)
+    return failure();
+  Value ptrVal = mlir::func::CallOp::create(builder, loc, getPtrFn,
+                                            {handleVal, fieldIdVal})
+                     .getResult(0);
+
+  auto ifaceLoweringOr =
+      context.ensureInterfaceLowering(selectedVifType->iface.body, loc);
+  if (failed(ifaceLoweringOr))
+    return failure();
+  auto ifaceType = ifaceLoweringOr.value()->type;
+  Value ifaceVal =
+      mlir::UnrealizedConversionCastOp::create(builder, loc, ifaceType,
+                                               ValueRange{ptrVal})
+          .getResult(0);
+
+  if (selectedVifType->modport) {
+    auto modportAttr =
+        context.lookupInterfaceModport(*selectedVifType->modport, loc);
+    if (failed(modportAttr))
+      return failure();
+    auto modportType =
+        sv::ModportType::get(builder.getContext(), *modportAttr);
+    auto fieldAttr = FlatSymbolRefAttr::get(builder.getContext(),
+                                            selectedVifType->modport->name);
+    ifaceVal = builder
+                   .create<sv::GetModportOp>(loc, modportType, ifaceVal, fieldAttr)
+                   .getResult();
+  }
+
+  return ifaceVal;
 }
 
 /// Map an index into an array, with bounds `range`, to a bit offset of the
@@ -672,7 +840,7 @@ struct ExprVisitor {
         }
 
         if (fragments.empty())
-          return moore::StringConstantOp::create(builder, loc, resultType, "");
+          return materializeStringValue(context, loc, "");
         if (fragments.size() == 1)
           return context.materializeConversion(resultType, fragments[0],
                                                /*isSigned=*/false, loc);
@@ -712,23 +880,9 @@ struct ExprVisitor {
     if (!type)
       return {};
 
-    if (!isLvalue && isVirtualInterfaceType(valueType) &&
-        isClassPropertyExpr(expr.value())) {
-      if (expr.member.as_if<slang::ast::ValueSymbol>()) {
-        if (auto intTy = dyn_cast<moore::IntType>(type))
-          return moore::ConstantOp::create(builder, loc, intTy, /*value=*/0,
-                                           /*isSigned=*/expr.type->isSigned());
-        if (auto strTy = dyn_cast<moore::StringType>(type))
-          return moore::StringConstantOp::create(builder, loc, strTy, "");
-        mlir::emitError(loc, "unsupported virtual interface member type: ")
-            << type;
-        return {};
-      }
-    }
-
-    auto value = convertLvalueOrRvalueExpression(expr.value());
-    if (!value)
-      return {};
+	    auto value = convertLvalueOrRvalueExpression(expr.value());
+	    if (!value)
+	      return {};
 
     auto resultType =
         isLvalue ? moore::RefType::get(cast<moore::UnpackedType>(type)) : type;
@@ -1017,24 +1171,26 @@ struct RvalueExprVisitor : public ExprVisitor {
       }
     }
 
-	    // Lower class property reads via the runtime-backed class object model.
-	    if (auto *prop = expr.symbol.as_if<slang::ast::ClassPropertySymbol>()) {
-	      auto type = context.convertType(*expr.type);
-	      if (!type)
-	        return {};
-	      auto fieldIntType = dyn_cast<moore::IntType>(type);
-	      auto fieldStrType = dyn_cast<moore::StringType>(type);
-	      if (!fieldIntType && !fieldStrType) {
-          // Bring-up: allow elaboration of class properties with constant
-          // initializers (e.g. fixed-size arrays in chapter-18 tests) by
-          // inlining the initializer value.
-          if (const auto *init = prop->getInitializer()) {
-            if (auto initVal = context.convertRvalueExpression(*init, type))
-              return initVal;
-          }
-          mlir::emitError(loc, "unsupported class property type: ") << type;
-          return {};
-	      }
+		    // Lower class property reads via the runtime-backed class object model.
+		    if (auto *prop = expr.symbol.as_if<slang::ast::ClassPropertySymbol>()) {
+		      auto type = context.convertType(*expr.type);
+		      if (!type)
+		        return {};
+		      auto fieldIntType = dyn_cast<moore::IntType>(type);
+		      auto fieldStrType = dyn_cast<moore::StringType>(type);
+		      bool fieldIsIface =
+		          isa<sv::InterfaceType>(type) || isa<sv::ModportType>(type);
+		      if (!fieldIntType && !fieldStrType && !fieldIsIface) {
+	          // Bring-up: allow elaboration of class properties with constant
+	          // initializers (e.g. fixed-size arrays in chapter-18 tests) by
+	          // inlining the initializer value.
+	          if (const auto *init = prop->getInitializer()) {
+	            if (auto initVal = context.convertRvalueExpression(*init, type))
+	              return initVal;
+	          }
+	          mlir::emitError(loc, "unsupported class property type: ") << type;
+	          return {};
+		      }
 
       auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
                                        moore::Domain::TwoValued);
@@ -1083,22 +1239,39 @@ struct RvalueExprVisitor : public ExprVisitor {
         return fn;
       };
 
-	      if (fieldStrType) {
-	        auto fnType =
-	            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {type});
-	        auto fn = getOrCreateExternFunc("circt_sv_class_get_str", fnType);
-	        if (!fn)
-	          return {};
-	        auto call = mlir::func::CallOp::create(builder, loc, fn,
-	                                               {handleVal, fieldIdVal});
-	        return call.getResult(0);
-	      }
+		      if (fieldStrType) {
+		        auto fnType =
+		            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {type});
+		        auto fn = getOrCreateExternFunc("circt_sv_class_get_str", fnType);
+		        if (!fn)
+		          return {};
+		        auto call = mlir::func::CallOp::create(builder, loc, fn,
+		                                               {handleVal, fieldIdVal});
+		        return call.getResult(0);
+		      }
 
-	      auto fnType =
-	          FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
-	      auto fn = getOrCreateExternFunc("circt_sv_class_get_i32", fnType);
-	      if (!fn)
-	        return {};
+		      if (fieldIsIface) {
+		        auto ptrTy = moore::IntType::get(context.getContext(), /*width=*/64,
+		                                         moore::Domain::TwoValued);
+		        auto fnType =
+		            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {ptrTy});
+		        auto fn = getOrCreateExternFunc("circt_sv_class_get_ptr", fnType);
+		        if (!fn)
+		          return {};
+		        Value got =
+		            mlir::func::CallOp::create(builder, loc, fn,
+		                                       {handleVal, fieldIdVal})
+		                .getResult(0);
+		        return mlir::UnrealizedConversionCastOp::create(builder, loc, type,
+		                                                        ValueRange{got})
+		            .getResult(0);
+		      }
+
+		      auto fnType =
+		          FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+		      auto fn = getOrCreateExternFunc("circt_sv_class_get_i32", fnType);
+		      if (!fn)
+		        return {};
 	      auto call =
 	          mlir::func::CallOp::create(builder, loc, fn, {handleVal, fieldIdVal});
 	      Value got = call.getResult(0);
@@ -1110,17 +1283,40 @@ struct RvalueExprVisitor : public ExprVisitor {
 	    }
 
     if (!context.thisStack.empty() && isInterfaceMemberSymbol(expr.symbol)) {
+      if (isLvalue)
+        return Value();
       auto type = context.convertType(*expr.type);
       if (!type)
         return {};
-      if (auto intTy = dyn_cast<moore::IntType>(type))
-        return moore::ConstantOp::create(builder, loc, intTy, /*value=*/0,
-                                         /*isSigned=*/expr.type->isSigned());
-      if (auto strTy = dyn_cast<moore::StringType>(type))
-        return moore::StringConstantOp::create(builder, loc, strTy, "");
-      mlir::emitError(loc, "unsupported virtual interface member type: ")
-          << type;
-      return {};
+      auto *memberSym = expr.symbol.as_if<slang::ast::ValueSymbol>();
+      if (!memberSym)
+        return {};
+
+      auto ifaceValOr =
+          resolveVirtualInterfaceHandleForMember(context, builder, loc, *memberSym);
+      if (failed(ifaceValOr)) {
+        // Best-effort bring-up: if we cannot resolve the virtual interface
+        // handle, fall back to a dummy value so class methods can still
+        // elaborate.
+        if (auto intTy = dyn_cast<moore::IntType>(type))
+          return moore::ConstantOp::create(builder, loc, intTy, /*value=*/0,
+                                           /*isSigned=*/expr.type->isSigned());
+        if (isa<moore::StringType>(type))
+          return materializeStringValue(context, loc, "");
+        mlir::emitError(loc, "unsupported virtual interface member type: ")
+            << type;
+        return {};
+      }
+
+      auto signalAttr = context.lookupInterfaceSignal(*memberSym, loc);
+      if (failed(signalAttr))
+        return {};
+      auto signalType = getInterfaceSignalType(type);
+      Value read = builder.create<sv::ReadInterfaceSignalOp>(
+          loc, signalType, *ifaceValOr, *signalAttr);
+      if (signalType != type)
+        read = context.materializeConversion(type, read, expr.type->isSigned(), loc);
+      return read;
     }
 
     // Otherwise some other part of ImportVerilog should have added an MLIR
@@ -1228,13 +1424,45 @@ struct RvalueExprVisitor : public ExprVisitor {
   Value visit(const slang::ast::AssignmentExpression &expr) {
     // Bring-up shim: slang resolves some virtual interface member accesses
     // (`vif.sig`) to the underlying interface member symbol. When these show up
-    // as direct assignments inside a class method, we cannot currently plumb
-    // the virtual interface handle through the runtime. Stub these stores
-    // (evaluate RHS for side effects, drop the write) so top-executed UVM
-    // benches can elaborate.
+    // as direct assignments inside a class method, resolve them through the
+    // runtime-backed class object model and lower them as interface signal
+    // assignments.
     if (!context.thisStack.empty()) {
       if (auto *named = expr.left().as_if<slang::ast::NamedValueExpression>()) {
         if (isInterfaceMemberSymbol(named->symbol)) {
+          auto *memberSym = named->symbol.as_if<slang::ast::ValueSymbol>();
+          if (memberSym) {
+            auto ifaceValOr = resolveVirtualInterfaceHandleForMember(
+                context, builder, loc, *memberSym);
+            if (succeeded(ifaceValOr)) {
+              auto signalAttr = context.lookupInterfaceSignal(*memberSym, loc);
+              if (failed(signalAttr))
+                return {};
+
+              auto targetType = context.convertType(*named->type);
+              if (!targetType)
+                return {};
+              auto signalType = getInterfaceSignalType(targetType);
+              if (!signalType)
+                return {};
+
+              Value rhs = context.convertRvalueExpression(expr.right(), targetType);
+              if (!rhs)
+                return {};
+              Value assignedValue = rhs;
+
+              rhs = context.materializeConversion(signalType, rhs, false, rhs.getLoc());
+              if (!rhs)
+                return {};
+              builder.create<sv::AssignInterfaceSignalOp>(loc, *ifaceValOr,
+                                                          *signalAttr, rhs);
+              return assignedValue;
+            }
+          }
+
+          // Best-effort bring-up: if we can't resolve the virtual interface
+          // handle, evaluate RHS for side effects and drop the write so
+          // testbenches can elaborate.
           auto targetType = context.convertType(*named->type);
           if (!targetType)
             return {};
@@ -1296,19 +1524,35 @@ struct RvalueExprVisitor : public ExprVisitor {
           return fn;
         };
 
-        if (isa<moore::StringType>(fieldType)) {
-          auto fnType =
-              FunctionType::get(context.getContext(), {i32Ty, i32Ty, fieldType}, {});
-          auto fn = getOrCreateExternFunc("circt_sv_class_set_str", fnType);
-          mlir::func::CallOp::create(builder, loc, fn,
-                                     {handleVal, fieldIdVal, rhs});
-          return assignedValue;
-        }
+	        if (isa<moore::StringType>(fieldType)) {
+	          auto fnType =
+	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, fieldType}, {});
+	          auto fn = getOrCreateExternFunc("circt_sv_class_set_str", fnType);
+	          mlir::func::CallOp::create(builder, loc, fn,
+	                                     {handleVal, fieldIdVal, rhs});
+	          return assignedValue;
+	        }
 
-        auto fieldIntType = dyn_cast<moore::IntType>(fieldType);
-        if (!fieldIntType) {
-          mlir::emitError(loc, "unsupported class property type: ") << fieldType;
-          return {};
+	        if (isa<sv::InterfaceType>(fieldType) || isa<sv::ModportType>(fieldType)) {
+	          auto ptrTy = moore::IntType::get(context.getContext(), /*width=*/64,
+	                                           moore::Domain::TwoValued);
+	          Value rhsPtr = rhs;
+	          if (rhsPtr.getType() != ptrTy)
+	            rhsPtr = mlir::UnrealizedConversionCastOp::create(builder, loc, ptrTy,
+	                                                              ValueRange{rhs})
+	                         .getResult(0);
+	          auto fnType =
+	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, ptrTy}, {});
+	          auto fn = getOrCreateExternFunc("circt_sv_class_set_ptr", fnType);
+	          mlir::func::CallOp::create(builder, loc, fn,
+	                                     {handleVal, fieldIdVal, rhsPtr});
+	          return assignedValue;
+	        }
+
+	        auto fieldIntType = dyn_cast<moore::IntType>(fieldType);
+	        if (!fieldIntType) {
+	          mlir::emitError(loc, "unsupported class property type: ") << fieldType;
+	          return {};
         }
 
         rhs = context.materializeConversion(i32Ty, rhs, prop->getType().isSigned(),
@@ -1378,19 +1622,35 @@ struct RvalueExprVisitor : public ExprVisitor {
           return fn;
         };
 
-        if (isa<moore::StringType>(fieldType)) {
-          auto fnType =
-              FunctionType::get(context.getContext(), {i32Ty, i32Ty, fieldType}, {});
-          auto fn = getOrCreateExternFunc("circt_sv_class_set_str", fnType);
-          mlir::func::CallOp::create(builder, loc, fn,
-                                     {handleVal, fieldIdVal, rhs});
-          return assignedValue;
-        }
+	        if (isa<moore::StringType>(fieldType)) {
+	          auto fnType =
+	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, fieldType}, {});
+	          auto fn = getOrCreateExternFunc("circt_sv_class_set_str", fnType);
+	          mlir::func::CallOp::create(builder, loc, fn,
+	                                     {handleVal, fieldIdVal, rhs});
+	          return assignedValue;
+	        }
 
-        auto fieldIntType = dyn_cast<moore::IntType>(fieldType);
-        if (!fieldIntType) {
-          mlir::emitError(loc, "unsupported class property type: ") << fieldType;
-          return {};
+	        if (isa<sv::InterfaceType>(fieldType) || isa<sv::ModportType>(fieldType)) {
+	          auto ptrTy = moore::IntType::get(context.getContext(), /*width=*/64,
+	                                           moore::Domain::TwoValued);
+	          Value rhsPtr = rhs;
+	          if (rhsPtr.getType() != ptrTy)
+	            rhsPtr = mlir::UnrealizedConversionCastOp::create(builder, loc, ptrTy,
+	                                                              ValueRange{rhs})
+	                         .getResult(0);
+	          auto fnType =
+	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, ptrTy}, {});
+	          auto fn = getOrCreateExternFunc("circt_sv_class_set_ptr", fnType);
+	          mlir::func::CallOp::create(builder, loc, fn,
+	                                     {handleVal, fieldIdVal, rhsPtr});
+	          return assignedValue;
+	        }
+
+	        auto fieldIntType = dyn_cast<moore::IntType>(fieldType);
+	        if (!fieldIntType) {
+	          mlir::emitError(loc, "unsupported class property type: ") << fieldType;
+	          return {};
         }
 
         rhs = context.materializeConversion(i32Ty, rhs,
@@ -1492,25 +1752,10 @@ struct RvalueExprVisitor : public ExprVisitor {
       }
     }
 
-    if (auto *member =
-            expr.left().as_if<slang::ast::MemberAccessExpression>()) {
-      if (member->member.as_if<slang::ast::ValueSymbol>() &&
-          isVirtualInterfaceType(member->value().type) &&
-          isClassPropertyExpr(member->value())) {
-        auto targetType = context.convertType(*member->type);
-        if (!targetType)
-          return {};
-        Value rhs = context.convertRvalueExpression(expr.right(), targetType);
-        if (!rhs)
-          return {};
-        return rhs;
-      }
-    }
-
-    if (auto *member =
-            expr.left().as_if<slang::ast::MemberAccessExpression>()) {
-      auto ifaceValue = context.convertRvalueExpression(member->value());
-      if (ifaceValue && isa<sv::InterfaceType>(ifaceValue.getType())) {
+	    if (auto *member =
+	            expr.left().as_if<slang::ast::MemberAccessExpression>()) {
+	      auto ifaceValue = context.convertRvalueExpression(member->value());
+	      if (ifaceValue && isa<sv::InterfaceType>(ifaceValue.getType())) {
         auto assigned =
             context.assignInterfaceMember(expr.left(), expr.right(), loc);
         if (succeeded(assigned))
@@ -2297,8 +2542,10 @@ struct RvalueExprVisitor : public ExprVisitor {
             const auto &grandSym = grandScope->asSymbol();
             if (grandSym.kind == slang::ast::SymbolKind::Package &&
                 grandSym.name == "uvm_pkg") {
-              for (auto [callArg, declArg] :
-                   llvm::zip(call->arguments(), (**ctorSubroutine).getArguments())) {
+	              Value nameVal;
+	              Value parentVal;
+	              for (auto [callArg, declArg] :
+	                   llvm::zip(call->arguments(), (**ctorSubroutine).getArguments())) {
                 const auto *argExpr = callArg;
                 if (const auto *assign =
                         argExpr->as_if<slang::ast::AssignmentExpression>())
@@ -2311,8 +2558,83 @@ struct RvalueExprVisitor : public ExprVisitor {
                   value = context.convertLvalueExpression(*argExpr);
                 if (!value)
                   return {};
-              }
-              return makeVoidValue();
+	                // Record the component name (first input argument) so UVM
+	                // helpers like `get_full_name()` can return something stable.
+	                if (!nameVal &&
+	                    declArg->direction == slang::ast::ArgumentDirection::In &&
+	                    isa<moore::StringType>(value.getType()))
+	                  nameVal = value;
+	                // Capture the (optional) parent component handle argument for
+	                // component registration shims.
+	                if (!parentVal &&
+	                    declArg->direction == slang::ast::ArgumentDirection::In) {
+	                  if (auto intTy = dyn_cast<moore::IntType>(value.getType()))
+	                    if (intTy.getBitSize() == 32 && value != nameVal)
+	                      parentVal = value;
+	                }
+	              }
+
+	              auto getOrCreateExternFunc = [&](StringRef name,
+	                                               FunctionType fnType) {
+	                if (auto existing =
+	                        context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+	                            name)) {
+	                  if (existing.getFunctionType() != fnType) {
+	                    mlir::emitError(loc, "conflicting declarations for `")
+	                        << name << "`";
+	                    return mlir::func::FuncOp();
+	                  }
+	                  return existing;
+	                }
+	                OpBuilder::InsertionGuard g(context.builder);
+	                context.builder.setInsertionPointToStart(
+	                    context.intoModuleOp.getBody());
+	                context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+	                auto fn = mlir::func::FuncOp::create(context.builder, loc, name,
+	                                                     fnType);
+	                fn.setPrivate();
+	                return fn;
+	              };
+
+	              Value self = context.thisStack.back();
+
+	              if (nameVal) {
+	                auto fnType = FunctionType::get(context.getContext(),
+	                                                {self.getType(),
+	                                                 nameVal.getType()},
+	                                                {});
+	                auto fn =
+	                    getOrCreateExternFunc("circt_uvm_component_set_name", fnType);
+	                if (!fn)
+	                  return {};
+	                builder.create<mlir::func::CallOp>(loc, fn,
+	                                                   ValueRange{self, nameVal});
+	              }
+
+	              // Register UVM components for later phase iteration.
+	              if (parentVal) {
+	                auto i32Ty = moore::IntType::get(context.getContext(),
+	                                                 /*width=*/32,
+	                                                 moore::Domain::TwoValued);
+	                Value selfI32 = context.materializeConversion(
+	                    i32Ty, self, /*isSigned=*/false, loc);
+	                if (!selfI32)
+	                  return {};
+	                Value parentI32 = context.materializeConversion(
+	                    i32Ty, parentVal, /*isSigned=*/false, loc);
+	                if (!parentI32)
+	                  return {};
+	                auto fnType = FunctionType::get(context.getContext(),
+	                                                {i32Ty, i32Ty}, {});
+	                auto fn = getOrCreateExternFunc("circt_uvm_component_register",
+	                                                fnType);
+	                if (!fn)
+	                  return {};
+	                builder.create<mlir::func::CallOp>(
+	                    loc, fn, ValueRange{selfI32, parentI32});
+	              }
+
+	              return makeVoidValue();
             }
           }
         }
@@ -2570,6 +2892,32 @@ struct RvalueExprVisitor : public ExprVisitor {
         return {};
       const auto &parentSym = parentScope->asSymbol();
 
+      // UVM bring-up: avoid lowering the full UVM class library. Treat common
+      // phase callbacks on `uvm_*` base classes as no-ops so user code can call
+      // `super.*_phase()` without pulling in the full implementation.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType) {
+        llvm::StringRef parentName(parentSym.name.data(), parentSym.name.size());
+        llvm::StringRef subName(subroutine->name.data(), subroutine->name.size());
+        if (parentName.starts_with("uvm_") && subName.ends_with("_phase")) {
+          if (const auto *grandScope = parentSym.getParentScope()) {
+            const auto &grandSym = grandScope->asSymbol();
+            if (grandSym.kind == slang::ast::SymbolKind::Package &&
+                grandSym.name == "uvm_pkg") {
+              if (auto *thisExpr = expr.thisClass()) {
+                if (!context.convertRvalueExpression(*thisExpr))
+                  return {};
+              } else if (context.thisStack.empty()) {
+                // Implicit receiver.
+              }
+              for (auto *argExpr : expr.arguments())
+                if (!context.convertRvalueExpression(*argExpr))
+                  return {};
+              return makeVoidValue();
+            }
+          }
+        }
+      }
+
       // uvm_coreservice_t::get()
       if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
           parentSym.name == "uvm_coreservice_t" && subroutine->name == "get") {
@@ -2649,12 +2997,913 @@ struct RvalueExprVisitor : public ExprVisitor {
             return {};
         }
 
+        // Minimal UVM scheduler shim: run build_phase + connect_phase +
+        // run_phase for all registered components, then mark phases done.
+        auto ensureRunAllPhases = [&]() -> mlir::func::FuncOp {
+          StringRef shimName = "circt_uvm_run_all_phases";
+          if (auto existing =
+                  context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(shimName))
+            return existing;
+
+	          auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+	                                           moore::Domain::TwoValued);
+
+	          auto buildPhaseDispatch = [&](StringRef methodName,
+	                                        StringRef fnName)
+	              -> mlir::func::FuncOp {
+	            if (auto existing =
+	                    context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
+	              return existing;
+
+	            SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+	            for (auto [cls, classId] : context.classIds) {
+	              if (!cls)
+	                continue;
+	              llvm::StringRef clsName(cls->name.data(), cls->name.size());
+	              if (clsName.starts_with("uvm_"))
+	                continue;
+		              const slang::ast::SubroutineSymbol *impl = nullptr;
+		              for (auto &method :
+		                   cls->membersOfType<slang::ast::SubroutineSymbol>()) {
+		                if (llvm::StringRef(method.name.data(), method.name.size()) ==
+		                    methodName) {
+		                  impl = &method;
+		                  break;
+		                }
+		              }
+	              if (!impl)
+	                continue;
+	              if (failed(context.convertFunction(*impl)))
+	                continue;
+	              auto *implLowering = context.declareFunction(*impl);
+	              if (!implLowering || !implLowering->op)
+	                continue;
+	              impls.push_back({classId, implLowering->op});
+	            }
+
+	            auto fnTy =
+	                FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+
+	            OpBuilder::InsertionGuard g(context.builder);
+	            context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+	            context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+	            auto dispatchFn =
+	                mlir::func::FuncOp::create(context.builder, loc, fnName, fnTy);
+	            dispatchFn.setPrivate();
+	            context.symbolTable.insert(dispatchFn);
+
+	            auto &entry = dispatchFn.getBody().emplaceBlock();
+	            for (auto ty : fnTy.getInputs())
+	              entry.addArgument(ty, loc);
+
+	            OpBuilder b(context.getContext());
+	            b.setInsertionPointToStart(&entry);
+	            if (impls.empty()) {
+	              mlir::func::ReturnOp::create(b, loc);
+	              return dispatchFn;
+	            }
+
+	            Value thisArg = entry.getArgument(0);
+	            auto getTypeFnTy = FunctionType::get(context.getContext(),
+	                                                 {thisArg.getType()},
+	                                                 {thisArg.getType()});
+	            auto getTypeFn =
+	                getOrCreateExternFunc("circt_sv_class_get_type", getTypeFnTy);
+	            if (!getTypeFn)
+	              return mlir::func::FuncOp();
+	            Value dynType =
+	                mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg})
+	                    .getResult(0);
+
+	            Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
+	            SmallVector<Block *> checkBlocks;
+	            SmallVector<Block *> caseBlocks;
+	            checkBlocks.reserve(impls.size());
+	            caseBlocks.reserve(impls.size());
+	            for (size_t i = 0, e = impls.size(); i < e; ++i) {
+	              checkBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+	              caseBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+	            }
+
+	            b.setInsertionPointToEnd(&entry);
+	            mlir::cf::BranchOp::create(b, loc,
+	                                       checkBlocks.empty() ? defaultBlock
+	                                                           : checkBlocks.front());
+
+	            b.setInsertionPointToStart(defaultBlock);
+	            mlir::func::ReturnOp::create(b, loc);
+
+	            auto cmpTy = moore::IntType::get(
+	                context.getContext(), /*width=*/32,
+	                cast<moore::IntType>(thisArg.getType()).getDomain());
+	            for (size_t i = 0, e = impls.size(); i < e; ++i) {
+	              auto [classId, implFn] = impls[i];
+	              Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
+
+	              b.setInsertionPointToStart(checkBlocks[i]);
+	              Value classIdVal = moore::ConstantOp::create(
+	                  b, loc, cmpTy, classId, /*isSigned=*/true);
+	              Value eq = b.createOrFold<moore::EqOp>(loc, dynType, classIdVal);
+	              eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+	              Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+	              mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i], next);
+
+	              b.setInsertionPointToStart(caseBlocks[i]);
+	              mlir::func::CallOp::create(b, loc, implFn, entry.getArguments());
+	              mlir::func::ReturnOp::create(b, loc);
+	            }
+
+	            return dispatchFn;
+	          };
+
+	          mlir::func::FuncOp buildFn =
+	              buildPhaseDispatch("build_phase",
+	                                 "__circt_uvm_dispatch_build_phase");
+	          mlir::func::FuncOp connectFn =
+	              buildPhaseDispatch("connect_phase",
+	                                 "__circt_uvm_dispatch_connect_phase");
+	          mlir::func::FuncOp runFn =
+	              buildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase");
+
+	          OpBuilder::InsertionGuard g(context.builder);
+	          context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+          context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+          auto fnType = FunctionType::get(context.getContext(), {}, {});
+          auto shimFn =
+              mlir::func::FuncOp::create(context.builder, loc, shimName, fnType);
+          shimFn.setPrivate();
+          context.symbolTable.insert(shimFn);
+
+          auto &entry = shimFn.getBody().emplaceBlock();
+          auto &buildCond = shimFn.getBody().emplaceBlock();
+          buildCond.addArgument(i32Ty, loc);
+          auto &buildBody = shimFn.getBody().emplaceBlock();
+          buildBody.addArgument(i32Ty, loc);
+          auto &connectCond = shimFn.getBody().emplaceBlock();
+          connectCond.addArgument(i32Ty, loc);
+          auto &connectBody = shimFn.getBody().emplaceBlock();
+          connectBody.addArgument(i32Ty, loc);
+          auto &runCond = shimFn.getBody().emplaceBlock();
+          runCond.addArgument(i32Ty, loc);
+          auto &runBody = shimFn.getBody().emplaceBlock();
+          runBody.addArgument(i32Ty, loc);
+          auto &finish = shimFn.getBody().emplaceBlock();
+
+          OpBuilder b(context.getContext());
+          b.setInsertionPointToStart(&entry);
+
+          Value zero = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/0,
+                                                /*isSigned=*/true);
+          Value one = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/1,
+                                               /*isSigned=*/true);
+
+          auto countFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
+          auto countFn =
+              getOrCreateExternFunc("circt_uvm_component_count", countFnTy);
+          if (!countFn)
+            return mlir::func::FuncOp();
+
+          auto getFnTy =
+              FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+          auto getFn =
+              getOrCreateExternFunc("circt_uvm_component_get", getFnTy);
+          if (!getFn)
+            return mlir::func::FuncOp();
+
+          mlir::cf::BranchOp::create(b, loc, &buildCond, ValueRange{zero});
+
+          // build_phase loop (recompute component_count each iteration so
+          // components created during build are visited too).
+          b.setInsertionPointToStart(&buildCond);
+          Value bIdx = buildCond.getArgument(0);
+          Value bCount =
+              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+          Value bLt = moore::UltOp::create(b, loc, bIdx, bCount);
+          Value bCond = moore::ToBuiltinBoolOp::create(b, loc, bLt);
+          mlir::cf::CondBranchOp::create(b, loc, bCond, &buildBody,
+                                         ValueRange{bIdx}, &connectCond,
+                                         ValueRange{zero});
+
+          b.setInsertionPointToStart(&buildBody);
+          Value bBodyIdx = buildBody.getArgument(0);
+          Value bComp =
+              mlir::func::CallOp::create(b, loc, getFn, ValueRange{bBodyIdx})
+                  .getResult(0);
+          if (buildFn)
+            mlir::func::CallOp::create(b, loc, buildFn, ValueRange{bComp, zero});
+          Value bNext = moore::AddOp::create(b, loc, bBodyIdx, one);
+          mlir::cf::BranchOp::create(b, loc, &buildCond, ValueRange{bNext});
+
+          // connect_phase loop
+          b.setInsertionPointToStart(&connectCond);
+          Value cIdx = connectCond.getArgument(0);
+          Value cCount =
+              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+          Value cLt = moore::UltOp::create(b, loc, cIdx, cCount);
+          Value cCond = moore::ToBuiltinBoolOp::create(b, loc, cLt);
+          mlir::cf::CondBranchOp::create(b, loc, cCond, &connectBody,
+                                         ValueRange{cIdx}, &runCond,
+                                         ValueRange{zero});
+
+          b.setInsertionPointToStart(&connectBody);
+          Value cBodyIdx = connectBody.getArgument(0);
+          Value comp = mlir::func::CallOp::create(b, loc, getFn,
+                                                  ValueRange{cBodyIdx})
+                           .getResult(0);
+          if (connectFn)
+            mlir::func::CallOp::create(b, loc, connectFn, ValueRange{comp, zero});
+          Value cNext = moore::AddOp::create(b, loc, cBodyIdx, one);
+          mlir::cf::BranchOp::create(b, loc, &connectCond, ValueRange{cNext});
+
+          // run_phase loop
+          b.setInsertionPointToStart(&runCond);
+          Value rIdx = runCond.getArgument(0);
+          Value rCount =
+              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+          Value rLt = moore::UltOp::create(b, loc, rIdx, rCount);
+          Value rCond = moore::ToBuiltinBoolOp::create(b, loc, rLt);
+          mlir::cf::CondBranchOp::create(b, loc, rCond, &runBody,
+                                         ValueRange{rIdx}, &finish, ValueRange{});
+
+          b.setInsertionPointToStart(&runBody);
+          Value rBodyIdx = runBody.getArgument(0);
+          Value rComp = mlir::func::CallOp::create(b, loc, getFn,
+                                                   ValueRange{rBodyIdx})
+                            .getResult(0);
+          if (runFn)
+            mlir::func::CallOp::create(b, loc, runFn, ValueRange{rComp, zero});
+          Value rNext = moore::AddOp::create(b, loc, rBodyIdx, one);
+          mlir::cf::BranchOp::create(b, loc, &runCond, ValueRange{rNext});
+
+          b.setInsertionPointToStart(&finish);
+          mlir::func::ReturnOp::create(b, loc);
+
+          return shimFn;
+        };
+
         auto fnType = FunctionType::get(context.getContext(),
                                         {self.getType(), nameArg.getType()}, {});
         auto fn = getOrCreateExternFunc("circt_uvm_root_run_test", fnType);
         if (!fn)
           return {};
         builder.create<mlir::func::CallOp>(loc, fn, ValueRange{self, nameArg});
+
+        auto phasesFn = ensureRunAllPhases();
+        if (phasesFn)
+          mlir::func::CallOp::create(builder, loc, phasesFn, ValueRange{});
+        return makeVoidValue();
+      }
+
+      // uvm_*_registry#(...)::create(...)
+      //
+      // The UVM factory/registry stack is class-heavy and not yet lowered.
+      // For bring-up, lower `type_id::create` calls directly to a `new` of the
+      // requested return type.
+      if ((parentSym.kind == slang::ast::SymbolKind::ClassType ||
+           parentSym.kind == slang::ast::SymbolKind::GenericClassDef) &&
+          subroutine->name == "create") {
+        llvm::StringRef parentName(parentSym.name.data(), parentSym.name.size());
+        if (parentName.starts_with("uvm_") && parentName.ends_with("_registry")) {
+          if (const auto *grandScope = parentSym.getParentScope()) {
+            const auto &grandSym = grandScope->asSymbol();
+            if (grandSym.kind == slang::ast::SymbolKind::Package &&
+                grandSym.name == "uvm_pkg") {
+              const auto *retCls =
+                  expr.type ? expr.type->getCanonicalType()
+                                  .as_if<slang::ast::ClassType>()
+                            : nullptr;
+              if (!retCls) {
+                mlir::emitError(loc,
+                                "unsupported `create` result type; expected class");
+                return {};
+              }
+
+              auto resultType = context.convertType(*expr.type);
+              if (!resultType)
+                return {};
+              auto intType = dyn_cast<moore::IntType>(resultType);
+              if (!intType) {
+                mlir::emitError(loc,
+                                "unsupported `create` result type; expected int")
+                    << resultType;
+                return {};
+              }
+
+              auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                               moore::Domain::TwoValued);
+
+              int32_t classId = context.getOrAssignClassId(*retCls);
+              Value classIdVal = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                           classId,
+                                                           /*isSigned=*/true);
+
+              auto allocType =
+                  FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+              auto allocFn =
+                  getOrCreateExternFunc("circt_sv_class_alloc", allocType);
+              if (!allocFn)
+                return {};
+              Value handle =
+                  mlir::func::CallOp::create(builder, loc, allocFn, {classIdVal})
+                      .getResult(0);
+              Value handleTyped = context.materializeConversion(
+                  intType, handle, /*isSigned=*/false, loc);
+              if (!handleTyped)
+                return {};
+
+              const slang::ast::SubroutineSymbol *ctor = nullptr;
+              for (auto &method :
+                   retCls->membersOfType<slang::ast::SubroutineSymbol>()) {
+                if (llvm::StringRef(method.name.data(), method.name.size()) ==
+                    "new") {
+                  ctor = &method;
+                  break;
+                }
+              }
+
+              if (!ctor) {
+                mlir::emitError(loc, "missing constructor for `create` result");
+                return {};
+              }
+
+              if (failed(context.convertFunction(*ctor)))
+                return {};
+              auto *ctorLowering = context.declareFunction(*ctor);
+              if (!ctorLowering || !ctorLowering->op) {
+                mlir::emitError(loc, "missing constructor lowering for `")
+                    << ctor->name << "`";
+                return {};
+              }
+
+              auto fnTy = ctorLowering->op.getFunctionType();
+              if (fnTy.getNumInputs() < 1) {
+                mlir::emitError(loc, "invalid constructor type for `create`");
+                return {};
+              }
+
+              SmallVector<Value> args;
+              args.reserve(fnTy.getNumInputs());
+
+              Value thisVal = context.materializeConversion(
+                  fnTy.getInput(0), handle, /*isSigned=*/false, loc);
+              if (!thisVal)
+                return {};
+              args.push_back(thisVal);
+
+              auto ctorArgs = ctor->getArguments();
+              auto callArgs = expr.arguments();
+              if (fnTy.getNumInputs() != 1 + ctorArgs.size()) {
+                mlir::emitError(loc, "constructor signature mismatch for `create`");
+                return {};
+              }
+
+              auto emptyString = [&]() -> Value {
+                auto strType = moore::StringType::get(context.getContext());
+                auto i8Ty = moore::IntType::get(context.getContext(), /*width=*/8,
+                                                moore::Domain::TwoValued);
+                Value raw =
+                    moore::StringConstantOp::create(builder, loc, i8Ty, "")
+                        .getResult();
+                return moore::ConversionOp::create(builder, loc, strType, raw);
+              };
+
+              for (size_t i = 0, e = ctorArgs.size(); i < e; ++i) {
+                auto expectedTy = fnTy.getInput(1 + i);
+                Value value;
+                if (i < callArgs.size()) {
+                  const auto *argExpr = callArgs[i];
+                  if (const auto *assign =
+                          argExpr->as_if<slang::ast::AssignmentExpression>())
+                    argExpr = &assign->left();
+
+                  if (ctorArgs[i]->direction == slang::ast::ArgumentDirection::In)
+                    value = context.convertRvalueExpression(*argExpr);
+                  else
+                    value = context.convertLvalueExpression(*argExpr);
+                  if (!value)
+                    return {};
+                  value = context.materializeConversion(expectedTy, value,
+                                                        /*isSigned=*/false, loc);
+                  if (!value)
+                    return {};
+                } else if (isa<moore::StringType>(expectedTy)) {
+                  value = emptyString();
+                } else if (auto expectedIntTy = dyn_cast<moore::IntType>(expectedTy)) {
+                  value = moore::ConstantOp::create(builder, loc, expectedIntTy,
+                                                    /*value=*/0,
+                                                    /*isSigned=*/true);
+                } else {
+                  mlir::emitError(loc, "unsupported default constructor arg type: ")
+                      << expectedTy;
+                  return {};
+                }
+                args.push_back(value);
+              }
+
+              mlir::func::CallOp::create(builder, loc, ctorLowering->op, args);
+              return handleTyped;
+            }
+          }
+        }
+      }
+
+      // uvm_port_base::connect(...)
+      //
+      // The full TLM connectivity machinery pulls in a large portion of the
+      // UVM library. For bring-up, keep a minimal connection model so
+      // analysis-port-based tests can execute end-to-end.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_port_base" && subroutine->name == "connect") {
+        Value self;
+        if (auto *thisExpr = expr.thisClass()) {
+          self = context.convertRvalueExpression(*thisExpr);
+        } else if (!context.thisStack.empty()) {
+          self = context.thisStack.back();
+        } else {
+          mlir::emitError(loc, "missing `this` for `uvm_port_base::connect`");
+          return {};
+        }
+        if (!self)
+          return {};
+
+        if (expr.arguments().empty())
+          return makeVoidValue();
+
+        Value other = context.convertRvalueExpression(*expr.arguments().front());
+        if (!other)
+          return {};
+        for (size_t i = 1, e = expr.arguments().size(); i < e; ++i)
+          if (!context.convertRvalueExpression(*expr.arguments()[i]))
+            return {};
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        self =
+            context.materializeConversion(i32Ty, self, /*isSigned=*/false, loc);
+        other = context.materializeConversion(i32Ty, other,
+                                              /*isSigned=*/false, loc);
+        if (!self || !other)
+          return {};
+        auto fnType =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+        auto fn = getOrCreateExternFunc("circt_uvm_port_connect", fnType);
+        if (!fn)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, fn, ValueRange{self, other});
+        return makeVoidValue();
+      }
+
+      // uvm_analysis_imp#(T, IMP)::new(string name, IMP imp)
+      //
+      // Capture the implementation pointer for minimal analysis_port delivery.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_analysis_imp" && subroutine->name == "new") {
+        if (expr.arguments().size() > 2) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_analysis_imp::new`: expected "
+                          "0 to 2 argument(s), got ")
+              << expr.arguments().size();
+          return {};
+        }
+        auto *thisExpr = expr.thisClass();
+        if (!thisExpr) {
+          mlir::emitError(loc, "missing `this` for `uvm_analysis_imp::new`");
+          return {};
+        }
+        Value self = context.convertRvalueExpression(*thisExpr);
+        if (!self)
+          return {};
+        if (!expr.arguments().empty())
+          if (!context.convertRvalueExpression(*expr.arguments()[0]))
+            return {};
+        if (expr.arguments().size() < 2)
+          return makeVoidValue();
+        Value impl = context.convertRvalueExpression(*expr.arguments()[1]);
+        if (!impl)
+          return {};
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        self =
+            context.materializeConversion(i32Ty, self, /*isSigned=*/false, loc);
+        impl =
+            context.materializeConversion(i32Ty, impl, /*isSigned=*/false, loc);
+        if (!self || !impl)
+          return {};
+
+        auto fnType =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+        auto fn = getOrCreateExternFunc("circt_uvm_analysis_imp_set_impl", fnType);
+        if (!fn)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, fn, ValueRange{self, impl});
+        return makeVoidValue();
+      }
+
+      // uvm_analysis_port#(T)::write(T t)
+      //
+      // Lower to a minimal runtime-backed analysis-port delivery shim rather
+      // than pulling in the full UVM TLM stack.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_analysis_port" && subroutine->name == "write") {
+        if (expr.arguments().size() != 1) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_analysis_port::write`: "
+                          "expected 1 argument, got ")
+              << expr.arguments().size();
+          return {};
+        }
+        Value self;
+        if (auto *thisExpr = expr.thisClass()) {
+          self = context.convertRvalueExpression(*thisExpr);
+        } else if (!context.thisStack.empty()) {
+          self = context.thisStack.back();
+        } else {
+          mlir::emitError(loc, "missing `this` for `uvm_analysis_port::write`");
+          return {};
+        }
+        if (!self)
+          return {};
+
+        Value item = context.convertRvalueExpression(*expr.arguments().front());
+        if (!item)
+          return {};
+
+        auto ensureAnalysisWriteSupport = [&]() -> mlir::func::FuncOp {
+          StringRef portWriteName = "__circt_uvm_analysis_port_write";
+          if (auto existing =
+                  context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+                      portWriteName))
+            return existing;
+
+          auto i32Ty =
+              moore::IntType::get(context.getContext(), /*width=*/32,
+                                  moore::Domain::TwoValued);
+
+          auto getClassId = [&](StringRef name) -> int32_t {
+            for (auto [cls, classId] : context.classIds) {
+              if (!cls)
+                continue;
+              if (llvm::StringRef(cls->name.data(), cls->name.size()) == name)
+                return classId;
+            }
+            return 0;
+          };
+
+          int32_t analysisPortId = getClassId("uvm_analysis_port");
+          int32_t analysisImpId = getClassId("uvm_analysis_imp");
+
+          auto buildWriteDispatch = [&]() -> mlir::func::FuncOp {
+            StringRef fnName = "__circt_uvm_dispatch_analysis_write";
+            if (auto existing =
+                    context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
+              return existing;
+
+            SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+            for (auto [cls, classId] : context.classIds) {
+              if (!cls)
+                continue;
+              llvm::StringRef clsName(cls->name.data(), cls->name.size());
+              if (clsName.starts_with("uvm_"))
+                continue;
+              const slang::ast::SubroutineSymbol *impl = nullptr;
+              for (auto &method :
+                   cls->membersOfType<slang::ast::SubroutineSymbol>()) {
+                if (llvm::StringRef(method.name.data(), method.name.size()) ==
+                    "write") {
+                  impl = &method;
+                  break;
+                }
+              }
+              if (!impl)
+                continue;
+              if (failed(context.convertFunction(*impl)))
+                continue;
+              auto *implLowering = context.declareFunction(*impl);
+              if (!implLowering || !implLowering->op)
+                continue;
+
+              auto implTy = implLowering->op.getFunctionType();
+              if (implTy.getNumInputs() != 2 || implTy.getNumResults() != 0)
+                continue;
+              if (implTy.getInput(0) != i32Ty || implTy.getInput(1) != i32Ty)
+                continue;
+
+              impls.push_back({classId, implLowering->op});
+            }
+
+            auto fnTy =
+                FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+
+            OpBuilder::InsertionGuard g(context.builder);
+            context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+            context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+            auto dispatchFn =
+                mlir::func::FuncOp::create(context.builder, loc, fnName, fnTy);
+            dispatchFn.setPrivate();
+            context.symbolTable.insert(dispatchFn);
+
+            auto &entry = dispatchFn.getBody().emplaceBlock();
+            for (auto ty : fnTy.getInputs())
+              entry.addArgument(ty, loc);
+
+            OpBuilder b(context.getContext());
+            b.setInsertionPointToStart(&entry);
+            if (impls.empty()) {
+              mlir::func::ReturnOp::create(b, loc);
+              return dispatchFn;
+            }
+
+            Value thisArg = entry.getArgument(0);
+            auto getTypeFnTy = FunctionType::get(context.getContext(),
+                                                 {thisArg.getType()},
+                                                 {thisArg.getType()});
+            auto getTypeFn =
+                getOrCreateExternFunc("circt_sv_class_get_type", getTypeFnTy);
+            if (!getTypeFn)
+              return mlir::func::FuncOp();
+            Value dynType =
+                mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg})
+                    .getResult(0);
+
+            Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
+            SmallVector<Block *> checkBlocks;
+            SmallVector<Block *> caseBlocks;
+            checkBlocks.reserve(impls.size());
+            caseBlocks.reserve(impls.size());
+            for (size_t i = 0, e = impls.size(); i < e; ++i) {
+              checkBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+              caseBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+            }
+
+            b.setInsertionPointToEnd(&entry);
+            mlir::cf::BranchOp::create(b, loc,
+                                       checkBlocks.empty() ? defaultBlock
+                                                           : checkBlocks.front());
+
+            b.setInsertionPointToStart(defaultBlock);
+            mlir::func::ReturnOp::create(b, loc);
+
+            for (size_t i = 0, e = impls.size(); i < e; ++i) {
+              auto [classId, implFn] = impls[i];
+              Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
+
+              b.setInsertionPointToStart(checkBlocks[i]);
+              Value classIdVal = moore::ConstantOp::create(
+                  b, loc, i32Ty, classId, /*isSigned=*/true);
+              Value eq = b.createOrFold<moore::EqOp>(loc, dynType, classIdVal);
+              eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+              Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+              mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i], next);
+
+              b.setInsertionPointToStart(caseBlocks[i]);
+              mlir::func::CallOp::create(b, loc, implFn, entry.getArguments());
+              mlir::func::ReturnOp::create(b, loc);
+            }
+
+            return dispatchFn;
+          };
+
+          mlir::func::FuncOp writeDispatch = buildWriteDispatch();
+
+          auto buildImpWrite = [&]() -> mlir::func::FuncOp {
+            StringRef fnName = "__circt_uvm_analysis_imp_write";
+            if (auto existing =
+                    context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
+              return existing;
+
+            auto fnTy =
+                FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+
+            OpBuilder::InsertionGuard g(context.builder);
+            context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+            context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+            auto fn = mlir::func::FuncOp::create(context.builder, loc, fnName, fnTy);
+            fn.setPrivate();
+            context.symbolTable.insert(fn);
+
+            auto &entry = fn.getBody().emplaceBlock();
+            for (auto ty : fnTy.getInputs())
+              entry.addArgument(ty, loc);
+
+            OpBuilder b(context.getContext());
+            b.setInsertionPointToStart(&entry);
+            Value imp = entry.getArgument(0);
+            Value item = entry.getArgument(1);
+
+            auto getImplFnTy =
+                FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+            auto getImplFn =
+                getOrCreateExternFunc("circt_uvm_analysis_imp_get_impl", getImplFnTy);
+            if (!getImplFn)
+              return mlir::func::FuncOp();
+            Value impl =
+                mlir::func::CallOp::create(b, loc, getImplFn, {imp}).getResult(0);
+
+            if (writeDispatch)
+              mlir::func::CallOp::create(b, loc, writeDispatch, {impl, item});
+            mlir::func::ReturnOp::create(b, loc);
+            return fn;
+          };
+
+          mlir::func::FuncOp impWrite = buildImpWrite();
+
+          auto fnTy = FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+
+          OpBuilder::InsertionGuard g(context.builder);
+          context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+          context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+          auto portWrite =
+              mlir::func::FuncOp::create(context.builder, loc, portWriteName, fnTy);
+          portWrite.setPrivate();
+          context.symbolTable.insert(portWrite);
+
+          auto &entry = portWrite.getBody().emplaceBlock();
+          for (auto ty : fnTy.getInputs())
+            entry.addArgument(ty, loc);
+
+          auto &whileCond = portWrite.getBody().emplaceBlock();
+          auto &whileBody = portWrite.getBody().emplaceBlock();
+          auto &connCond = portWrite.getBody().emplaceBlock();
+          connCond.addArgument(i32Ty, loc);
+          connCond.addArgument(i32Ty, loc);
+          connCond.addArgument(i32Ty, loc);
+          auto &connBody = portWrite.getBody().emplaceBlock();
+          connBody.addArgument(i32Ty, loc);
+          connBody.addArgument(i32Ty, loc);
+          connBody.addArgument(i32Ty, loc);
+          auto &checkPort = portWrite.getBody().emplaceBlock();
+          auto &doImp = portWrite.getBody().emplaceBlock();
+          auto &doPort = portWrite.getBody().emplaceBlock();
+          auto &doDefault = portWrite.getBody().emplaceBlock();
+          auto &connCont = portWrite.getBody().emplaceBlock();
+          auto &connDone = portWrite.getBody().emplaceBlock();
+          auto &finish = portWrite.getBody().emplaceBlock();
+
+          OpBuilder b(context.getContext());
+          b.setInsertionPointToStart(&entry);
+
+          Value port = entry.getArgument(0);
+          Value itemArg = entry.getArgument(1);
+
+          Value zero = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/0,
+                                                /*isSigned=*/true);
+          Value one = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/1,
+                                               /*isSigned=*/true);
+
+          auto qAllocTy = FunctionType::get(context.getContext(), {}, {i32Ty});
+          auto qAllocFn =
+              getOrCreateExternFunc("circt_sv_queue_alloc_i32", qAllocTy);
+          if (!qAllocFn)
+            return mlir::func::FuncOp();
+          Value q = mlir::func::CallOp::create(b, loc, qAllocFn, ValueRange{})
+                        .getResult(0);
+
+          auto qPushTy =
+              FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+          auto qPushFn =
+              getOrCreateExternFunc("circt_sv_queue_push_back_i32", qPushTy);
+          if (!qPushFn)
+            return mlir::func::FuncOp();
+          mlir::func::CallOp::create(b, loc, qPushFn, {q, port});
+
+          mlir::cf::BranchOp::create(b, loc, &whileCond, ValueRange{});
+
+          b.setInsertionPointToStart(&whileCond);
+          auto qSizeTy =
+              FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+          auto qSizeFn =
+              getOrCreateExternFunc("circt_sv_queue_size_i32", qSizeTy);
+          if (!qSizeFn)
+            return mlir::func::FuncOp();
+          Value qSize =
+              mlir::func::CallOp::create(b, loc, qSizeFn, {q}).getResult(0);
+          Value eqZero = b.createOrFold<moore::EqOp>(loc, qSize, zero);
+          eqZero = b.createOrFold<moore::BoolCastOp>(loc, eqZero);
+          Value empty = moore::ToBuiltinBoolOp::create(b, loc, eqZero);
+          mlir::cf::CondBranchOp::create(b, loc, empty, &finish, ValueRange{},
+                                         &whileBody, ValueRange{});
+
+          b.setInsertionPointToStart(&whileBody);
+          auto qPopTy =
+              FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+          auto qPopFn =
+              getOrCreateExternFunc("circt_sv_queue_pop_front_i32", qPopTy);
+          if (!qPopFn)
+            return mlir::func::FuncOp();
+          Value cur =
+              mlir::func::CallOp::create(b, loc, qPopFn, {q}).getResult(0);
+
+          auto countFnTy =
+              FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+          auto countFn =
+              getOrCreateExternFunc("circt_uvm_port_conn_count", countFnTy);
+          if (!countFn)
+            return mlir::func::FuncOp();
+          Value count =
+              mlir::func::CallOp::create(b, loc, countFn, {cur}).getResult(0);
+
+          mlir::cf::BranchOp::create(b, loc, &connCond,
+                                     ValueRange{zero, cur, count});
+
+          b.setInsertionPointToStart(&connCond);
+          Value idx = connCond.getArgument(0);
+          Value connPort = connCond.getArgument(1);
+          Value connCount = connCond.getArgument(2);
+          Value lt = moore::UltOp::create(b, loc, idx, connCount);
+          Value ltCond = moore::ToBuiltinBoolOp::create(b, loc, lt);
+          mlir::cf::CondBranchOp::create(
+              b, loc, ltCond, &connBody, ValueRange{idx, connPort, connCount},
+              &connDone, ValueRange{});
+
+          b.setInsertionPointToStart(&connBody);
+          Value bodyIdx = connBody.getArgument(0);
+          Value bodyPort = connBody.getArgument(1);
+          Value bodyCount = connBody.getArgument(2);
+          auto getFnTy =
+              FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+          auto getFn = getOrCreateExternFunc("circt_uvm_port_conn_get", getFnTy);
+          if (!getFn)
+            return mlir::func::FuncOp();
+          Value dest =
+              mlir::func::CallOp::create(b, loc, getFn, {bodyPort, bodyIdx})
+                  .getResult(0);
+
+          auto getTypeFnTy =
+              FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+          auto getTypeFn =
+              getOrCreateExternFunc("circt_sv_class_get_type", getTypeFnTy);
+          if (!getTypeFn)
+            return mlir::func::FuncOp();
+          Value destType =
+              mlir::func::CallOp::create(b, loc, getTypeFn, {dest}).getResult(0);
+
+          if (analysisImpId != 0) {
+            Value classIdVal = moore::ConstantOp::create(
+                b, loc, i32Ty, analysisImpId, /*isSigned=*/true);
+            Value eq = b.createOrFold<moore::EqOp>(loc, destType, classIdVal);
+            eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+            Value isImp = moore::ToBuiltinBoolOp::create(b, loc, eq);
+            mlir::cf::CondBranchOp::create(b, loc, isImp, &doImp, ValueRange{},
+                                           &checkPort, ValueRange{});
+          } else {
+            mlir::cf::BranchOp::create(b, loc, &checkPort, ValueRange{});
+          }
+
+          b.setInsertionPointToStart(&doImp);
+          if (impWrite)
+            mlir::func::CallOp::create(b, loc, impWrite, {dest, itemArg});
+          mlir::cf::BranchOp::create(b, loc, &connCont, ValueRange{});
+
+          b.setInsertionPointToStart(&checkPort);
+          if (analysisPortId != 0) {
+            Value classIdVal = moore::ConstantOp::create(
+                b, loc, i32Ty, analysisPortId, /*isSigned=*/true);
+            Value eq = b.createOrFold<moore::EqOp>(loc, destType, classIdVal);
+            eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+            Value isPort = moore::ToBuiltinBoolOp::create(b, loc, eq);
+            mlir::cf::CondBranchOp::create(b, loc, isPort, &doPort, ValueRange{},
+                                           &doDefault, ValueRange{});
+          } else {
+            mlir::cf::BranchOp::create(b, loc, &doDefault, ValueRange{});
+          }
+
+          b.setInsertionPointToStart(&doPort);
+          mlir::func::CallOp::create(b, loc, qPushFn, {q, dest});
+          mlir::cf::BranchOp::create(b, loc, &connCont, ValueRange{});
+
+          b.setInsertionPointToStart(&doDefault);
+          if (writeDispatch)
+            mlir::func::CallOp::create(b, loc, writeDispatch, {dest, itemArg});
+          mlir::cf::BranchOp::create(b, loc, &connCont, ValueRange{});
+
+          b.setInsertionPointToStart(&connCont);
+          Value next = moore::AddOp::create(b, loc, bodyIdx, one);
+          mlir::cf::BranchOp::create(b, loc, &connCond,
+                                     ValueRange{next, bodyPort, bodyCount});
+
+          b.setInsertionPointToStart(&connDone);
+          mlir::cf::BranchOp::create(b, loc, &whileCond, ValueRange{});
+
+          b.setInsertionPointToStart(&finish);
+          mlir::func::ReturnOp::create(b, loc);
+
+          return portWrite;
+        };
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        self =
+            context.materializeConversion(i32Ty, self, /*isSigned=*/false, loc);
+        item =
+            context.materializeConversion(i32Ty, item, /*isSigned=*/false, loc);
+        if (!self || !item)
+          return {};
+
+        auto portWrite = ensureAnalysisWriteSupport();
+        if (!portWrite)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, portWrite, ValueRange{self, item});
         return makeVoidValue();
       }
 
@@ -2664,6 +3913,42 @@ struct RvalueExprVisitor : public ExprVisitor {
       // the UVM class library and exercises many not-yet-supported runtime
       // features. For bring-up, accept the call as a no-op so top-level
       // elaboration can proceed without lowering the full constructor body.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_component" &&
+          subroutine->name == "get_full_name") {
+        if (!expr.arguments().empty()) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_component::get_full_name`: "
+                          "expected 0 arguments, got ")
+              << expr.arguments().size();
+          return {};
+        }
+        Value self;
+        if (auto *thisExpr = expr.thisClass()) {
+          self = context.convertRvalueExpression(*thisExpr);
+        } else if (!context.thisStack.empty()) {
+          self = context.thisStack.back();
+        } else {
+          mlir::emitError(loc,
+                          "missing `this` for `uvm_component::get_full_name`");
+          return {};
+        }
+        if (!self)
+          return {};
+        auto resultType = context.convertType(*expr.type);
+        if (!resultType)
+          return {};
+        auto fnType =
+            FunctionType::get(context.getContext(), {self.getType()}, {resultType});
+        auto fn =
+            getOrCreateExternFunc("circt_uvm_component_get_full_name", fnType);
+        if (!fn)
+          return {};
+        auto call =
+            mlir::func::CallOp::create(builder, loc, fn, ValueRange{self});
+        return call.getResult(0);
+      }
+
       if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
           parentSym.name == "uvm_component" && subroutine->name == "new") {
         if (expr.arguments().size() > 2) {
@@ -2678,11 +3963,90 @@ struct RvalueExprVisitor : public ExprVisitor {
           mlir::emitError(loc, "missing `this` for `uvm_component::new`");
           return {};
         }
-        if (!context.convertRvalueExpression(*thisExpr))
+        Value selfVal = context.convertRvalueExpression(*thisExpr);
+        if (!selfVal)
           return {};
-        for (auto *argExpr : expr.arguments())
-          if (!context.convertRvalueExpression(*argExpr))
+
+        Value nameVal;
+        Value parentVal;
+        if (!expr.arguments().empty()) {
+          nameVal = context.convertRvalueExpression(*expr.arguments()[0]);
+          if (!nameVal)
             return {};
+        }
+        if (expr.arguments().size() == 2) {
+          parentVal = context.convertRvalueExpression(*expr.arguments()[1]);
+          if (!parentVal)
+            return {};
+        }
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        selfVal =
+            context.materializeConversion(i32Ty, selfVal, /*isSigned=*/false, loc);
+        if (!selfVal)
+          return {};
+        Value parentI32 = parentVal
+                              ? context.materializeConversion(i32Ty, parentVal,
+                                                              /*isSigned=*/false, loc)
+                              : moore::ConstantOp::create(builder, loc, i32Ty,
+                                                          /*value=*/0, /*isSigned=*/true);
+        if (!parentI32)
+          return {};
+
+        auto fnType =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+        auto fn = getOrCreateExternFunc("circt_uvm_component_register", fnType);
+        if (!fn)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, fn, ValueRange{selfVal, parentI32});
+        return makeVoidValue();
+      }
+
+      // uvm_phase::raise_objection / drop_objection
+      //
+      // The real implementation is class-heavy (objection pools, callbacks,
+      // report server integration, etc.). For bring-up, track a minimal
+      // objection count so arcilator can stop at a realistic time.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_phase" &&
+          (subroutine->name == "raise_objection" ||
+           subroutine->name == "drop_objection")) {
+        if (auto *thisExpr = expr.thisClass()) {
+          if (!context.convertRvalueExpression(*thisExpr))
+            return {};
+        } else if (context.thisStack.empty()) {
+          // Implicit receiver.
+        }
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        Value compVal =
+            moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0,
+                                      /*isSigned=*/true);
+
+        if (!expr.arguments().empty()) {
+          Value raw = context.convertRvalueExpression(*expr.arguments().front());
+          if (!raw)
+            return {};
+          compVal = context.materializeConversion(i32Ty, raw,
+                                                  /*isSigned=*/false, loc);
+          if (!compVal)
+            return {};
+        }
+
+        for (size_t i = 1, e = expr.arguments().size(); i < e; ++i)
+          if (!context.convertRvalueExpression(*expr.arguments()[i]))
+            return {};
+
+        auto fnType = FunctionType::get(context.getContext(), {i32Ty}, {});
+        StringRef fnName = (subroutine->name == "raise_objection")
+                               ? "circt_uvm_raise_objection"
+                               : "circt_uvm_drop_objection";
+        auto fn = getOrCreateExternFunc(fnName, fnType);
+        if (!fn)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, fn, ValueRange{compVal});
         return makeVoidValue();
       }
 
@@ -2695,6 +4059,31 @@ struct RvalueExprVisitor : public ExprVisitor {
       if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
           parentSym.name == "uvm_seq_item_pull_port" &&
           subroutine->name == "get") {
+        if (auto *thisExpr = expr.thisClass()) {
+          if (!context.convertRvalueExpression(*thisExpr))
+            return {};
+        }
+        return makeVoidValue();
+      }
+
+      // uvm_get_port#(T)::get(output T t)
+      //
+      // For bring-up, accept `get` as a no-op without lowering the output
+      // argument.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_get_port" && subroutine->name == "get") {
+        if (auto *thisExpr = expr.thisClass()) {
+          if (!context.convertRvalueExpression(*thisExpr))
+            return {};
+        }
+        return makeVoidValue();
+      }
+
+      // uvm_put_port#(T)::put(T t)
+      //
+      // For bring-up, accept `put` as a no-op.
+      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+          parentSym.name == "uvm_put_port" && subroutine->name == "put") {
         if (auto *thisExpr = expr.thisClass()) {
           if (!context.convertRvalueExpression(*thisExpr))
             return {};
@@ -2801,10 +4190,33 @@ struct RvalueExprVisitor : public ExprVisitor {
           return makeVoidValue();
         }
 
-        // For virtual interfaces, the value is an `!sv.interface`/`!sv.modport`
-        // handle which is not yet plumbed through the runtime. Accept the call
-        // to unblock top-level benches; the interface value is currently only
-        // used by class methods which are not executed yet.
+        // For virtual interfaces, store the lowered handle via a runtime-backed
+        // pointer map. We cast the interface/modport value to `chandle` so the
+        // call survives interface lowering (SV interfaces are lowered away
+        // before reaching Arc/LLVM).
+        if (isa<sv::InterfaceType>(value.getType()) ||
+            isa<sv::ModportType>(value.getType())) {
+          auto ptrTy = moore::IntType::get(context.getContext(), /*width=*/64,
+                                           moore::Domain::TwoValued);
+          Value valuePtr = mlir::UnrealizedConversionCastOp::create(
+                               builder, loc, ptrTy, ValueRange{value})
+                               .getResult(0);
+          SmallVector<Type> argTypes;
+          argTypes.reserve(3);
+          argTypes.push_back(scope.getType());
+          argTypes.push_back(name.getType());
+          argTypes.push_back(ptrTy);
+          auto fnType = FunctionType::get(context.getContext(), argTypes, {});
+          auto fn =
+              getOrCreateExternFunc("circt_uvm_resource_db_set_ptr", fnType);
+          if (!fn)
+            return {};
+          builder.create<mlir::func::CallOp>(loc, fn,
+                                             ValueRange{scope, name, valuePtr});
+          return makeVoidValue();
+        }
+
+        // Otherwise: accept as a no-op for bring-up.
         return makeVoidValue();
       }
 
@@ -2827,16 +4239,194 @@ struct RvalueExprVisitor : public ExprVisitor {
         }
 
         // Evaluate the key arguments.
-        if (!context.convertRvalueExpression(*expr.arguments()[0]) ||
-            !context.convertRvalueExpression(*expr.arguments()[1]))
+        Value scope = context.convertRvalueExpression(*expr.arguments()[0]);
+        Value name = context.convertRvalueExpression(*expr.arguments()[1]);
+        if (!scope || !name)
           return {};
-
-        // Do not evaluate the output argument since it requires lvalue support.
 
         // Optional `rpterr` argument: evaluate for side effects only.
         if (expr.arguments().size() == 4)
           if (!context.convertRvalueExpression(*expr.arguments()[3]))
             return {};
+
+        // Best-effort lowering: plumb the stored value into simple class
+        // properties used as the `output T val` argument.
+        const slang::ast::Expression *outExpr = expr.arguments()[2];
+        if (const auto *assign =
+                outExpr->as_if<slang::ast::AssignmentExpression>())
+          outExpr = &assign->left();
+
+        Type outType{};
+        // Avoid converting virtual interface types here. `convertType()` may
+        // materialize new `sv.interface` symbols which can break type identity
+        // for later module/interface uses (e.g. causing `@input_if` vs
+        // `@input_if_N` mismatches).
+        if (outExpr && outExpr->type && !isVirtualInterfaceType(outExpr->type))
+          outType = context.convertType(*outExpr->type);
+
+        // Virtual interface output arguments: fetch the stored handle and write
+        // it into simple class properties (best-effort bring-up).
+        if (outExpr && outExpr->type && isVirtualInterfaceType(outExpr->type)) {
+          auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                           moore::Domain::TwoValued);
+          auto ptrTy = moore::IntType::get(context.getContext(), /*width=*/64,
+                                           moore::Domain::TwoValued);
+
+          auto fnType = FunctionType::get(context.getContext(),
+                                          {scope.getType(), name.getType()},
+                                          {ptrTy});
+          auto fn = getOrCreateExternFunc("circt_uvm_resource_db_get_ptr", fnType);
+          if (!fn)
+            return {};
+          Value fetchedPtr =
+              mlir::func::CallOp::create(builder, loc, fn, ValueRange{scope, name})
+                  .getResult(0);
+
+          auto setClassPropPtr = [&](const slang::ast::ClassPropertySymbol &prop,
+                                     Value handleVal) -> LogicalResult {
+            int32_t fieldId = context.getOrAssignClassFieldId(prop);
+            Value fieldIdVal =
+                moore::ConstantOp::create(builder, loc, i32Ty, fieldId, /*isSigned=*/true);
+            auto setFnTy = FunctionType::get(context.getContext(),
+                                             {i32Ty, i32Ty, ptrTy}, {});
+            auto setFn = getOrCreateExternFunc("circt_sv_class_set_ptr", setFnTy);
+            if (!setFn)
+              return failure();
+            mlir::func::CallOp::create(builder, loc, setFn,
+                                       ValueRange{handleVal, fieldIdVal, fetchedPtr});
+            return success();
+          };
+
+          // `read_by_name(..., prop)`
+          if (auto *nv = outExpr->as_if<slang::ast::NamedValueExpression>()) {
+            if (auto *prop = nv->symbol.as_if<slang::ast::ClassPropertySymbol>()) {
+              Value handleVal;
+              if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+                handleVal = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                      /*value=*/0, /*isSigned=*/true);
+              } else {
+                if (context.thisStack.empty())
+                  return {};
+                handleVal = context.thisStack.back();
+                handleVal = context.materializeConversion(i32Ty, handleVal,
+                                                          /*isSigned=*/false, loc);
+                if (!handleVal)
+                  return {};
+              }
+              if (failed(setClassPropPtr(*prop, handleVal)))
+                return {};
+            }
+          }
+
+          // `read_by_name(..., obj.prop)`
+          if (auto *mem = outExpr->as_if<slang::ast::MemberAccessExpression>()) {
+            if (auto *prop = mem->member.as_if<slang::ast::ClassPropertySymbol>()) {
+              Value handleVal;
+              if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+                handleVal = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                      /*value=*/0, /*isSigned=*/true);
+              } else {
+                handleVal = context.convertRvalueExpression(mem->value());
+                if (!handleVal)
+                  return {};
+                handleVal = context.materializeConversion(i32Ty, handleVal,
+                                                          /*isSigned=*/false, loc);
+                if (!handleVal)
+                  return {};
+              }
+              if (failed(setClassPropPtr(*prop, handleVal)))
+                return {};
+            }
+          }
+        }
+        if (outType) {
+          auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                           moore::Domain::TwoValued);
+
+          Value fetched;
+          if (auto outIntTy = dyn_cast<moore::IntType>(outType);
+              outIntTy && outIntTy.getBitSize() == 32) {
+            auto fnType =
+                FunctionType::get(context.getContext(), {scope.getType(), name.getType()}, {outType});
+            auto fn = getOrCreateExternFunc("circt_uvm_resource_db_get_i32", fnType);
+            if (!fn)
+              return {};
+            fetched = mlir::func::CallOp::create(builder, loc, fn, ValueRange{scope, name})
+                          .getResult(0);
+          }
+
+          auto setClassProp = [&](const slang::ast::ClassPropertySymbol &prop,
+                                  Value handleVal) -> LogicalResult {
+            int32_t fieldId = context.getOrAssignClassFieldId(prop);
+            Value fieldIdVal =
+                moore::ConstantOp::create(builder, loc, i32Ty, fieldId, /*isSigned=*/true);
+
+            auto outIntTy = dyn_cast<moore::IntType>(outType);
+            if (!outIntTy)
+              return success();
+            Value rhs =
+                context.materializeConversion(i32Ty, fetched, prop.getType().isSigned(), loc);
+            if (!rhs)
+              return failure();
+            auto fnType =
+                FunctionType::get(context.getContext(), {i32Ty, i32Ty, i32Ty}, {});
+            auto fn = getOrCreateExternFunc("circt_sv_class_set_i32", fnType);
+            if (!fn)
+              return failure();
+            mlir::func::CallOp::create(builder, loc, fn,
+                                       ValueRange{handleVal, fieldIdVal, rhs});
+            return success();
+          };
+
+          if (fetched && outExpr) {
+            // `read_by_name(..., prop)`
+            if (auto *nv = outExpr->as_if<slang::ast::NamedValueExpression>()) {
+              if (auto *prop =
+                      nv->symbol.as_if<slang::ast::ClassPropertySymbol>()) {
+                Value handleVal;
+                if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+                  handleVal = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                        /*value=*/0,
+                                                        /*isSigned=*/true);
+                } else {
+                  if (context.thisStack.empty())
+                    return {};
+                  handleVal = context.thisStack.back();
+                  handleVal = context.materializeConversion(i32Ty, handleVal,
+                                                            /*isSigned=*/false, loc);
+                  if (!handleVal)
+                    return {};
+                }
+                if (failed(setClassProp(*prop, handleVal)))
+                  return {};
+              }
+            }
+
+            // `read_by_name(..., obj.prop)`
+            if (auto *mem =
+                    outExpr->as_if<slang::ast::MemberAccessExpression>()) {
+              if (auto *prop =
+                      mem->member.as_if<slang::ast::ClassPropertySymbol>()) {
+                Value handleVal;
+                if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+                  handleVal = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                        /*value=*/0,
+                                                        /*isSigned=*/true);
+                } else {
+                  handleVal = context.convertRvalueExpression(mem->value());
+                  if (!handleVal)
+                    return {};
+                  handleVal = context.materializeConversion(i32Ty, handleVal,
+                                                            /*isSigned=*/false, loc);
+                  if (!handleVal)
+                    return {};
+                }
+                if (failed(setClassProp(*prop, handleVal)))
+                  return {};
+              }
+            }
+          }
+        }
 
         auto resultType = context.convertType(*expr.type);
         if (!resultType)
@@ -3201,9 +4791,99 @@ struct RvalueExprVisitor : public ExprVisitor {
     // All other arguments are converted to lvalues and passed into the function
     // by reference.
     SmallVector<Value> arguments;
+    bool isSuperCall = false;
     if (subroutine->thisVar) {
+      if (expr.syntax && !isSuperCall) {
+        if (auto *inv = expr.syntax->as_if<slang::syntax::InvocationExpressionSyntax>()) {
+          if (auto *member =
+                  inv->left->as_if<slang::syntax::MemberAccessExpressionSyntax>()) {
+            const slang::syntax::ExpressionSyntax *recv = member->left;
+            while (recv) {
+              if (recv->kind == slang::syntax::SyntaxKind::SuperHandle)
+                isSuperCall = true;
+              if (auto *recvMember =
+                      recv->as_if<slang::syntax::MemberAccessExpressionSyntax>()) {
+                if (recvMember->name.valueText() == "super")
+                  isSuperCall = true;
+                recv = recvMember->left;
+                continue;
+              }
+              break;
+            }
+          }
+        }
+      }
+      if (!isSuperCall && expr.sourceRange != slang::SourceRange::NoLocation) {
+        auto origRange = context.sourceManager.getFullyOriginalRange(expr.sourceRange);
+        auto start = origRange.start();
+        auto end = origRange.end();
+        if (start.valid() && end.valid() && start.buffer() == end.buffer() &&
+            end.offset() >= start.offset()) {
+          auto bufText = context.sourceManager.getSourceText(start.buffer());
+          if (start.offset() <= bufText.size() && end.offset() <= bufText.size()) {
+            auto slice = llvm::StringRef(bufText)
+                             .slice(start.offset(), end.offset())
+                             .ltrim();
+            if (slice.starts_with("super.") || slice.starts_with("super::") ||
+                slice.contains(".super."))
+              isSuperCall = true;
+          }
+        }
+      }
       Value thisVal;
       if (auto *thisExpr = expr.thisClass()) {
+        // `super.<method>(...)` should bypass virtual dispatch and directly
+        // invoke the base implementation. Slang can represent the explicit
+        // receiver as either:
+        // - an `ArbitrarySymbolExpression` referencing the base class symbol, or
+        // - a `this` handle with method lookup constrained to the base class.
+        //
+        // Detect both forms here.
+        // Use the original source text as a last-resort discriminator.
+        if (!isSuperCall && thisExpr->sourceRange != slang::SourceRange::NoLocation) {
+          auto origRange =
+              context.sourceManager.getFullyOriginalRange(thisExpr->sourceRange);
+          auto start = origRange.start();
+          auto end = origRange.end();
+          if (start.valid() && end.valid() && start.buffer() == end.buffer() &&
+              end.offset() >= start.offset()) {
+            auto bufText = context.sourceManager.getSourceText(start.buffer());
+            if (start.offset() <= bufText.size() && end.offset() <= bufText.size()) {
+              auto slice = llvm::StringRef(bufText)
+                               .slice(start.offset(), end.offset())
+                               .trim();
+              if (slice == "super" || slice.ends_with(".super"))
+                isSuperCall = true;
+            }
+          }
+        }
+
+        if (auto *arb = thisExpr->as_if<slang::ast::ArbitrarySymbolExpression>()) {
+          if (arb->symbol->kind == slang::ast::SymbolKind::ClassType ||
+              arb->symbol->kind == slang::ast::SymbolKind::GenericClassDef)
+            isSuperCall = true;
+        } else if (auto *named =
+                       thisExpr->as_if<slang::ast::NamedValueExpression>()) {
+          if (!context.thisClassStack.empty() && context.thisClassStack.back()) {
+            const auto *curClass = context.thisClassStack.back();
+            if (curClass->thisVar == &named->symbol) {
+              const auto *parentScope = subroutine->getParentScope();
+              const auto *calleeClass = parentScope
+                                            ? parentScope->asSymbol().as_if<
+                                                  slang::ast::ClassType>()
+                                            : nullptr;
+              const slang::ast::ClassType *base = curClass;
+              while (base && !isSuperCall) {
+                base = base->getBaseClass()
+                           ? base->getBaseClass()
+                                 ->as_if<slang::ast::ClassType>()
+                           : nullptr;
+                if (base == calleeClass)
+                  isSuperCall = true;
+              }
+            }
+          }
+        }
         thisVal = context.convertRvalueExpression(*thisExpr);
         // Slang represents `super.<method>(...)` as a method call with an
         // explicit receiver expression that refers to the base class symbol.
@@ -3251,7 +4931,15 @@ struct RvalueExprVisitor : public ExprVisitor {
     }
 
     // Create the call.
-    auto callee = getOrCreateVirtualDispatch(lowering->op);
+    auto callee =
+        isSuperCall ? lowering->op : getOrCreateVirtualDispatch(lowering->op);
+    if (isSuperCall) {
+      // Ensure the base implementation is available when lowering `super.*`
+      // calls. Many UVM base class methods have trivial bodies, but are not
+      // otherwise referenced and therefore may not have been converted yet.
+      if (failed(context.convertFunction(*subroutine)))
+        return {};
+    }
     auto callOp =
         mlir::func::CallOp::create(builder, loc, callee, arguments);
 
@@ -3890,11 +5578,17 @@ struct RvalueExprVisitor : public ExprVisitor {
         // Push `this` for class property accesses in constraints.
         struct ThisStackGuard {
           Context &context;
-          explicit ThisStackGuard(Context &context, Value thisVal) : context(context) {
+          explicit ThisStackGuard(Context &context, Value thisVal,
+                                  const slang::ast::ClassType *thisClass)
+              : context(context) {
             context.thisStack.push_back(thisVal);
+            context.thisClassStack.push_back(thisClass);
           }
-          ~ThisStackGuard() { context.thisStack.pop_back(); }
-        } thisGuard(context, entry.getArgument(0));
+          ~ThisStackGuard() {
+            context.thisStack.pop_back();
+            context.thisClassStack.pop_back();
+          }
+        } thisGuard(context, entry.getArgument(0), cls);
 
       auto i1Ty = moore::IntType::get(context.getContext(), /*width=*/1,
                                       moore::Domain::TwoValued);
@@ -4355,7 +6049,32 @@ struct RvalueExprVisitor : public ExprVisitor {
   /// Handle string literals.
   Value visit(const slang::ast::StringLiteral &expr) {
     auto type = context.convertType(*expr.type);
-    return moore::StringConstantOp::create(builder, loc, type, expr.getValue());
+    if (!type)
+      return {};
+
+    // Slang types string literals as `string` in many contexts, even when they
+    // will later be converted to packed bit vectors. Represent the literal as
+    // a `!moore.string` value and rely on `materializeConversion` for any
+    // contextual casts.
+    if (isa<moore::StringType>(type))
+      return materializeStringValue(context, loc, expr.getValue());
+    if (isa<moore::FormatStringType>(type))
+      return moore::FormatLiteralOp::create(builder, loc,
+                                            builder.getStringAttr(expr.getValue()));
+    if (auto intTy = dyn_cast<moore::IntType>(type)) {
+      unsigned width = intTy.getBitSize().value_or(1);
+      if (width == 0)
+        width = 1;
+      auto rawTy =
+          moore::IntType::get(context.getContext(), width, Domain::TwoValued);
+      Value raw =
+          moore::StringConstantOp::create(builder, loc, rawTy, expr.getValue());
+      return context.materializeConversion(type, raw, expr.type->isSigned(),
+                                           loc);
+    }
+
+    mlir::emitError(loc, "unsupported string literal type: ") << type;
+    return {};
   }
 
   /// Handle real literals.
@@ -4876,8 +6595,24 @@ Value Context::materializeConstant(const slang::ConstantValue &constant,
     auto convertedType = convertType(type);
     if (!convertedType)
       return {};
-    return moore::StringConstantOp::create(builder, loc, convertedType,
-                                           constant.str());
+    if (isa<moore::StringType>(convertedType))
+      return materializeStringValue(*this, loc, constant.str());
+    if (isa<moore::FormatStringType>(convertedType))
+      return moore::FormatLiteralOp::create(builder, loc,
+                                            builder.getStringAttr(constant.str()));
+    if (auto intTy = dyn_cast<moore::IntType>(convertedType)) {
+      unsigned width = intTy.getBitSize().value_or(1);
+      if (width == 0)
+        width = 1;
+      auto rawTy =
+          moore::IntType::get(getContext(), width, moore::Domain::TwoValued);
+      Value raw =
+          moore::StringConstantOp::create(builder, loc, rawTy, constant.str());
+      return materializeConversion(convertedType, raw, type.isSigned(), loc);
+    }
+    mlir::emitError(loc, "unsupported string constant type: ")
+        << convertedType;
+    return {};
   }
 
   return {};
@@ -5001,6 +6736,58 @@ Value Context::materializeConversion(Type type, Value value, bool isSigned,
   // Nothing to do if the types are already equal.
   if (type == value.getType())
     return value;
+
+  auto isFourValuedStruct = [](Type t) -> bool {
+    auto structTy = dyn_cast<hw::StructType>(t);
+    if (!structTy)
+      return false;
+    auto elements = structTy.getElements();
+    if (elements.size() != 2)
+      return false;
+    if (elements[0].name.getValue() != "value" ||
+        elements[1].name.getValue() != "unknown")
+      return false;
+    return elements[0].type == elements[1].type &&
+           hw::isHWIntegerType(elements[0].type);
+  };
+
+  // Bridge between Moore 4-state ints and their `{value, unknown}` HW struct
+  // representation at interface boundaries.
+  if (isFourValuedStruct(type)) {
+    auto structTy = cast<hw::StructType>(type);
+    auto elemTy = structTy.getElements().front().type;
+    int64_t width = hw::getBitWidth(elemTy);
+    if (width < 0) {
+      mlir::emitError(loc) << "unsupported 4-state interface element type "
+                           << elemTy;
+      return {};
+    }
+    auto mooreTarget =
+        moore::IntType::get(getContext(), width, moore::Domain::FourValued);
+    value = materializeConversion(mooreTarget, value, isSigned, loc);
+    if (!value)
+      return {};
+    return mlir::UnrealizedConversionCastOp::create(builder, loc, type,
+                                                    ValueRange{value})
+        .getResult(0);
+  }
+
+  if (isFourValuedStruct(value.getType())) {
+    auto structTy = cast<hw::StructType>(value.getType());
+    auto elemTy = structTy.getElements().front().type;
+    int64_t width = hw::getBitWidth(elemTy);
+    if (width < 0) {
+      mlir::emitError(loc) << "unsupported 4-state interface element type "
+                           << elemTy;
+      return {};
+    }
+    auto mooreSrc =
+        moore::IntType::get(getContext(), width, moore::Domain::FourValued);
+    value = mlir::UnrealizedConversionCastOp::create(
+                builder, loc, mooreSrc, ValueRange{value})
+                .getResult(0);
+    return materializeConversion(type, value, isSigned, loc);
+  }
 
   // When values arrive from SV/HW interfaces, convert them into Moore ints so
   // the standard conversion logic can reason about widths and domains.

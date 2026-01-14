@@ -8,6 +8,7 @@
 
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
+#include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "mlir/Pass/Pass.h"
@@ -45,14 +46,22 @@ struct AddTapsPass : public arc::impl::AddTapsBase<AddTapsPass> {
     // Add taps to inputs.
     auto builder = OpBuilder::atBlockBegin(moduleOp.getBodyBlock());
     for (auto [port, arg] :
-         llvm::zip(ports.getInputs(), moduleOp.getBodyBlock()->getArguments()))
-      buildTap(builder, arg.getLoc(), arg, port.getName());
+         llvm::zip(ports.getInputs(), moduleOp.getBodyBlock()->getArguments())) {
+      Value tapValue = arg;
+      if (isa<hw::InOutType>(tapValue.getType()))
+        tapValue = builder.create<llhd::PrbOp>(arg.getLoc(), tapValue);
+      buildTap(builder, arg.getLoc(), tapValue, port.getName());
+    }
 
     // Add taps to outputs.
     builder.setInsertionPoint(outputOp);
     for (auto [port, result] :
-         llvm::zip(ports.getOutputs(), outputOp->getOperands()))
-      buildTap(builder, result.getLoc(), result, port.getName());
+         llvm::zip(ports.getOutputs(), outputOp->getOperands())) {
+      Value tapValue = result;
+      if (isa<hw::InOutType>(tapValue.getType()))
+        tapValue = builder.create<llhd::PrbOp>(result.getLoc(), tapValue);
+      buildTap(builder, result.getLoc(), tapValue, port.getName());
+    }
   }
 
   // Add taps for SV wires.

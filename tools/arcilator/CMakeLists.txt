@@ -30,6 +30,7 @@ set(libs
   CIRCTSV
   CIRCTSVTransforms
   CIRCTMoore
+  CIRCTMooreTransforms
   MLIRArithDialect
   MLIRBuiltinToLLVMIRTranslation
   MLIRControlFlowDialect

@@ -8,6 +8,7 @@
 
 include "circt/Dialect/LLHD/IR/LLHDDialect.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def ProceduralRegion : NativeOpTrait<"ProceduralRegion"> {
   let cppNamespace = "::circt::llhd";
@@ -143,6 +144,7 @@ def CombinationalOp : LLHDOp<"combinational", [
 def WaitOp : LLHDOp<"wait", [
   AttrSizedOperandSegments,
   HasParent<"ProcessOp">,
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
   Terminator,
 ]> {
   let summary = "Suspend execution of a process";

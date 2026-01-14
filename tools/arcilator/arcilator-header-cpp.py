@@ -64,6 +64,7 @@ public:
   {{ model.name }}() :
     storage({{ model.name }}Layout::numStateBytes ? {{ model.name }}Layout::numStateBytes : 1, 0),
     view(storage.data()) {
+    arcilator_init_state_x<{{ model.name }}Layout>(storage.data());
 {% if model.initialFnSym %}
     {{ model.initialFnSym }}(storage.data());
 {% endif %}
@@ -185,10 +186,14 @@ def group_state_by_hierarchy(
 
   for state in states:
     if not state.name or "/" not in state.name:
-      state.name = uniquify(state.name)
       local_state.append(state)
     else:
       remainder.append(state)
+
+  # First build hierarchy scopes. This mirrors how SV names work: an instance
+  # name (scope) must win over any synthetic leaf signal with the same name.
+  # If both appear, rename the leaf signal rather than the scope.
+  hierarchy_groups = list()
   while len(remainder) > 0:
     left = list()
     prefix = remainder[0].name.split("/")[0]
@@ -200,10 +205,17 @@ def group_state_by_hierarchy(
       state.name = removeprefix(state.name, prefix + "/")
       substates.append(state)
     remainder = left
+    hierarchy_groups.append((prefix, substates))
+
+  for prefix, substates in hierarchy_groups:
+    unique_prefix = uniquify(prefix)
     hierarchy_states, hierarchy_children = group_state_by_hierarchy(substates)
-    prefix = uniquify(prefix)
     hierarchies.append(
-        StateHierarchy(prefix, hierarchy_states, hierarchy_children))
+        StateHierarchy(unique_prefix, hierarchy_states, hierarchy_children))
+
+  # Then uniquify local leaf signals against the already-claimed scope names.
+  for state in local_state:
+    state.name = uniquify(state.name)
   return local_state, hierarchies
 
 

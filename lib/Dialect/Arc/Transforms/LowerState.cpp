@@ -200,6 +200,8 @@ LogicalResult ModuleLowering::run() {
       ModelOp::create(builder, moduleOp.getLoc(), moduleOp.getModuleNameAttr(),
                       TypeAttr::get(moduleOp.getModuleType()),
                       FlatSymbolRefAttr{}, FlatSymbolRefAttr{});
+  if (auto sigInitsAttr = moduleOp->getAttr("arcilator.sig_inits"))
+    modelOp->setAttr("arcilator.sig_inits", sigInitsAttr);
   auto &modelBlock = modelOp.getBody().emplaceBlock();
   storageArg = modelBlock.addArgument(
       StorageType::get(builder.getContext(), {}), modelOp.getLoc());
@@ -342,11 +344,12 @@ Value ModuleLowering::getAllocatedState(OpResult result) {
   // HACK: If the result comes from an instance op, add the instance and port
   // name as an attribute to the allocation. This will make it show up in the C
   // headers later. Get rid of this once we have proper debug dialect support.
-  if (auto instOp = dyn_cast<InstanceOp>(result.getOwner()))
-    alloc->setAttr(
-        "name", builder.getStringAttr(
-                    instOp.getInstanceName() + "/" +
-                    instOp.getOutputName(result.getResultNumber()).getValue()));
+  if (auto instOp = dyn_cast<InstanceOp>(result.getOwner())) {
+    auto outName = instOp.getOutputName(result.getResultNumber());
+    alloc->setAttr("name", builder.getStringAttr(instOp.getInstanceName() +
+                                                 "/" + outName.getValue()));
+    alloc->setAttr("names", builder.getArrayAttr({outName}));
+  }
 
   // HACK: If the result comes from an op that has a "names" attribute, use that
   // as a name for the allocation. This should no longer be necessary once we
@@ -807,7 +810,62 @@ LogicalResult OpLowering::lower(TapOp op) {
     auto alloc = AllocStateOp::create(module.allocBuilder, op.getLoc(),
                                       StateType::get(value.getType()),
                                       module.storageArg, true);
-    alloc->setAttr("names", op.getNamesAttr());
+    // Preserve the TapOp names, and opportunistically add an un-prefixed alias
+    // for composite structs tapped under an instance scope.
+    //
+    // This is primarily meant to improve VCD name overlap with other simulators
+    // for lowered interfaces, where a struct often shows up as `<inst>/<port>`
+    // but the SV-level object is named `<port>` in the parent scope.
+    SmallVector<Attribute> names;
+    if (auto nameAttrs = op.getNamesAttr())
+      llvm::append_range(names, nameAttrs);
+
+    auto shouldAddUnprefixedAlias = [&]() -> bool {
+      Type ty = op.getValue().getType();
+      if (auto inoutTy = dyn_cast<hw::InOutType>(ty))
+        ty = inoutTy.getElementType();
+      auto structTy = dyn_cast<hw::StructType>(ty);
+      if (!structTy)
+        return false;
+      // Exclude the `{unknown, value}` 4-state structs used for regular nets.
+      auto elements = structTy.getElements();
+      if (elements.size() == 2) {
+        auto int0 = dyn_cast<IntegerType>(elements[0].type);
+        auto int1 = dyn_cast<IntegerType>(elements[1].type);
+        if (int0 && int1 && int0.getWidth() == int1.getWidth())
+          return false;
+      }
+      return true;
+    }();
+
+    if (shouldAddUnprefixedAlias) {
+      SmallVector<Attribute> existing = names;
+      for (auto attr : existing) {
+        auto nameAttr = dyn_cast<StringAttr>(attr);
+        if (!nameAttr)
+          continue;
+        auto fullName = nameAttr.getValue();
+        auto slash = fullName.find('/');
+        if (slash == StringRef::npos)
+          continue;
+        // Only drop a single leading scope (e.g. `dut/in` → `in`), and avoid
+        // generating ambiguous aliases for deeper paths.
+        if (fullName.find('/', slash + 1) != StringRef::npos)
+          continue;
+        auto alias = fullName.drop_front(slash + 1);
+        if (alias.empty())
+          continue;
+        names.push_back(StringAttr::get(op.getContext(), alias));
+      }
+    }
+
+    if (!names.empty()) {
+      llvm::sort(names, [](Attribute a, Attribute b) {
+        return cast<StringAttr>(a).getValue() < cast<StringAttr>(b).getValue();
+      });
+      names.erase(llvm::unique(names), names.end());
+      alloc->setAttr("names", ArrayAttr::get(op.getContext(), names));
+    }
     state = alloc;
   }
   StateWriteOp::create(module.builder, op.getLoc(), state, value, Value{});
@@ -835,9 +893,10 @@ LogicalResult OpLowering::lower(InstanceOp op) {
     auto state = AllocStateOp::create(module.allocBuilder, value.getLoc(),
                                       StateType::get(value.getType()),
                                       module.storageArg);
-    state->setAttr("name", module.builder.getStringAttr(
-                               op.getInstanceName() + "/" +
-                               cast<StringAttr>(name).getValue()));
+    auto argName = cast<StringAttr>(name).getValue();
+    state->setAttr(
+        "name", module.builder.getStringAttr(op.getInstanceName() + "/" + argName));
+    state->setAttr("names", module.builder.getArrayAttr({name}));
     StateWriteOp::create(module.builder, value.getLoc(), state, value, Value{});
   }
 

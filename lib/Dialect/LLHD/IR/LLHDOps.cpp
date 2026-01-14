@@ -623,6 +623,15 @@ LogicalResult WaitOp::verify() {
   return verifyYieldResults(*this, getYieldOperands());
 }
 
+void WaitOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // `llhd.wait` represents a suspension point where externally-driven signals
+  // may change while the process is inactive. Model this as an unknown write to
+  // prevent CSE/hoisting of `llhd.prb` reads across the wait.
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
 //===----------------------------------------------------------------------===//
 // HaltOp
 //===----------------------------------------------------------------------===//

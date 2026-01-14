@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <string>
 
 namespace circt {
@@ -41,21 +42,31 @@ struct StateInfo {
   unsigned memoryDepth = 0;  // number of words in a memory
 };
 
+/// Initialization metadata for runtime-managed signals used by the arcilator
+/// scheduler hooks (`__arcilator_sig_*`).
+struct RuntimeSignalInitInfo {
+  uint64_t sigId = 0;
+  uint64_t initU64 = 0;
+  uint64_t totalWidth = 0;
+};
+
 /// Gathers information about a given Arc model.
 struct ModelInfo {
   std::string name;
   size_t numStateBytes;
   llvm::SmallVector<StateInfo> states;
+  llvm::SmallVector<RuntimeSignalInitInfo> sigInits;
   mlir::FlatSymbolRefAttr initialFnSym;
   mlir::FlatSymbolRefAttr finalFnSym;
 
   ModelInfo(std::string name, size_t numStateBytes,
             llvm::SmallVector<StateInfo> states,
+            llvm::SmallVector<RuntimeSignalInitInfo> sigInits,
             mlir::FlatSymbolRefAttr initialFnSym,
             mlir::FlatSymbolRefAttr finalFnSym)
       : name(std::move(name)), numStateBytes(numStateBytes),
-        states(std::move(states)), initialFnSym(initialFnSym),
-        finalFnSym(finalFnSym) {}
+        states(std::move(states)), sigInits(std::move(sigInits)),
+        initialFnSym(initialFnSym), finalFnSym(finalFnSym) {}
 };
 
 /// Collects information about states within the provided Arc model storage

@@ -9,6 +9,7 @@
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/symbols/ClassSymbols.h"
+#include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
 #include "slang/ast/symbols/VariableSymbols.h"
@@ -31,9 +32,18 @@ static Type getInterfaceSignalType(Type type) {
     unsigned width = intTy.getBitSize().value_or(1);
     if (width == 0)
       width = 1;
-    auto widthAttr =
-        IntegerAttr::get(IntegerType::get(type.getContext(), 32), APInt(32, width));
-    return hw::IntType::get(widthAttr);
+    auto widthAttr = IntegerAttr::get(
+        IntegerType::get(type.getContext(), 32), APInt(32, width));
+    Type elemTy = hw::IntType::get(widthAttr);
+    if (intTy.getDomain() == moore::Domain::FourValued) {
+      SmallVector<hw::StructType::FieldInfo> fields;
+      fields.push_back(
+          {StringAttr::get(type.getContext(), "value"), elemTy});
+      fields.push_back(
+          {StringAttr::get(type.getContext(), "unknown"), elemTy});
+      return hw::StructType::get(type.getContext(), fields);
+    }
+    return elemTy;
   }
   return type;
 }
@@ -1201,12 +1211,172 @@ LogicalResult Context::convertCompilation() {
       return failure();
   }
 
+  if (failed(finalizeUvmShims()))
+    return failure();
+
+  return success();
+}
+
+LogicalResult Context::finalizeUvmShims() {
+  // UVM shim bring-up: we generate a minimal phase scheduler shim when
+  // lowering `uvm_root::run_test`. At that point the set of instantiated
+  // component classes may not be known yet, so the generated dispatch stubs can
+  // be empty. Rebuild the phase-dispatch functions once we've converted the
+  // whole compilation and have assigned class IDs.
+  if (!intoModuleOp.lookupSymbol<mlir::func::FuncOp>("circt_uvm_run_all_phases"))
+    return success();
+
+  auto rebuildPhaseDispatch = [&](StringRef methodName,
+                                  StringRef fnName) -> LogicalResult {
+    Location loc = UnknownLoc::get(getContext());
+
+    mlir::func::FuncOp dispatchFn =
+        intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName);
+    if (!dispatchFn) {
+      auto i32Ty = moore::IntType::get(getContext(), /*width=*/32,
+                                       moore::Domain::TwoValued);
+      auto fnTy = FunctionType::get(getContext(), {i32Ty, i32Ty}, {});
+
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(intoModuleOp.getBody());
+      getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+      dispatchFn = mlir::func::FuncOp::create(builder, loc, fnName, fnTy);
+      dispatchFn.setPrivate();
+      symbolTable.insert(dispatchFn);
+    }
+
+    auto fnTy = dispatchFn.getFunctionType();
+    if (fnTy.getNumInputs() < 1)
+      return success();
+
+    SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+    for (auto [cls, classId] : classIds) {
+      if (!cls)
+        continue;
+      llvm::StringRef clsName(cls->name.data(), cls->name.size());
+      if (clsName.starts_with("uvm_"))
+        continue;
+      const slang::ast::SubroutineSymbol *impl = nullptr;
+      for (auto &method : cls->membersOfType<slang::ast::SubroutineSymbol>()) {
+        if (llvm::StringRef(method.name.data(), method.name.size()) ==
+            methodName) {
+          impl = &method;
+          break;
+        }
+      }
+      if (!impl)
+        continue;
+      if (failed(convertFunction(*impl)))
+        continue;
+      auto *implLowering = declareFunction(*impl);
+      if (!implLowering || !implLowering->op)
+        continue;
+      if (implLowering->op.getFunctionType() != fnTy)
+        continue;
+      impls.push_back({classId, implLowering->op});
+    }
+    llvm::sort(impls, [](const auto &a, const auto &b) {
+      return a.first < b.first;
+    });
+
+    dispatchFn.getBody().getBlocks().clear();
+
+    auto &entry = dispatchFn.getBody().emplaceBlock();
+    for (auto ty : fnTy.getInputs())
+      entry.addArgument(ty, loc);
+
+    OpBuilder b(getContext());
+    b.setInsertionPointToStart(&entry);
+    if (impls.empty()) {
+      mlir::func::ReturnOp::create(b, loc);
+      return success();
+    }
+
+    Value thisArg = entry.getArgument(0);
+    auto getTypeFnTy = FunctionType::get(getContext(), {thisArg.getType()},
+                                         {thisArg.getType()});
+    auto getTypeFn = intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+        "circt_sv_class_get_type");
+    if (!getTypeFn || getTypeFn.getFunctionType() != getTypeFnTy) {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(intoModuleOp.getBody());
+      getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+      getTypeFn = mlir::func::FuncOp::create(builder, loc,
+                                             "circt_sv_class_get_type",
+                                             getTypeFnTy);
+      getTypeFn.setPrivate();
+      symbolTable.insert(getTypeFn);
+    }
+
+    Value dynType =
+        mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg}).getResult(0);
+
+    Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
+    SmallVector<Block *> checkBlocks;
+    SmallVector<Block *> caseBlocks;
+    checkBlocks.reserve(impls.size());
+    caseBlocks.reserve(impls.size());
+    for (size_t i = 0, e = impls.size(); i < e; ++i) {
+      checkBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+      caseBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+    }
+
+    b.setInsertionPointToEnd(&entry);
+    mlir::cf::BranchOp::create(b, loc,
+                               checkBlocks.empty() ? defaultBlock
+                                                   : checkBlocks.front());
+
+    b.setInsertionPointToStart(defaultBlock);
+    mlir::func::ReturnOp::create(b, loc);
+
+    auto cmpTy = moore::IntType::get(
+        getContext(), /*width=*/32,
+        cast<moore::IntType>(dynType.getType()).getDomain());
+
+    for (size_t i = 0, e = impls.size(); i < e; ++i) {
+      auto [classId, implFn] = impls[i];
+      Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
+
+      b.setInsertionPointToStart(checkBlocks[i]);
+      Value classIdVal = moore::ConstantOp::create(b, loc, cmpTy, classId,
+                                                   /*isSigned=*/true);
+      Value eq = b.createOrFold<moore::EqOp>(loc, dynType, classIdVal);
+      eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+      Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+      mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i], next);
+
+      b.setInsertionPointToStart(caseBlocks[i]);
+      mlir::func::CallOp::create(b, loc, implFn, entry.getArguments());
+      mlir::func::ReturnOp::create(b, loc);
+    }
+
+    return success();
+  };
+
+  if (failed(
+          rebuildPhaseDispatch("build_phase", "__circt_uvm_dispatch_build_phase")))
+    return failure();
+  if (failed(rebuildPhaseDispatch("connect_phase",
+                                  "__circt_uvm_dispatch_connect_phase")))
+    return failure();
+  if (failed(
+          rebuildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase")))
+    return failure();
   return success();
 }
 
 InterfaceLowering *
 Context::convertInterface(const slang::ast::InstanceBodySymbol *interface) {
   using slang::ast::ArgumentDirection;
+
+  for (auto const &existingIface : interfaces) {
+    if (!existingIface.getFirst())
+      continue;
+    if (interface->hasSameType(*existingIface.getFirst())) {
+      interface = existingIface.first;
+      break;
+    }
+  }
 
   auto &slot = interfaces[interface];
   if (slot)
@@ -1250,15 +1420,8 @@ Context::convertInterface(const slang::ast::InstanceBodySymbol *interface) {
     if (!type)
       return failure();
     auto sigLoc = convertLocation(value.location);
-    Type signalType;
-    if (auto intType = dyn_cast<moore::IntType>(type)) {
-      unsigned width = intType.getBitSize().value_or(1);
-      if (width == 0)
-        width = 1;
-      auto widthAttr = IntegerAttr::get(
-          IntegerType::get(ifaceBuilder.getContext(), 32), APInt(32, width));
-      signalType = hw::IntType::get(widthAttr);
-    } else {
+    auto signalType = getInterfaceSignalType(type);
+    if (!signalType || signalType == type) {
       mlir::emitError(sigLoc) << "unsupported interface signal type " << type;
       return failure();
     }
@@ -1524,22 +1687,29 @@ Context::convertModuleHeader(const slang::ast::InstanceBodySymbol *module) {
   for (auto *symbol : module->getPortList()) {
     if (const auto *ifacePort =
             symbol->as_if<slang::ast::InterfacePortSymbol>()) {
-      if (!ifacePort->interfaceDef || ifacePort->isGeneric) {
-        auto portLoc = convertLocation(ifacePort->location);
-        mlir::emitError(portLoc)
-            << "unsupported interface port `" << ifacePort->name
-            << "` without concrete interface definition";
-        return {};
-      }
+    if (!ifacePort->interfaceDef || ifacePort->isGeneric) {
       auto portLoc = convertLocation(ifacePort->location);
-      auto ifaceRef = FlatSymbolRefAttr::get(builder.getContext(),
-                                             ifacePort->interfaceDef->name);
-      auto ifaceType = sv::InterfaceType::get(builder.getContext(), ifaceRef);
+      mlir::emitError(portLoc)
+          << "unsupported interface port `" << ifacePort->name
+          << "` without concrete interface definition";
+      return {};
+    }
+      auto portLoc = convertLocation(ifacePort->location);
+      auto &ifaceBody = slang::ast::InstanceBodySymbol::fromDefinition(
+          compilation, *ifacePort->interfaceDef, ifacePort->location,
+          slang::ast::InstanceFlags::None,
+          /*hierarchyOverrideNode=*/nullptr, /*configBlock=*/nullptr,
+          /*configRule=*/nullptr);
+      auto *ifaceLowering = convertInterface(&ifaceBody);
+      if (!ifaceLowering)
+        return {};
+      Type ifaceType = ifaceLowering->type;
       auto portName = builder.getStringAttr(ifacePort->name);
       modulePorts.push_back(
-          {portName, ifaceType, hw::ModulePort::Input});
+          hw::ModulePort{portName, ifaceType, hw::ModulePort::Input});
       auto arg = block->addArgument(ifaceType, portLoc);
-      lowering.interfacePorts.push_back({*ifacePort, portLoc, arg});
+      lowering.interfacePorts.push_back(
+          ModuleLowering::InterfacePortLowering{*ifacePort, portLoc, arg});
       lowering.portInfos.push_back(
           {ModuleLowering::ModulePortInfo::Kind::Interface,
            static_cast<unsigned>(lowering.interfacePorts.size() - 1)});
@@ -1932,14 +2102,20 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   size_t inputIdx = 0;
   bool pushedThis = false;
   auto thisGuard = llvm::make_scope_exit([&] {
-    if (pushedThis)
+    if (pushedThis) {
       thisStack.pop_back();
+      thisClassStack.pop_back();
+    }
   });
   if (subroutine.thisVar) {
     auto thisLoc = convertLocation(subroutine.thisVar->location);
     Value thisArg = block.addArgument(inputTypes[inputIdx++], thisLoc);
     valueSymbols.insert(subroutine.thisVar, thisArg);
     thisStack.push_back(thisArg);
+    const slang::ast::ClassType *thisClass = nullptr;
+    const slang::ast::Type &thisTy = subroutine.thisVar->getType();
+    thisClass = thisTy.getCanonicalType().as_if<slang::ast::ClassType>();
+    thisClassStack.push_back(thisClass);
     pushedThis = true;
   }
 
