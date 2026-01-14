@@ -186,7 +186,12 @@ LogicalResult LowerClocksToFuncsPass::isolateClock(Operation *clockOp,
         operand.set(clockStorageArg);
         continue;
       }
-      if (isa<BlockArgument>(operand.get())) {
+      if (auto barg = dyn_cast<BlockArgument>(operand.get())) {
+        // Block arguments that are internal to the clock tree are fine.
+        auto *argRegion = barg.getOwner()->getParent();
+        if (argRegion == clockRegion || clockRegion->isAncestor(argRegion))
+          continue;
+
         auto d = op->emitError(
             "operation in clock tree uses external block argument");
         d.attachNote() << "clock trees can only use external constant values";

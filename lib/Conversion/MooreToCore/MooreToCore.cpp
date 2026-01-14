@@ -788,9 +788,33 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
   matchAndRewrite(ProcedureOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Collect values to observe before we do any modifications to the region.
-    SmallVector<Value> observedValues;
+    //
+    // `always_comb` and `always_latch` have an implicit sensitivity list and
+    // must suspend until an observed value changes.
+    //
+    // Some SV constructs (notably concurrent assertions lowered to
+    // `verif.clocked_*`) currently appear as `moore.procedure always` without
+    // an explicit `moore.wait_*`. Lowering those directly to an LLHD process
+    // loop would create a zero-delay infinite loop and hang cycle-driven
+    // simulation. Treat such procedures like `always_comb`: observe their
+    // external dependencies and insert an implicit wait point.
+    bool needsImplicitWait = false;
     if (op.getKind() == ProcedureKind::AlwaysComb ||
-        op.getKind() == ProcedureKind::AlwaysLatch) {
+        op.getKind() == ProcedureKind::AlwaysLatch)
+      needsImplicitWait = true;
+    if (!needsImplicitWait &&
+        (op.getKind() == ProcedureKind::Always ||
+         op.getKind() == ProcedureKind::AlwaysFF)) {
+      bool hasExplicitWait = false;
+      op.getBody().walk([&](Operation *inner) {
+        if (isa<WaitEventOp, WaitDelayOp>(inner))
+          hasExplicitWait = true;
+      });
+      needsImplicitWait = !hasExplicitWait;
+    }
+
+    SmallVector<Value> observedValues;
+    if (needsImplicitWait) {
       auto setInsertionPoint = [&](Value value) {
         rewriter.setInsertionPoint(op);
       };
@@ -834,14 +858,13 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
     rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
                                 newOp.getBody().end());
 
-    // Add special handling for `always_comb` and `always_latch` procedures.
+    // Add special handling for procedures with an implicit sensitivity list.
     // These run once at simulation startup and then implicitly wait for any of
     // the values they access to change before running again. To implement this,
     // we create another basic block that contains the implicit wait, and make
     // all `moore.return` ops branch to that wait block instead of immediately
     // jumping back up to the body.
-    if (op.getKind() == ProcedureKind::AlwaysComb ||
-        op.getKind() == ProcedureKind::AlwaysLatch) {
+    if (needsImplicitWait) {
       Block *waitBlock = rewriter.createBlock(&newOp.getBody());
       llhd::WaitOp::create(rewriter, loc, ValueRange{}, Value(), observedValues,
                            ValueRange{}, block);
@@ -964,9 +987,13 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     rewriter.eraseOp(clonedOp);
 
     // Also observe the values that the wait event itself is tracking. These
-    // have now been materialized in the wait block as `valuesBefore`, so append
-    // them to the wait op's observed operand segment.
-    SmallVector<Value> trackedValues;
+    // have now been materialized in the wait block as `valuesBefore`. Convert
+    // them to HW value types and:
+    //   1) Observe them so `llhd.wait` wakes up on changes, and
+    //   2) Pass them as dest operands into the check block so edge detection can
+    //      use the true pre-wait values even after later scheduler lowering.
+    SmallVector<Value> beforeValues;
+    SmallVector<Value> beforeArgs;
     for (auto value : valuesBefore) {
       auto type = typeConverter->convertType(value.getType());
       if (!type || !hw::isHWValueType(type))
@@ -975,13 +1002,16 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
       if (converted.getType() != type) {
         OpBuilder::InsertionGuard g(rewriter);
         rewriter.setInsertionPoint(waitOp);
-        converted = typeConverter->materializeTargetConversion(
-            rewriter, loc, type, converted);
+        converted = typeConverter->materializeTargetConversion(rewriter, loc, type,
+                                                               converted);
       }
-      trackedValues.push_back(converted);
+      beforeValues.push_back(converted);
+      beforeArgs.push_back(checkBlock->addArgument(type, value.getLoc()));
     }
-    if (!trackedValues.empty())
-      waitOp.getObservedMutable().append(trackedValues);
+    if (!beforeValues.empty()) {
+      waitOp.getObservedMutable().append(beforeValues);
+      waitOp.getDestOperandsMutable().append(beforeValues);
+    }
 
     // Collect a list of all detect ops and inline the `wait_event` body into
     // the check block.
@@ -991,52 +1021,130 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     rewriter.eraseOp(op);
 
     // Helper function to detect if a certain change occurred between a value
-    // before the `llhd.wait` and after.
+    // captured before the `llhd.wait` and the value after.
     auto computeTrigger = [&](Value before, Value after, Edge edge) -> Value {
       assert(before.getType() == after.getType() &&
-             "mismatched types after clone op");
-      auto beforeType = cast<IntType>(before.getType());
-
-      // 9.4.2 IEEE 1800-2017: An edge event shall be detected only on the LSB
-      // of the expression
-      if (beforeType.getWidth() != 1 && edge != Edge::AnyChange) {
-        constexpr int LSB = 0;
-        beforeType =
-            IntType::get(rewriter.getContext(), 1, beforeType.getDomain());
-        before =
-            moore::ExtractOp::create(rewriter, loc, beforeType, before, LSB);
-        after = moore::ExtractOp::create(rewriter, loc, beforeType, after, LSB);
-      }
-
-      auto intType = rewriter.getIntegerType(beforeType.getWidth());
-      before = typeConverter->materializeTargetConversion(rewriter, loc,
-                                                          intType, before);
-      after = typeConverter->materializeTargetConversion(rewriter, loc, intType,
-                                                         after);
-
-      if (edge == Edge::AnyChange)
-        return comb::ICmpOp::create(rewriter, loc, ICmpPredicate::ne, before,
-                                    after, true);
-
-      SmallVector<Value> disjuncts;
+             "mismatched types after conversion");
       Value trueVal = hw::ConstantOp::create(rewriter, loc, APInt(1, 1));
 
+      auto lowerToLsb = [&](Value v) -> Value {
+        auto intTy = dyn_cast<IntegerType>(v.getType());
+        if (!intTy || intTy.getWidth() == 1)
+          return v;
+        return comb::ExtractOp::create(rewriter, loc, v, /*lowBit=*/0,
+                                       /*width=*/1);
+      };
+
+      // Two-valued values are plain integers.
+      if (auto intTy = dyn_cast<IntegerType>(before.getType())) {
+        Value beforeInt = before;
+        Value afterInt = after;
+        if (edge != Edge::AnyChange && intTy.getWidth() != 1) {
+          beforeInt = lowerToLsb(beforeInt);
+          afterInt = lowerToLsb(afterInt);
+        }
+
+        if (edge == Edge::AnyChange)
+          return comb::ICmpOp::create(rewriter, loc, ICmpPredicate::ne, beforeInt,
+                                      afterInt, true);
+
+        SmallVector<Value> disjuncts;
+        if (edge == Edge::PosEdge || edge == Edge::BothEdges) {
+          Value notOld =
+              comb::XorOp::create(rewriter, loc, beforeInt, trueVal, true);
+          disjuncts.push_back(
+              comb::AndOp::create(rewriter, loc, notOld, afterInt, true));
+        }
+        if (edge == Edge::NegEdge || edge == Edge::BothEdges) {
+          Value notCurr =
+              comb::XorOp::create(rewriter, loc, afterInt, trueVal, true);
+          disjuncts.push_back(
+              comb::AndOp::create(rewriter, loc, beforeInt, notCurr, true));
+        }
+        return rewriter.createOrFold<comb::OrOp>(loc, disjuncts, true);
+      }
+
+      // Four-valued values are represented as `{value, unknown}`.
+      auto structTy = dyn_cast<hw::StructType>(before.getType());
+      if (!structTy)
+        return {};
+
+      auto valueField = rewriter.getStringAttr(kFourValuedValueField);
+      auto unknownField = rewriter.getStringAttr(kFourValuedUnknownField);
+      Value beforeValue =
+          rewriter.createOrFold<hw::StructExtractOp>(loc, before, valueField);
+      Value beforeUnknown =
+          rewriter.createOrFold<hw::StructExtractOp>(loc, before, unknownField);
+      Value afterValue =
+          rewriter.createOrFold<hw::StructExtractOp>(loc, after, valueField);
+      Value afterUnknown =
+          rewriter.createOrFold<hw::StructExtractOp>(loc, after, unknownField);
+      auto fieldTy = dyn_cast<IntegerType>(beforeValue.getType());
+      if (!fieldTy || beforeUnknown.getType() != fieldTy ||
+          afterValue.getType() != fieldTy || afterUnknown.getType() != fieldTy)
+        return {};
+
+      // Any-change event: detect changes in the canonical 4-state value where
+      // unknown bits mask out the corresponding value bits.
+      if (edge == Edge::AnyChange) {
+        Value ones = hw::ConstantOp::create(rewriter, loc,
+                                            APInt(fieldTy.getWidth(), -1,
+                                                  /*isSigned=*/true));
+        Value beforeKnownMask =
+            comb::XorOp::create(rewriter, loc, beforeUnknown, ones, true);
+        Value afterKnownMask =
+            comb::XorOp::create(rewriter, loc, afterUnknown, ones, true);
+        Value beforeCanon = comb::AndOp::create(rewriter, loc, beforeValue,
+                                                beforeKnownMask, true);
+        Value afterCanon = comb::AndOp::create(rewriter, loc, afterValue,
+                                               afterKnownMask, true);
+        Value unknownChanged = comb::ICmpOp::create(
+            rewriter, loc, ICmpPredicate::ne, beforeUnknown, afterUnknown, true);
+        Value valueChanged = comb::ICmpOp::create(
+            rewriter, loc, ICmpPredicate::ne, beforeCanon, afterCanon, true);
+        return rewriter.createOrFold<comb::OrOp>(
+            loc, ValueRange{unknownChanged, valueChanged}, true);
+      }
+
+      // 9.4.2 IEEE 1800-2017: Edge events consider only the LSB.
+      Value beforeValueBit = beforeValue;
+      Value beforeUnknownBit = beforeUnknown;
+      Value afterValueBit = afterValue;
+      Value afterUnknownBit = afterUnknown;
+      if (fieldTy.getWidth() != 1) {
+        beforeValueBit = lowerToLsb(beforeValueBit);
+        beforeUnknownBit = lowerToLsb(beforeUnknownBit);
+        afterValueBit = lowerToLsb(afterValueBit);
+        afterUnknownBit = lowerToLsb(afterUnknownBit);
+      }
+
+      // Posedge: after==1 and before!=1 (before can be 0, X, or Z).
+      // Negedge: after==0 and before!=0 (before can be 1, X, or Z).
+      Value afterKnown =
+          comb::XorOp::create(rewriter, loc, afterUnknownBit, trueVal, true);
+      Value beforeNot1 = rewriter.createOrFold<comb::OrOp>(
+          loc, ValueRange{beforeUnknownBit,
+                          comb::XorOp::create(rewriter, loc, beforeValueBit,
+                                              trueVal, true)},
+          true);
+      Value beforeNot0 = rewriter.createOrFold<comb::OrOp>(
+          loc, ValueRange{beforeUnknownBit, beforeValueBit}, true);
+
+      SmallVector<Value> disjuncts;
       if (edge == Edge::PosEdge || edge == Edge::BothEdges) {
-        Value notOldVal =
-            comb::XorOp::create(rewriter, loc, before, trueVal, true);
-        Value posedge =
-            comb::AndOp::create(rewriter, loc, notOldVal, after, true);
-        disjuncts.push_back(posedge);
+        Value lhs =
+            comb::AndOp::create(rewriter, loc, afterKnown, afterValueBit, true);
+        disjuncts.push_back(
+            comb::AndOp::create(rewriter, loc, lhs, beforeNot1, true));
       }
-
       if (edge == Edge::NegEdge || edge == Edge::BothEdges) {
-        Value notCurrVal =
-            comb::XorOp::create(rewriter, loc, after, trueVal, true);
-        Value posedge =
-            comb::AndOp::create(rewriter, loc, before, notCurrVal, true);
-        disjuncts.push_back(posedge);
+        Value notAfter =
+            comb::XorOp::create(rewriter, loc, afterValueBit, trueVal, true);
+        Value lhs =
+            comb::AndOp::create(rewriter, loc, afterKnown, notAfter, true);
+        disjuncts.push_back(
+            comb::AndOp::create(rewriter, loc, lhs, beforeNot0, true));
       }
-
       return rewriter.createOrFold<comb::OrOp>(loc, disjuncts, true);
     };
 
@@ -1045,19 +1153,20 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     // has been collected into `valuesBefore` in the "wait" block; the "after"
     // value corresponds to the detect op's input.
     SmallVector<Value> triggers;
-    for (auto [detectOp, before] : llvm::zip(detectOps, valuesBefore)) {
+    for (auto [detectOp, before] : llvm::zip(detectOps, beforeArgs)) {
       if (!allDetectsAreAnyChange) {
-        if (!isa<IntType>(before.getType()))
-          return detectOp->emitError() << "requires int operand";
-
         rewriter.setInsertionPoint(detectOp);
-        auto trigger =
-            computeTrigger(before, detectOp.getInput(), detectOp.getEdge());
+        auto afterType = before.getType();
+        Value after = detectOp.getInput();
+        if (after.getType() != afterType)
+          after = typeConverter->materializeTargetConversion(rewriter, loc,
+                                                             afterType, after);
+        auto trigger = computeTrigger(before, after, detectOp.getEdge());
         if (detectOp.getCondition()) {
           auto condition = typeConverter->materializeTargetConversion(
               rewriter, loc, rewriter.getI1Type(), detectOp.getCondition());
-          trigger =
-              comb::AndOp::create(rewriter, loc, trigger, condition, true);
+        trigger =
+            comb::AndOp::create(rewriter, loc, trigger, condition, true);
         }
         triggers.push_back(trigger);
       }
@@ -5258,6 +5367,20 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
           mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
         if (inputs.size() != 1 || !inputs[0])
           return Value();
+        // Materialize reads from `inout<T>` values as explicit probes instead
+        // of leaving an unresolved cast behind. This is important for SV
+        // interface lowering, where interface instances are backed by
+        // `inout<struct<...>>` storage, but some users need the current value
+        // (`struct<...>`) for extraction.
+        if (auto inoutTy = dyn_cast<hw::InOutType>(inputs[0].getType())) {
+          auto stripAlias = [](Type t) -> Type {
+            while (auto alias = dyn_cast<hw::TypeAliasType>(t))
+              t = alias.getInnerType();
+            return t;
+          };
+          if (stripAlias(inoutTy.getElementType()) == stripAlias(resultType))
+            return llhd::PrbOp::create(builder, loc, inputs[0]);
+        }
         return UnrealizedConversionCastOp::create(builder, loc, resultType,
                                                   inputs[0])
             .getResult(0);

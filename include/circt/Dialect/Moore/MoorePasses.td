@@ -48,5 +48,14 @@ def CreateVTables : Pass<"moore-create-vtables", "mlir::ModuleOp"> {
     let constructor = "circt::moore::createVTablesPass()";
 }
 
-
+def InlineCalls : Pass<"moore-inline-calls", "mlir::ModuleOp"> {
+    let summary = "Inline `func.call` ops inside `moore.procedure` regions";
+    let description = [{
+      Inline calls to non-external `func.func` operations when the call site
+      appears in a `moore.procedure`. This is primarily intended to support
+      tasks that contain timing controls (`moore.wait_*`), which cannot be
+      lowered as standalone functions.
+    }];
+    let constructor = "circt::moore::createInlineCallsPass()";
+}
 #endif // CIRCT_DIALECT_MOORE_MOOREPASSES_TD

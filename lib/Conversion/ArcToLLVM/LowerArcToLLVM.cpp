@@ -44,6 +44,7 @@
 #include "llvm/Support/FormatVariadic.h"
 
 #include <cstddef>
+#include <optional>
 
 #define DEBUG_TYPE "lower-arc-to-llvm"
 
@@ -64,6 +65,60 @@ using namespace runtime;
 
 static llvm::Twine evalSymbolFromModelName(StringRef modelName) {
   return modelName + "_eval";
+}
+
+static std::optional<int64_t> tryResolveArcilatorSigId(Value value) {
+  auto stripCasts = [](Value v) -> Value {
+    while (auto cast = v.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (cast.getNumOperands() != 1 || cast.getNumResults() != 1)
+        break;
+      v = cast.getOperand(0);
+    }
+    return v;
+  };
+
+  auto peelExecuteBlockArg = [](Value v) -> Value {
+    auto barg = dyn_cast<BlockArgument>(v);
+    if (!barg)
+      return v;
+    Operation *parent = barg.getOwner() ? barg.getOwner()->getParentOp() : nullptr;
+    auto exec = dyn_cast_or_null<arc::ExecuteOp>(parent);
+    if (!exec)
+      return v;
+    unsigned idx = barg.getArgNumber();
+    if (idx >= exec.getInputs().size())
+      return v;
+    return exec.getInputs()[idx];
+  };
+
+  // Keep peeling casts and execute region arguments until we reach a stable
+  // defining value.
+  while (true) {
+    Value prev = value;
+    value = stripCasts(value);
+    value = peelExecuteBlockArg(value);
+    if (value == prev)
+      break;
+  }
+
+  if (auto bitcast = value.getDefiningOp<hw::BitcastOp>()) {
+    Value input = bitcast.getInput();
+    if (auto cst = input.getDefiningOp<hw::ConstantOp>()) {
+      auto cstTy = dyn_cast<IntegerType>(cst.getType());
+      if (cstTy && cstTy.getWidth() <= 32)
+        return cst.getValue().getSExtValue();
+    }
+  }
+
+  auto agg = value.getDefiningOp<hw::AggregateConstantOp>();
+  if (!agg)
+    return std::nullopt;
+
+  auto sigIdAttr = agg->getAttrOfType<IntegerAttr>("arcilator.sig_id");
+  if (!sigIdAttr)
+    return std::nullopt;
+
+  return sigIdAttr.getValue().getSExtValue();
 }
 
 namespace {
@@ -1265,6 +1320,42 @@ void LowerArcToLLVMPass::runOnOperation() {
         result.replaceAllUsesWith(zero);
       }
     });
+  }
+
+  // Lower virtual-interface handle shims that currently materialize as
+  // `builtin.unrealized_conversion_cast` between Arc state bundles and `i64`
+  // into plain signal IDs. This keeps the Arc-to-LLVM pipeline free of HW
+  // types that otherwise leak through to LLVM translation.
+  {
+    SmallVector<UnrealizedConversionCastOp> castsToErase;
+    getOperation().walk([&](UnrealizedConversionCastOp cast) {
+      if (cast.getNumOperands() != 1 || cast.getNumResults() != 1)
+        return;
+      auto resTy = dyn_cast<IntegerType>(cast.getResult(0).getType());
+      if (!resTy || resTy.getWidth() != 64)
+        return;
+
+      auto sigId = tryResolveArcilatorSigId(cast.getOperand(0));
+      if (!sigId)
+        return;
+
+      OpBuilder builder(cast);
+      auto idConst =
+          hw::ConstantOp::create(builder, cast.getLoc(), APInt(64, *sigId));
+      cast.getResult(0).replaceAllUsesWith(idConst);
+      castsToErase.push_back(cast);
+    });
+    for (auto cast : castsToErase)
+      cast.erase();
+
+    SmallVector<UnrealizedConversionCastOp> deadCasts;
+    getOperation().walk([&](UnrealizedConversionCastOp cast) {
+      if (cast.getNumOperands() == 1 && cast.getNumResults() == 1 &&
+          cast->use_empty())
+        deadCasts.push_back(cast);
+    });
+    for (auto cast : deadCasts)
+      cast.erase();
   }
 
   // Collect the symbols in the root op such that the HW-to-LLVM lowering can

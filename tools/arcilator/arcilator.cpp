@@ -34,6 +34,7 @@
 #include "circt/Dialect/LLHD/LLHDPasses.h"
 #include "circt/Dialect/LTL/LTLDialect.h"
 #include "circt/Dialect/Moore/MooreDialect.h"
+#include "circt/Dialect/Moore/MoorePasses.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
@@ -785,8 +786,11 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     return;
   // In strict mode (`--strip-verification=false`), keep `verif.*` ops in the IR
   // and lower supported assertions later during Arc state lowering.
-  if (inputHasMoore)
+  if (inputHasMoore) {
+    pm.addPass(moore::createInlineCallsPass());
+    pm.addPass(mlir::createSymbolDCEPass());
     pm.addPass(createConvertMooreToCorePass());
+  }
   pm.addPass(om::createStripOMPass());
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
@@ -832,11 +836,22 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
   // Restructure the input from a `hw.module` hierarchy to a collection of arcs.
   if (untilReached(UntilArcConversion))
     return;
-
-  ArcConversionOptions conversionOpt;
-  conversionOpt.observeRegisters = observeRegisters || !jitVcdFile.empty();
-  conversionOpt.shouldDedup = shouldDedup;
-  populateArcConversionPipeline(pm, conversionOpt);
+  // Flatten the HW module hierarchy before converting to arcs. This avoids
+  // passing reference-like values (e.g. interface bundles lowered to
+  // `!llhd.ref<!hw.struct>`) through module ports, which can otherwise leave
+  // behind unresolved LLHD probe materializations during Arc conversion.
+  pm.addPass(hw::createFlattenModules());
+  pm.addPass(createCSEPass());
+  {
+    ConvertToArcsPassOptions opts;
+    opts.tapRegisters = observeRegisters || !jitVcdFile.empty();
+    pm.addPass(createConvertToArcsPass(opts));
+  }
+  if (shouldDedup)
+    pm.addPass(arc::createDedupPass());
+  pm.addPass(hw::createFlattenModules());
+  pm.addPass(createCSEPass());
+  pm.addPass(arc::createArcCanonicalizerPass());
 
   // Perform arc-level optimizations that are not specific to software
   // simulation.

@@ -1,4 +1,5 @@
 add_circt_dialect_library(CIRCTMooreTransforms
+InlineCalls.cpp
 LowerConcatRef.cpp
 SimplifyProcedures.cpp
 CreateVTables.cpp

@@ -134,6 +134,7 @@ struct Context {
 
   /// Convert hierarchy and structure AST nodes to MLIR ops.
   LogicalResult convertCompilation();
+  LogicalResult finalizeUvmShims();
   ModuleLowering *
   convertModuleHeader(const slang::ast::InstanceBodySymbol *module);
   LogicalResult convertModuleBody(const slang::ast::InstanceBodySymbol *module);
@@ -379,6 +380,9 @@ struct Context {
 
   /// A stack of implicit `this` handles for methods currently being lowered.
   SmallVector<Value> thisStack;
+  /// A stack of the Slang class types corresponding to entries in `thisStack`.
+  /// Entries may be null if the receiver type is not a concrete class.
+  SmallVector<const slang::ast::ClassType *> thisClassStack;
 
   /// A listener called for every variable or net being read. This can be used
   /// to collect all variables read as part of an expression or statement, for

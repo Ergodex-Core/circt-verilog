@@ -13,11 +13,20 @@
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/Seq/SeqTypes.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/JSON.h"
 
 using namespace mlir;
 using namespace circt;
 using namespace arc;
+
+static constexpr const char kArcilatorSigIdAttr[] = "arcilator.sig_id";
+static constexpr const char kArcilatorSigOffsetAttr[] = "arcilator.sig_offset";
+static constexpr const char kArcilatorSigTotalWidthAttr[] =
+    "arcilator.sig_total_width";
+static constexpr const char kArcilatorSigInitU64Attr[] = "arcilator.sig_init_u64";
+static constexpr const char kArcilatorSigInitsAttr[] = "arcilator.sig_inits";
 
 /// Detect `{unknown, value}` 4-state structs and compute the semantic bit width
 /// and element byte offsets (relative to the struct base).
@@ -91,6 +100,178 @@ static bool getFourStateInfo(Type type, unsigned &bitWidth,
   unknownOffsetBytes = (llvmUnknownIdx == 0) ? off0 : off1;
   valueOffsetBytes = (llvmValueIdx == 0) ? off0 : off1;
   return true;
+}
+
+static void collectCompositeChildStates(Type type, StringRef baseName,
+                                       unsigned baseOffsetBytes,
+                                       StateInfo::Type kind,
+                                       SmallVector<StateInfo> &states) {
+  if (auto inoutType = dyn_cast<hw::InOutType>(type))
+    type = inoutType.getElementType();
+
+  unsigned fourStateBits = 0;
+  unsigned valueOff = 0;
+  unsigned unknownOff = 0;
+  if (getFourStateInfo(type, fourStateBits, valueOff, unknownOff))
+    return;
+
+  if (isa<IntegerType, hw::StringType, seq::ClockType>(type))
+    return;
+
+  auto structType = dyn_cast<hw::StructType>(type);
+  if (!structType)
+    return;
+
+  auto elements = structType.getElements();
+  SmallVector<uint64_t> offsets(elements.size(), 0);
+
+  uint64_t structWidth = 0;
+  uint64_t structAlignment = 8;
+  for (size_t llvmIdx = 0, e = elements.size(); llvmIdx < e; ++llvmIdx) {
+    size_t origIdx = e - llvmIdx - 1;
+    Type elemTy = elements[origIdx].type;
+
+    uint64_t elemWidth = arc::StateType::get(elemTy).getBitWidth();
+    elemWidth = std::max<uint64_t>(elemWidth, 8);
+    uint64_t alignment = llvm::bit_ceil(std::min<uint64_t>(elemWidth, 16 * 8));
+    uint64_t alignedWidth = llvm::alignToPowerOf2(elemWidth, alignment);
+
+    structWidth = llvm::alignToPowerOf2(structWidth, alignment);
+    offsets[origIdx] = structWidth / 8;
+    structWidth += alignedWidth;
+    structAlignment = std::max<uint64_t>(structAlignment, alignment);
+  }
+  (void)llvm::alignToPowerOf2(structWidth, structAlignment);
+
+  for (auto [idx, element] : llvm::enumerate(elements)) {
+    std::string childName = (baseName + "/" + element.name.getValue()).str();
+    unsigned childOffset =
+        baseOffsetBytes + static_cast<unsigned>(offsets[idx]);
+    Type childType = element.type;
+    if (auto inoutType = dyn_cast<hw::InOutType>(childType))
+      childType = inoutType.getElementType();
+
+    unsigned childFourBits = 0;
+    unsigned childValueOff = 0;
+    unsigned childUnknownOff = 0;
+    if (getFourStateInfo(childType, childFourBits, childValueOff,
+                         childUnknownOff)) {
+      StateInfo info;
+      info.type = kind;
+      info.name = childName;
+      info.offset = childOffset;
+      info.numBits = childFourBits;
+      info.storageBytes = arc::StateType::get(childType).getByteWidth();
+      info.valueOffset = childValueOff;
+      info.unknownOffset = childUnknownOff;
+      states.push_back(info);
+      continue;
+    }
+
+    if (auto intType = dyn_cast<IntegerType>(childType)) {
+      StateInfo info;
+      info.type = kind;
+      info.name = childName;
+      info.offset = childOffset;
+      info.numBits = intType.getWidth();
+      info.storageBytes = arc::StateType::get(childType).getByteWidth();
+      states.push_back(info);
+      continue;
+    }
+
+    if (isa<seq::ClockType>(childType)) {
+      StateInfo info;
+      info.type = kind;
+      info.name = childName;
+      info.offset = childOffset;
+      info.numBits = 1;
+      info.storageBytes = 1;
+      states.push_back(info);
+      continue;
+    }
+
+  collectCompositeChildStates(childType, childName, childOffset, kind, states);
+  }
+}
+
+static void collectRuntimeSignalInits(ModelOp modelOp,
+                                      SmallVector<RuntimeSignalInitInfo> &inits) {
+  llvm::DenseMap<uint64_t, RuntimeSignalInitInfo> byId;
+
+  // Prefer a pre-collected summary attribute produced during ConvertToArcs,
+  // since the handle ops that carry `arcilator.sig_init_u64` are often DCE'd
+  // away by later lowering/canonicalization passes.
+  if (auto arr = modelOp->getAttrOfType<ArrayAttr>(kArcilatorSigInitsAttr)) {
+    for (Attribute entry : arr) {
+      auto dict = dyn_cast<DictionaryAttr>(entry);
+      if (!dict)
+        continue;
+      auto sigIdAttr = dyn_cast_or_null<IntegerAttr>(dict.get("sigId"));
+      auto initAttr = dyn_cast_or_null<IntegerAttr>(dict.get("initU64"));
+      auto widthAttr = dyn_cast_or_null<IntegerAttr>(dict.get("totalWidth"));
+      if (!sigIdAttr || !initAttr)
+        continue;
+      uint64_t sigId = sigIdAttr.getValue().getZExtValue();
+      uint64_t initU64 = initAttr.getValue().getZExtValue();
+      uint64_t totalWidth =
+          widthAttr ? widthAttr.getValue().getZExtValue() : 0;
+      (void)byId.try_emplace(sigId,
+                             RuntimeSignalInitInfo{sigId, initU64, totalWidth});
+    }
+
+    inits.reserve(byId.size());
+    for (auto &it : byId)
+      inits.push_back(it.second);
+    llvm::sort(inits, [](const auto &a, const auto &b) {
+      return a.sigId < b.sigId;
+    });
+    return;
+  }
+
+  modelOp.walk([&](Operation *op) {
+    auto sigIdAttr = op->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr);
+    if (!sigIdAttr)
+      return;
+
+    auto initAttr = op->getAttrOfType<IntegerAttr>(kArcilatorSigInitU64Attr);
+    if (!initAttr)
+      return;
+
+    uint64_t baseOffset = 0;
+    if (auto offAttr = op->getAttrOfType<IntegerAttr>(kArcilatorSigOffsetAttr))
+      baseOffset = offAttr.getValue().getZExtValue();
+    if (baseOffset != 0)
+      return;
+
+    uint64_t totalWidth = 0;
+    if (auto widthAttr =
+            op->getAttrOfType<IntegerAttr>(kArcilatorSigTotalWidthAttr))
+      totalWidth = widthAttr.getValue().getZExtValue();
+
+    uint64_t sigId = sigIdAttr.getValue().getZExtValue();
+    uint64_t initU64 = initAttr.getValue().getZExtValue();
+
+    auto [it, inserted] = byId.try_emplace(
+        sigId, RuntimeSignalInitInfo{sigId, initU64, totalWidth});
+    if (!inserted) {
+      // Keep the first init value and width, but sanity-check that duplicates
+      // remain consistent.
+      if (it->second.initU64 != initU64)
+        op->emitWarning("conflicting arcilator.sig_init_u64 for sigId ")
+            << sigId;
+      if (totalWidth != 0 && it->second.totalWidth != 0 &&
+          it->second.totalWidth != totalWidth)
+        op->emitWarning("conflicting arcilator.sig_total_width for sigId ")
+            << sigId;
+    }
+  });
+
+  inits.reserve(byId.size());
+  for (auto &it : byId)
+    inits.push_back(it.second);
+  llvm::sort(inits, [](const auto &a, const auto &b) {
+    return a.sigId < b.sigId;
+  });
 }
 
 LogicalResult circt::arc::collectStates(Value storage, unsigned offset,
@@ -182,6 +363,8 @@ LogicalResult circt::arc::collectStates(Value storage, unsigned offset,
       for (auto name : names) {
         stateInfo.name = name.getValue();
         states.push_back(stateInfo);
+        collectCompositeChildStates(stateType.getType(), stateInfo.name,
+                                    stateInfo.offset, stateInfo.type, states);
       }
       continue;
     }
@@ -223,9 +406,12 @@ LogicalResult circt::arc::collectModels(mlir::ModuleOp module,
     llvm::stable_sort(states,
                       [](auto &a, auto &b) { return a.offset < b.offset; });
 
+    SmallVector<RuntimeSignalInitInfo> sigInits;
+    collectRuntimeSignalInits(modelOp, sigInits);
+
     models.emplace_back(std::string(modelOp.getName()), storageType.getSize(),
-                        std::move(states), modelOp.getInitialFnAttr(),
-                        modelOp.getFinalFnAttr());
+                        std::move(states), std::move(sigInits),
+                        modelOp.getInitialFnAttr(), modelOp.getFinalFnAttr());
   }
 
   return success();
@@ -245,6 +431,15 @@ void circt::arc::serializeModelInfoToJson(llvm::raw_ostream &outputStream,
                                            : model.initialFnSym.getValue());
         json.attribute("finalFnSym",
                        !model.finalFnSym ? "" : model.finalFnSym.getValue());
+        json.attributeArray("sigInits", [&] {
+          for (const auto &init : model.sigInits) {
+            json.object([&] {
+              json.attribute("sigId", init.sigId);
+              json.attribute("initU64", init.initU64);
+              json.attribute("totalWidth", init.totalWidth);
+            });
+          }
+        });
         json.attributeArray("states", [&] {
           for (const auto &state : model.states) {
             json.object([&] {

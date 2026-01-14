@@ -17,10 +17,13 @@
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Support/ConversionPatternSet.h"
 #include "circt/Support/Namespace.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
@@ -28,6 +31,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/Support/Debug.h"
+#include <cstdlib>
 
 #define DEBUG_TYPE "convert-to-arcs"
 
@@ -44,10 +48,19 @@ static constexpr StringLiteral kArcilatorSigIdAttr = "arcilator.sig_id";
 static constexpr StringLiteral kArcilatorSigOffsetAttr = "arcilator.sig_offset";
 static constexpr StringLiteral kArcilatorSigTotalWidthAttr =
     "arcilator.sig_total_width";
+static constexpr StringLiteral kArcilatorSigInitU64Attr =
+    "arcilator.sig_init_u64";
 static constexpr StringLiteral kArcilatorSigDynExtractAttr =
     "arcilator.sig_dyn_extract";
 static constexpr StringLiteral kArcilatorNeedsSchedulerAttr =
     "arcilator.needs_scheduler";
+static constexpr StringLiteral kArcilatorSigInitsAttr =
+    "arcilator.sig_inits";
+
+struct ArcilatorRuntimeSigInit {
+  uint64_t initU64 = 0;
+  uint64_t totalWidth = 0;
+};
 
 static Value stripCasts(Value value) {
   while (auto castOp =
@@ -57,6 +70,181 @@ static Value stripCasts(Value value) {
     value = castOp.getInputs().front();
   }
   return value;
+}
+
+static bool isFourStateValueUnknownStruct(Type ty, unsigned &fieldWidth) {
+  auto structTy = dyn_cast<hw::StructType>(ty);
+  if (!structTy)
+    return false;
+  auto elements = structTy.getElements();
+  if (elements.size() != 2)
+    return false;
+  if (elements[0].name.getValue() != "value" ||
+      elements[1].name.getValue() != "unknown")
+    return false;
+  auto valueTy = dyn_cast<IntegerType>(elements[0].type);
+  auto unknownTy = dyn_cast<IntegerType>(elements[1].type);
+  if (!valueTy || !unknownTy || valueTy.getWidth() != unknownTy.getWidth())
+    return false;
+  fieldWidth = static_cast<unsigned>(valueTy.getWidth());
+  return true;
+}
+
+static std::optional<APInt> tryEvalIntConstant(Value value, unsigned bitWidth) {
+  value = stripCasts(value);
+  APInt bits;
+  if (matchPattern(value, mlir::m_ConstantInt(&bits)))
+    return bits.zextOrTrunc(bitWidth);
+  return std::nullopt;
+}
+
+static Type stripInOutAndAliasTypes(Type ty) {
+  if (auto inoutTy = dyn_cast<hw::InOutType>(ty))
+    ty = inoutTy.getElementType();
+  while (auto alias = dyn_cast<hw::TypeAliasType>(ty))
+    ty = alias.getInnerType();
+  return ty;
+}
+
+static std::optional<APInt> tryEvalRuntimeSignalInitAttr(Attribute initAttr,
+                                                         Type elemTy);
+
+static std::optional<APInt>
+tryEvalRuntimeSignalInitStructFields(ArrayRef<Attribute> fields,
+                                     hw::StructType structTy) {
+  const unsigned structWidth =
+      static_cast<unsigned>(hw::getBitWidth(structTy));
+  if (structWidth == 0 || structWidth > 64)
+    return std::nullopt;
+
+  auto elements = structTy.getElements();
+  if (fields.size() != elements.size())
+    return std::nullopt;
+
+  APInt packed(structWidth, 0);
+  for (unsigned idx = 0, e = elements.size(); idx < e; ++idx) {
+    Type fieldTy = elements[idx].type;
+    int64_t fieldWidthSigned = hw::getBitWidth(fieldTy);
+    if (fieldWidthSigned <= 0)
+      return std::nullopt;
+    unsigned fieldWidth = static_cast<unsigned>(fieldWidthSigned);
+    if (fieldWidth > 64)
+      return std::nullopt;
+
+    // Match HW struct packing (MSB-first). Keep the special-case 4-state
+    // `{value, unknown}` encoding stable by treating `value` as low bits.
+    uint64_t fieldOffsetLSB = 0;
+    if (elements.size() == 2 && elements[0].name.getValue() == "value" &&
+        elements[1].name.getValue() == "unknown") {
+      if (idx == 0) {
+        fieldOffsetLSB = 0;
+      } else {
+        fieldOffsetLSB = static_cast<uint64_t>(fieldWidth);
+      }
+    } else {
+      uint64_t prefixWidth = 0;
+      for (unsigned i = 0; i < idx; ++i) {
+        int64_t w = hw::getBitWidth(elements[i].type);
+        if (w <= 0)
+          return std::nullopt;
+        prefixWidth += static_cast<uint64_t>(w);
+      }
+      uint64_t structWidthU = static_cast<uint64_t>(structWidth);
+      uint64_t fieldWidthU = static_cast<uint64_t>(fieldWidth);
+      if (prefixWidth + fieldWidthU > structWidthU)
+        return std::nullopt;
+      fieldOffsetLSB = structWidthU - prefixWidth - fieldWidthU;
+    }
+
+    auto fieldBits = tryEvalRuntimeSignalInitAttr(fields[idx], fieldTy);
+    if (!fieldBits)
+      return std::nullopt;
+    APInt slice = fieldBits->zextOrTrunc(fieldWidth);
+    packed |= slice.zext(structWidth).shl(fieldOffsetLSB);
+  }
+  return packed;
+}
+
+static std::optional<APInt> tryEvalRuntimeSignalInitAttr(Attribute initAttr,
+                                                         Type elemTy) {
+  elemTy = stripInOutAndAliasTypes(elemTy);
+
+  if (auto intTy = dyn_cast<IntegerType>(elemTy)) {
+    auto intAttr = dyn_cast<IntegerAttr>(initAttr);
+    if (!intAttr)
+      return std::nullopt;
+    return intAttr.getValue().zextOrTrunc(static_cast<unsigned>(intTy.getWidth()));
+  }
+
+  unsigned fieldWidth = 0;
+  if (isFourStateValueUnknownStruct(elemTy, fieldWidth)) {
+    auto fields = dyn_cast<ArrayAttr>(initAttr);
+    if (!fields || fields.size() != 2)
+      return std::nullopt;
+    auto valueAttr = dyn_cast<IntegerAttr>(fields[0]);
+    auto unknownAttr = dyn_cast<IntegerAttr>(fields[1]);
+    if (!valueAttr || !unknownAttr)
+      return std::nullopt;
+    APInt valueBits = valueAttr.getValue().zextOrTrunc(fieldWidth);
+    APInt unknownBits = unknownAttr.getValue().zextOrTrunc(fieldWidth);
+    unsigned totalWidth = 2 * fieldWidth;
+    APInt packed =
+        unknownBits.zext(totalWidth).shl(fieldWidth) | valueBits.zext(totalWidth);
+    return packed;
+  }
+
+  if (auto structTy = dyn_cast<hw::StructType>(elemTy)) {
+    auto fieldsAttr = dyn_cast<ArrayAttr>(initAttr);
+    if (!fieldsAttr)
+      return std::nullopt;
+    return tryEvalRuntimeSignalInitStructFields(fieldsAttr.getValue(), structTy);
+  }
+
+  // Note: arrays/memories are currently not supported for runtime-managed
+  // signal init evaluation. Extend as needed.
+  return std::nullopt;
+}
+
+static std::optional<APInt> tryEvalRuntimeSignalInit(Value init, Type elemTy) {
+  init = stripCasts(init);
+  elemTy = stripInOutAndAliasTypes(elemTy);
+
+  if (auto intTy = dyn_cast<IntegerType>(elemTy)) {
+    auto bits = tryEvalIntConstant(init, static_cast<unsigned>(intTy.getWidth()));
+    if (!bits)
+      return std::nullopt;
+    return *bits;
+  }
+
+  unsigned fieldWidth = 0;
+  if (!isFourStateValueUnknownStruct(elemTy, fieldWidth))
+    return std::nullopt;
+
+  // struct<value,unknown> initializer: pack as [value (low), unknown (high)].
+  if (auto create = init.getDefiningOp<hw::StructCreateOp>()) {
+    if (create.getOperands().size() != 2)
+      return std::nullopt;
+    auto valueBits = tryEvalIntConstant(create.getOperands()[0], fieldWidth);
+    auto unknownBits = tryEvalIntConstant(create.getOperands()[1], fieldWidth);
+    if (!valueBits || !unknownBits)
+      return std::nullopt;
+    unsigned totalWidth = 2 * fieldWidth;
+    APInt packed = unknownBits->zext(totalWidth).shl(fieldWidth) |
+                   valueBits->zext(totalWidth);
+    return packed;
+  }
+
+  if (auto agg = init.getDefiningOp<hw::AggregateConstantOp>()) {
+    return tryEvalRuntimeSignalInitAttr(agg.getFields(), elemTy);
+  }
+
+  // Already-packed integer constant initializer.
+  if (auto cst = init.getDefiningOp<hw::ConstantOp>()) {
+    unsigned totalWidth = 2 * fieldWidth;
+    return cst.getValue().zextOrTrunc(totalWidth);
+  }
+
+  return std::nullopt;
 }
 
 static Attribute getZeroHWAttr(OpBuilder &builder, Type type) {
@@ -153,17 +341,46 @@ static bool needsCycleScheduler(llhd::ProcessOp op) {
   // "run once then stop" semantics via the runtime PC state.
   bool hasHalt = !op.getOps<llhd::HaltOp>().empty();
   bool hasDelay = false;
-  bool hasWideObserved = false;
+  bool hasObserved = false;
   op.walk([&](llhd::WaitOp wait) {
     if (wait.getDelay())
       hasDelay = true;
-    for (Value obs : wait.getObserved()) {
-      auto intTy = dyn_cast<IntegerType>(obs.getType());
-      if (!intTy || intTy.getWidth() != 1)
-        hasWideObserved = true;
-    }
+    if (!wait.getObserved().empty())
+      hasObserved = true;
   });
-  return hasHalt || hasDelay || hasWideObserved;
+  return hasHalt || hasDelay || hasObserved;
+}
+
+static bool isRematerializableCallForPolling(mlir::func::CallOp call) {
+  auto callee = call.getCallee();
+  if (callee.empty())
+    return false;
+
+  // Observed values in scheduled waits often depend on runtime "getter" shims
+  // (e.g. virtual interface indirections). Treat these calls as rematerializable
+  // since they are side-effect free and deterministic with respect to runtime
+  // state.
+  return callee == "circt_sv_class_get_ptr" ||
+         callee == "circt_sv_class_get_i32" ||
+         callee == "circt_sv_class_get_type" ||
+         callee == "circt_sv_dynarray_size_i32" ||
+         callee == "circt_sv_dynarray_get_i32" ||
+         callee == "circt_sv_queue_size_i32" ||
+         callee == "circt_sv_assoc_exists_str_i32" ||
+         callee == "circt_sv_assoc_get_str_i32" ||
+         callee == "__arcilator_sig_load_u64" ||
+         callee == "__arcilator_frame_load_u64" ||
+         callee == "circt_uvm_coreservice_get" ||
+         callee == "circt_uvm_coreservice_get_root" ||
+         callee == "circt_uvm_root_get" ||
+         callee == "circt_uvm_report_server_get_server" ||
+         callee == "circt_uvm_get_severity_count" ||
+         callee == "circt_uvm_phase_all_done" ||
+         callee == "circt_uvm_component_count" ||
+         callee == "circt_uvm_component_get" ||
+         callee == "circt_uvm_component_get_full_name" ||
+         callee == "circt_uvm_resource_db_get_i32" ||
+         callee == "circt_uvm_resource_db_get_ptr";
 }
 
 static bool isRematerializableForPolling(Operation *op) {
@@ -173,6 +390,8 @@ static bool isRematerializableForPolling(Operation *op) {
     return false;
   if (op->hasTrait<OpTrait::IsTerminator>())
     return false;
+  if (auto call = dyn_cast<mlir::func::CallOp>(op))
+    return isRematerializableCallForPolling(call);
   // Treat LLHD signal declarations as rematerializable handles. For scheduled
   // processes we lower signals into runtime-managed storage keyed by a stable
   // id, so cloning the declaration is equivalent to duplicating the handle.
@@ -239,10 +458,6 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
     return success();
 
   Block *entryBlock = &region.front();
-  for (auto &block : region)
-    if (&block != entryBlock && !block.getArguments().empty())
-      return execOp.emitOpError()
-             << "cannot lower scheduled process with non-entry block arguments";
 
   auto module = execOp->getParentOfType<mlir::ModuleOp>();
   if (!module)
@@ -302,6 +517,218 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   rewriter.setInsertionPointToEnd(exitBlock);
   arc::OutputOp::create(rewriter, loc, ValueRange{});
 
+  // Helpers to pack/unpack values stored in the cycle-scheduler frame.
+  auto canFrameType = [&](Type ty) -> bool {
+    if (isa<hw::InOutType>(ty))
+      return false;
+    int64_t bw = hw::getBitWidth(ty);
+    return bw > 0 && bw <= 64;
+  };
+  auto packToI64 = [&](Value value) -> FailureOr<Value> {
+    Type ty = value.getType();
+    int64_t bw = hw::getBitWidth(ty);
+    if (bw <= 0 || bw > 64)
+      return failure();
+    Location loc = value.getLoc();
+    Value bits = value;
+    auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
+    if (!isa<IntegerType>(ty))
+      bits = rewriter.createOrFold<hw::BitcastOp>(loc, intTy, value);
+    if (bw < 64)
+      bits = comb::createZExt(rewriter, loc, bits, 64);
+    return bits;
+  };
+  auto unpackFromI64 = [&](Value packed, Type ty,
+                           Location loc) -> FailureOr<Value> {
+    int64_t bw = hw::getBitWidth(ty);
+    if (bw <= 0 || bw > 64)
+      return failure();
+    Value bits = packed;
+    if (bw < 64)
+      bits = comb::ExtractOp::create(rewriter, loc, packed, 0,
+                                     static_cast<unsigned>(bw));
+    if (isa<IntegerType>(ty))
+      return bits;
+    auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
+    return rewriter.createOrFold<hw::BitcastOp>(loc, ty, bits);
+  };
+
+  // Lower SSA block arguments (phi nodes) by modeling branch operands as frame
+  // stores and replacing the block arguments with frame loads. This avoids
+  // having to pass operands when the scheduler jumps directly to a state.
+  DenseMap<Block *, SmallVector<std::pair<BlockArgument, uint32_t>>>
+      phiArgsByBlock;
+  uint32_t nextPhiSlot = 0;
+  for (Block &block : region) {
+    if (&block == dispatchBlock || &block == exitBlock)
+      continue;
+    if (block.getArguments().empty())
+      continue;
+    auto &args = phiArgsByBlock[&block];
+    for (BlockArgument arg : block.getArguments()) {
+      if (!canFrameType(arg.getType()))
+        return execOp.emitOpError()
+               << "cannot lower scheduled process with block argument of type "
+               << arg.getType();
+      args.push_back({arg, nextPhiSlot++});
+    }
+  }
+
+  auto emitPhiStores = [&](Location storeLoc, Block *dest,
+                           ValueRange operands) -> LogicalResult {
+    auto it = phiArgsByBlock.find(dest);
+    if (it == phiArgsByBlock.end())
+      return success();
+    auto &args = it->second;
+    if (operands.size() != args.size())
+      return failure();
+    for (auto [operand, argInfo] : llvm::zip(operands, args)) {
+      auto packed = packToI64(operand);
+      if (failed(packed))
+        return failure();
+      Value slotVal = buildI32Constant(rewriter, storeLoc, argInfo.second);
+      rewriter.create<mlir::func::CallOp>(
+          storeLoc, "__arcilator_frame_store_u64", TypeRange{},
+          ValueRange{procIdVal, slotVal, *packed});
+    }
+    return success();
+  };
+
+  if (!phiArgsByBlock.empty()) {
+    // Rewrite branches to perform frame stores along edges that would have
+    // supplied phi operands.
+    SmallVector<Operation *> terminators;
+    terminators.reserve(region.getBlocks().size());
+    for (Block &block : region)
+      terminators.push_back(block.getTerminator());
+
+    for (Operation *terminator : terminators) {
+      if (auto br = dyn_cast<mlir::cf::BranchOp>(terminator)) {
+        Block *dest = br.getDest();
+        if (phiArgsByBlock.contains(dest)) {
+          rewriter.setInsertionPoint(br);
+          if (failed(emitPhiStores(br.getLoc(), dest, br.getDestOperands())))
+            return br.emitOpError() << "failed to lower branch block arguments";
+          rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(br, dest);
+        }
+        continue;
+      }
+
+      if (auto br = dyn_cast<mlir::cf::CondBranchOp>(terminator)) {
+        Block *trueDest = br.getTrueDest();
+        Block *falseDest = br.getFalseDest();
+        bool needsTrueStores = phiArgsByBlock.contains(trueDest);
+        bool needsFalseStores = phiArgsByBlock.contains(falseDest);
+        if (!needsTrueStores && !needsFalseStores)
+          continue;
+
+        auto insertIt = std::next(Region::iterator(br->getBlock()));
+
+        Block *newTrueDest = trueDest;
+        if (needsTrueStores) {
+          auto *storeBlock = rewriter.createBlock(&region, insertIt);
+          rewriter.setInsertionPointToEnd(storeBlock);
+          if (failed(emitPhiStores(br.getLoc(), trueDest,
+                                  br.getTrueDestOperands())))
+            return br.emitOpError()
+                   << "failed to lower true-branch block arguments";
+          mlir::cf::BranchOp::create(rewriter, br.getLoc(), trueDest);
+          newTrueDest = storeBlock;
+        }
+
+        Block *newFalseDest = falseDest;
+        if (needsFalseStores) {
+          auto *storeBlock = rewriter.createBlock(&region, insertIt);
+          rewriter.setInsertionPointToEnd(storeBlock);
+          if (failed(emitPhiStores(br.getLoc(), falseDest,
+                                  br.getFalseDestOperands())))
+            return br.emitOpError()
+                   << "failed to lower false-branch block arguments";
+          mlir::cf::BranchOp::create(rewriter, br.getLoc(), falseDest);
+          newFalseDest = storeBlock;
+        }
+
+        rewriter.setInsertionPoint(br);
+        rewriter.replaceOpWithNewOp<mlir::cf::CondBranchOp>(
+            br, br.getCondition(), newTrueDest, ValueRange{}, newFalseDest,
+            ValueRange{});
+        continue;
+      }
+
+      if (auto sw = dyn_cast<mlir::cf::SwitchOp>(terminator)) {
+        bool needsRewrite = phiArgsByBlock.contains(sw.getDefaultDestination());
+        for (Block *dest : sw.getCaseDestinations())
+          needsRewrite |= phiArgsByBlock.contains(dest);
+        if (!needsRewrite)
+          continue;
+
+        auto insertIt = std::next(Region::iterator(sw->getBlock()));
+
+        auto makeStoreBlock = [&](Block *dest, ValueRange operands)
+            -> FailureOr<Block *> {
+          if (!phiArgsByBlock.contains(dest))
+            return dest;
+          auto *storeBlock = rewriter.createBlock(&region, insertIt);
+          rewriter.setInsertionPointToEnd(storeBlock);
+          if (failed(emitPhiStores(sw.getLoc(), dest, operands)))
+            return failure();
+          mlir::cf::BranchOp::create(rewriter, sw.getLoc(), dest);
+          return storeBlock;
+        };
+
+        auto newDefault = makeStoreBlock(sw.getDefaultDestination(),
+                                         sw.getDefaultOperands());
+        if (failed(newDefault))
+          return sw.emitOpError() << "failed to lower default block arguments";
+
+        SmallVector<Block *> newCaseDests;
+        SmallVector<ValueRange> newCaseOperands;
+        for (auto [dest, operands] :
+             llvm::zip(sw.getCaseDestinations(), sw.getCaseOperands())) {
+          auto newDest = makeStoreBlock(dest, operands);
+          if (failed(newDest))
+            return sw.emitOpError() << "failed to lower case block arguments";
+          newCaseDests.push_back(*newDest);
+          newCaseOperands.push_back(ValueRange{});
+        }
+
+        rewriter.setInsertionPoint(sw);
+        auto caseValuesAttr = sw.getCaseValuesAttr();
+        rewriter.replaceOpWithNewOp<mlir::cf::SwitchOp>(
+            sw, sw.getFlag(), *newDefault, ValueRange{}, caseValuesAttr,
+            mlir::BlockRange(newCaseDests), newCaseOperands);
+        continue;
+      }
+    }
+
+    // Replace the phi arguments with loads in their destination blocks and
+    // erase the arguments.
+    for (auto &it : phiArgsByBlock) {
+      Block *block = it.first;
+      auto &args = it.second;
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToStart(block);
+      for (auto [arg, slot] : args) {
+        Value slotVal = buildI32Constant(rewriter, arg.getLoc(), slot);
+        Value loaded =
+            rewriter
+                .create<mlir::func::CallOp>(arg.getLoc(),
+                                            "__arcilator_frame_load_u64",
+                                            rewriter.getI64Type(),
+                                            ValueRange{procIdVal, slotVal})
+                .getResult(0);
+        auto unpacked = unpackFromI64(loaded, arg.getType(), arg.getLoc());
+        if (failed(unpacked))
+          return execOp.emitOpError()
+                 << "cannot reload block argument of type " << arg.getType();
+        arg.replaceAllUsesWith(*unpacked);
+      }
+      while (block->getNumArguments() != 0)
+        block->eraseArgument(0);
+    }
+  }
+  uint32_t spillSlotBase = nextPhiSlot;
+
   // If there are no waits, avoid the full PC-based state dispatch and hoisting.
   // We only need to model "run once then stop" semantics for one-shot processes
   // ending in `llhd.halt`.
@@ -359,7 +786,9 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       bool isHandleLike = isa<llhd::SignalOp>(op) || op.hasTrait<OpTrait::ConstantLike>();
       if (!isHandleLike) {
         isHandleLike = llvm::any_of(op.getResultTypes(), [](Type ty) {
-          return isa<hw::InOutType>(ty);
+          if (auto alias = dyn_cast<hw::TypeAliasType>(ty))
+            ty = alias.getInnerType();
+          return isa<hw::InOutType, hw::StringType>(ty);
         });
       }
       if (!isHandleLike)
@@ -472,8 +901,6 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   for (auto [waitBlock, waitOp] : waitBlocks) {
     if (!waitOp.getYieldOperands().empty())
       return waitOp.emitOpError() << "scheduled wait with yield operands unsupported";
-    if (!waitOp.getDestOperands().empty())
-      return waitOp.emitOpError() << "scheduled wait with dest operands unsupported";
 
     rewriter.setInsertionPoint(waitOp);
 
@@ -484,6 +911,13 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         buildI32Constant(rewriter, waitOp.getLoc(), waitIdAttr.getInt());
 
     Value ready;
+    // If the wait resumes into a block with (lowered) phi arguments, store the
+    // destination operands into the scheduler frame so the destination block's
+    // frame loads observe the correct values when we resume.
+    if (failed(emitPhiStores(waitOp.getLoc(), waitOp.getDest(),
+                             waitOp.getDestOperands())))
+      return waitOp.emitOpError()
+             << "failed to lower scheduled wait dest operands";
     if (auto delay = waitOp.getDelay()) {
       auto delayFs = tryExtractDelayFs(delay);
       if (failed(delayFs))
@@ -500,7 +934,14 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       // Combine observed values into a single signature to keep the runtime API
       // simple. Rematerialize observed reads into the wait block so each poll
       // sees the current value even when the scheduler jumps directly here.
-      Value sig = buildI64Constant(rewriter, waitOp.getLoc(), 0);
+      // NOTE: The signature must change for any observed change. A plain XOR
+      // across observed fields is commutative and can cancel (e.g. 4-state clocks
+      // transitioning X->1 flip both `{value, unknown}` bits, and `value ^ unknown`
+      // may remain constant). Use an order-dependent hash combine instead.
+      constexpr uint64_t kFNVOffsetBasis64 = 0xcbf29ce484222325ULL;
+      constexpr uint64_t kFNVPrime64 = 0x100000001b3ULL;
+      Value sig = buildI64Constant(rewriter, waitOp.getLoc(), kFNVOffsetBasis64);
+      Value fnvPrime = buildI64Constant(rewriter, waitOp.getLoc(), kFNVPrime64);
       DenseMap<Value, Value> rematCache;
       for (Value obs : waitOp.getObserved()) {
         auto remat = rematerializeValueForPolling(obs, rematCache, rewriter);
@@ -516,6 +957,8 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
           if (intTy.getWidth() < 64)
             ext = comb::createZExt(rewriter, waitOp.getLoc(), intVal, 64);
           sig = comb::XorOp::create(rewriter, waitOp.getLoc(), sig, ext, true);
+          sig = comb::MulOp::create(rewriter, waitOp.getLoc(),
+                                    ValueRange{sig, fnvPrime}, true);
           return success();
         };
 
@@ -596,46 +1039,12 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   // Spilling: any SSA value defined in one scheduler state and used in another
   // must be preserved across suspension/resume. Model this with a simple
   // per-process frame array managed by the runtime.
-  auto canSpillType = [&](Type ty) -> bool {
-    if (isa<hw::InOutType>(ty))
-      return false;
-    int64_t bw = hw::getBitWidth(ty);
-    return bw > 0 && bw <= 64;
-  };
-  auto packToI64 = [&](Value value) -> FailureOr<Value> {
-    Type ty = value.getType();
-    int64_t bw = hw::getBitWidth(ty);
-    if (bw <= 0 || bw > 64)
-      return failure();
-    Location loc = value.getLoc();
-    Value bits = value;
-    auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
-    if (!isa<IntegerType>(ty))
-      bits = rewriter.createOrFold<hw::BitcastOp>(loc, intTy, value);
-    if (bw < 64)
-      bits = comb::createZExt(rewriter, loc, bits, 64);
-    return bits;
-  };
-  auto unpackFromI64 = [&](Value packed, Type ty, Location loc) -> FailureOr<Value> {
-    int64_t bw = hw::getBitWidth(ty);
-    if (bw <= 0 || bw > 64)
-      return failure();
-    Value bits = packed;
-    if (bw < 64)
-      bits = comb::ExtractOp::create(rewriter, loc, packed, 0,
-                                     static_cast<unsigned>(bw));
-    if (isa<IntegerType>(ty))
-      return bits;
-    auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
-    return rewriter.createOrFold<hw::BitcastOp>(loc, ty, bits);
-  };
-
   DenseMap<Value, uint32_t> spillSlots;
-  uint32_t nextSlot = 0;
+  uint32_t nextSlot = spillSlotBase;
   for (Block *block : stateBlocks) {
     for (Operation &op : block->getOperations()) {
       for (Value result : op.getResults()) {
-        if (!canSpillType(result.getType()))
+        if (!canFrameType(result.getType()))
           continue;
         bool crossBlockUse = llvm::any_of(result.getUses(), [&](OpOperand &use) {
           return use.getOwner()->getBlock() != block;
@@ -770,6 +1179,10 @@ static std::optional<uint64_t> getConstantLowBit(Value value) {
 
 struct ResolvedRuntimeSignal {
   IntegerAttr sigIdAttr;
+  // Dynamic signal id (e.g. opaque interface handles cast back from runtime
+  // pointer-like storage). Expected to be an integer value (typically i64/i32)
+  // that names a runtime-managed signal group.
+  Value dynSigId;
   uint64_t baseOffset = 0;
   uint64_t totalWidth = 0;
   Value dynamicOffset;
@@ -777,7 +1190,36 @@ struct ResolvedRuntimeSignal {
 };
 
 static LogicalResult resolveRuntimeSignal(Value handle, ResolvedRuntimeSignal &out) {
-  handle = stripCasts(handle);
+  // Strip trivial `unrealized_conversion_cast` wrappers, but preserve cast nodes
+  // that carry semantic meaning for the runtime signal representation.
+  while (auto cast = handle.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (cast->hasAttr(kArcilatorSigDynExtractAttr))
+      break;
+    // Preserve casts used by SV interface lowering to model "opaque handle"
+    // round-trips (e.g. virtual interfaces stored as i64 values). Note that
+    // `hw.inout<T>` is dropped by type conversion, so these casts may appear as
+    // `i64 -> T` during dialect conversion.
+    if (cast.getInputs().size() == 1 && cast.getResults().size() == 1) {
+      Value input = cast.getInputs().front();
+      auto inputIntTy = dyn_cast<IntegerType>(input.getType());
+      if (inputIntTy && inputIntTy.getWidth() == 64) {
+        Type outTy = cast.getResult(0).getType();
+        if (auto inoutTy = dyn_cast<hw::InOutType>(outTy))
+          outTy = inoutTy.getElementType();
+        while (auto alias = dyn_cast<hw::TypeAliasType>(outTy))
+          outTy = alias.getInnerType();
+        int64_t bw = hw::getBitWidth(outTy);
+        if (bw > 0 && bw <= 64 && isa<hw::StructType, hw::ArrayType>(outTy))
+          break;
+        if (isa<hw::InOutType>(cast.getResult(0).getType()))
+          break;
+      }
+    }
+    if (cast.getInputs().size() != 1)
+      break;
+    handle = cast.getInputs().front();
+  }
+
   Operation *defOp = handle.getDefiningOp();
   if (!defOp)
     return failure();
@@ -801,6 +1243,28 @@ static LogicalResult resolveRuntimeSignal(Value handle, ResolvedRuntimeSignal &o
   }
 
   if (auto cast = dyn_cast<mlir::UnrealizedConversionCastOp>(defOp)) {
+    // Opaque interface handles: interpret `i64 -> hw.inout<struct>` casts as
+    // dynamic runtime signal ids. This is produced by SV interface lowering for
+    // virtual interfaces stored in runtime shims (e.g. UVM config/resource DB).
+    if (!cast->hasAttr(kArcilatorSigDynExtractAttr) &&
+        cast.getInputs().size() == 1 && cast.getResults().size() == 1) {
+      Value input = cast.getInputs().front();
+      auto inputIntTy = dyn_cast<IntegerType>(input.getType());
+      if (inputIntTy && inputIntTy.getWidth() == 64) {
+        Type outTy = cast.getResult(0).getType();
+        if (auto outInOutTy = dyn_cast<hw::InOutType>(outTy))
+          outTy = outInOutTy.getElementType();
+        while (auto alias = dyn_cast<hw::TypeAliasType>(outTy))
+          outTy = alias.getInnerType();
+        int64_t bw = hw::getBitWidth(outTy);
+        if (bw > 0 && bw <= 64 && isa<hw::StructType, hw::ArrayType>(outTy)) {
+          out.dynSigId = input;
+          out.totalWidth = static_cast<uint64_t>(bw);
+          return success();
+        }
+      }
+    }
+
     if (!cast->hasAttr(kArcilatorSigDynExtractAttr))
       return failure();
     if (cast.getInputs().size() != 2)
@@ -853,15 +1317,40 @@ static LogicalResult resolveRuntimeSignal(Value handle, ResolvedRuntimeSignal &o
     if (!fieldIndexOpt)
       return failure();
 
-    uint64_t fieldOffset = 0;
     auto elements = hwStructTy.getElements();
+
+    // Special-case the ubiquitous 4-state `{value, unknown}` struct encoding.
+    // We canonicalize this layout separately (value in low bits), so keep the
+    // field offsets consistent here.
+    if (elements.size() == 2 &&
+        elements[0].name.getValue() == "value" &&
+        elements[1].name.getValue() == "unknown") {
+      int64_t w = hw::getBitWidth(elements[0].type);
+      if (w <= 0 || hw::getBitWidth(elements[1].type) != w)
+        return failure();
+      return *fieldIndexOpt == 0 ? 0ULL : static_cast<uint64_t>(w);
+    }
+
+    // Match HW struct packing (MSB-first). Special-case the 4-state
+    // `{value, unknown}` encoding which we canonicalize as value in low bits.
+    uint64_t prefixWidth = 0;
     for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
       int64_t w = hw::getBitWidth(elements[i].type);
       if (w <= 0)
         return failure();
-      fieldOffset += static_cast<uint64_t>(w);
+      prefixWidth += static_cast<uint64_t>(w);
     }
-    return fieldOffset;
+    int64_t fieldWidthI64 = hw::getBitWidth(elements[*fieldIndexOpt].type);
+    if (fieldWidthI64 <= 0)
+      return failure();
+    uint64_t fieldWidth = static_cast<uint64_t>(fieldWidthI64);
+    int64_t totalWidthI64 = hw::getBitWidth(hwStructTy);
+    if (totalWidthI64 <= 0)
+      return failure();
+    uint64_t totalWidth = static_cast<uint64_t>(totalWidthI64);
+    if (prefixWidth + fieldWidth > totalWidth)
+      return failure();
+    return totalWidth - prefixWidth - fieldWidth;
   };
 
   if (auto field = dyn_cast<llhd::SigStructExtractOp>(defOp)) {
@@ -2695,6 +3184,10 @@ static LogicalResult convert(llhd::YieldOp op, llhd::YieldOp::Adaptor adaptor,
 struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
   using OpConversionPattern<llhd::SignalOp>::OpConversionPattern;
 
+  SignalOpConversion(TypeConverter &typeConverter, MLIRContext *context,
+                     llvm::DenseMap<uint64_t, ArcilatorRuntimeSigInit> *sigInits)
+      : OpConversionPattern(typeConverter, context), sigInits(sigInits) {}
+
   LogicalResult
   matchAndRewrite(llhd::SignalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -2732,6 +3225,43 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
                            rewriter.getI32IntegerAttr(0));
             defOp->setAttr(kArcilatorSigTotalWidthAttr,
                            rewriter.getI32IntegerAttr(totalWidth));
+            // Preserve the LLHD signal initializer as a constant i64 payload so
+            // the later Arc state-lowering pipeline can seed runtime-managed
+            // signals at time 0 (important for 2-state SV types).
+            auto initBits =
+                tryEvalRuntimeSignalInit(adaptor.getInit(), convertedTy);
+            if (!initBits) {
+              // Default-initialize 2-state integer signals to 0. This matches SV
+              // semantics and avoids spurious all-ones initialization when the
+              // initializer is not representable as a constant at this point in
+              // the pipeline.
+              if (isa<IntegerType>(stripInOutAndAliasTypes(convertedTy)))
+                initBits = APInt(static_cast<unsigned>(totalWidth), 0);
+            }
+            if (initBits) {
+              APInt bits =
+                  initBits->zextOrTrunc(static_cast<unsigned>(totalWidth));
+              uint64_t initU64 = bits.getZExtValue();
+              defOp->setAttr(kArcilatorSigInitU64Attr,
+                             rewriter.getI64IntegerAttr(initU64));
+              if (sigInits) {
+                uint64_t sigId = static_cast<uint64_t>(sigIdAttr.getInt());
+                auto [it, inserted] = sigInits->try_emplace(
+                    sigId, ArcilatorRuntimeSigInit{
+                               initU64,
+                               static_cast<uint64_t>(totalWidth)});
+                if (!inserted) {
+                  // Keep the first initializer and width; later duplicates must
+                  // agree.
+                  if (it->second.initU64 != initU64)
+                    op->emitWarning("conflicting runtime init value for sigId ")
+                        << sigId;
+                  if (it->second.totalWidth != static_cast<uint64_t>(totalWidth))
+                    op->emitWarning("conflicting runtime width for sigId ")
+                        << sigId;
+                }
+              }
+            }
           }
           rewriter.replaceOp(op, handle);
           return success();
@@ -2742,6 +3272,8 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
     rewriter.replaceOp(op, adaptor.getInit());
     return success();
   }
+
+  llvm::DenseMap<uint64_t, ArcilatorRuntimeSigInit> *sigInits = nullptr;
 };
 
 /// `llhd.prb` -> pass-through (signal already converted to plain SSA)
@@ -2751,13 +3283,13 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
   LogicalResult
   matchAndRewrite(llhd::PrbOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value handle = stripCasts(adaptor.getSignal());
+    Value handle = adaptor.getSignal();
     ResolvedRuntimeSignal resolved;
-    if (failed(resolveRuntimeSignal(handle, resolved)) || !resolved.sigIdAttr) {
+    if (failed(resolveRuntimeSignal(handle, resolved)) ||
+        (!resolved.sigIdAttr && !resolved.dynSigId)) {
       rewriter.replaceOp(op, adaptor.getSignal());
       return success();
     }
-    auto sigIdAttr = resolved.sigIdAttr;
     uint64_t sliceOffset = resolved.baseOffset;
     uint64_t totalWidth = resolved.totalWidth;
 
@@ -2789,7 +3321,20 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
     }
     Value procIdVal = buildI32Constant(rewriter, op.getLoc(), procId);
 
-    Value sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
+    Value sigIdVal;
+    if (resolved.sigIdAttr) {
+      sigIdVal = buildI32Constant(rewriter, op.getLoc(), resolved.sigIdAttr.getInt());
+    } else {
+      Value dyn = resolved.dynSigId;
+      auto dynTy = dyn_cast<IntegerType>(dyn.getType());
+      if (!dynTy)
+        return rewriter.notifyMatchFailure(op, "unsupported dynamic signal id type");
+      if (dynTy.getWidth() < 32)
+        dyn = comb::createZExt(rewriter, op.getLoc(), dyn, 32);
+      else if (dynTy.getWidth() > 32)
+        dyn = comb::ExtractOp::create(rewriter, op.getLoc(), dyn, 0, 32);
+      sigIdVal = dyn;
+    }
 
     Value loaded =
         rewriter
@@ -2852,20 +3397,22 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
   }
 };
 
-/// `llhd.drv` -> best-effort runtime store (ignore precise delay/enable).
+/// `llhd.drv` -> best-effort runtime store (ignore precise delay; honor enable).
 struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
   using OpConversionPattern<llhd::DrvOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(llhd::DrvOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value handle = stripCasts(adaptor.getSignal());
+    Location loc = op.getLoc();
+
+    Value handle = adaptor.getSignal();
     ResolvedRuntimeSignal resolved;
-    if (failed(resolveRuntimeSignal(handle, resolved)) || !resolved.sigIdAttr) {
+    if (failed(resolveRuntimeSignal(handle, resolved)) ||
+        (!resolved.sigIdAttr && !resolved.dynSigId)) {
       rewriter.eraseOp(op);
       return success();
     }
-    auto sigIdAttr = resolved.sigIdAttr;
 
     Type rawValueTy = adaptor.getValue().getType();
     int64_t valueWidth = hw::getBitWidth(rawValueTy);
@@ -2913,9 +3460,38 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
     }
     Value procIdVal = buildI32Constant(rewriter, op.getLoc(), procId);
 
-    Value sigIdVal = buildI32Constant(rewriter, op.getLoc(), sigIdAttr.getInt());
+    Value sigIdVal;
+    if (resolved.sigIdAttr) {
+      sigIdVal = buildI32Constant(rewriter, op.getLoc(), resolved.sigIdAttr.getInt());
+    } else {
+      Value dyn = resolved.dynSigId;
+      auto dynTy = dyn_cast<IntegerType>(dyn.getType());
+      if (!dynTy)
+        return rewriter.notifyMatchFailure(op, "unsupported dynamic signal id type");
+      if (dynTy.getWidth() < 32)
+        dyn = comb::createZExt(rewriter, loc, dyn, 32);
+      else if (dynTy.getWidth() > 32)
+        dyn = comb::ExtractOp::create(rewriter, loc, dyn, 0, 32);
+      sigIdVal = dyn;
+    }
 
-    Location loc = op.getLoc();
+    Value enable = adaptor.getEnable();
+    std::optional<bool> constEnable;
+    if (!enable) {
+      constEnable = true;
+      enable = hw::ConstantOp::create(rewriter, loc, rewriter.getI1Type(), 1);
+    } else {
+      constEnable = getConstantBoolValue(enable);
+      if (constEnable && !*constEnable) {
+        rewriter.eraseOp(op);
+        if (resolved.dynamicOffsetOp &&
+            llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                         [](Value v) { return v.use_empty(); }))
+          rewriter.eraseOp(resolved.dynamicOffsetOp);
+        return success();
+      }
+    }
+
     Value value64 = valueInt;
     if (static_cast<uint64_t>(valueWidth) < 64)
       value64 = comb::createZExt(rewriter, loc, value64, 64);
@@ -2967,7 +3543,13 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
 
       Value shiftedVal = rewriter.createOrFold<comb::ShlOp>(loc, value64, offsetVal);
       Value inserted = rewriter.createOrFold<comb::AndOp>(loc, shiftedVal, sliceMask);
-      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, inserted);
+      Value storeSlice = inserted;
+      if (!constEnable || !*constEnable) {
+        Value oldSlice = rewriter.createOrFold<comb::AndOp>(loc, curMasked, sliceMask);
+        storeSlice =
+            rewriter.createOrFold<comb::MuxOp>(loc, enable, storeSlice, oldSlice);
+      }
+      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, storeSlice);
       Value storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, totalMaskCst);
 
       rewriter.create<mlir::func::CallOp>(loc, "__arcilator_sig_store_u64",
@@ -2996,7 +3578,19 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
         (sliceOffset == 0 && static_cast<uint64_t>(valueWidth) == totalWidth);
     Value storeVal;
     if (isFullWrite) {
-      storeVal = rewriter.createOrFold<comb::AndOp>(loc, value64, totalMaskCst);
+      Value newVal = rewriter.createOrFold<comb::AndOp>(loc, value64, totalMaskCst);
+      storeVal = newVal;
+      if (!constEnable || !*constEnable) {
+        Value cur =
+            rewriter
+                .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+                                            rewriter.getI64Type(),
+                                            ValueRange{sigIdVal, procIdVal})
+                .getResult(0);
+        Value curMasked = rewriter.createOrFold<comb::AndOp>(loc, cur, totalMaskCst);
+        storeVal =
+            rewriter.createOrFold<comb::MuxOp>(loc, enable, newVal, curMasked);
+      }
     } else {
       Value cur =
           rewriter
@@ -3017,7 +3611,13 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
 
       Value cleared = rewriter.createOrFold<comb::AndOp>(loc, cur, clearMaskCst);
       Value inserted = rewriter.createOrFold<comb::AndOp>(loc, value64, sliceMaskCst);
-      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, inserted);
+      Value storeSlice = inserted;
+      if (!constEnable || !*constEnable) {
+        Value oldSlice = rewriter.createOrFold<comb::AndOp>(loc, cur, sliceMaskCst);
+        storeSlice =
+            rewriter.createOrFold<comb::MuxOp>(loc, enable, storeSlice, oldSlice);
+      }
+      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, storeSlice);
       storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, totalMaskCst);
     }
 
@@ -3171,19 +3771,40 @@ struct SigStructExtractOpConversion
         auto fieldIndexOpt = structTy.getFieldIndex(op.getFieldAttr());
         if (!fieldIndexOpt)
           return rewriter.notifyMatchFailure(op, "unknown struct field");
-        uint64_t fieldOffset = 0;
         auto elements = structTy.getElements();
-        for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
-          int64_t w = hw::getBitWidth(elements[i].type);
-          if (w <= 0)
-            return rewriter.notifyMatchFailure(op, "unsupported struct field width");
-          fieldOffset += static_cast<uint64_t>(w);
-        }
         Type fieldTy = elements[*fieldIndexOpt].type;
         int64_t fieldWidth = hw::getBitWidth(fieldTy);
         if (fieldWidth <= 0)
           return rewriter.notifyMatchFailure(op, "unsupported extracted field type");
-        uint64_t newOffset = baseOffset + fieldOffset;
+
+        // Match HW struct packing (MSB-first). Special-case the 4-state
+        // `{value, unknown}` encoding which we canonicalize as value in low
+        // bits.
+        uint64_t fieldOffsetLSB = 0;
+        if (elements.size() == 2 &&
+            elements[0].name.getValue() == "value" &&
+            elements[1].name.getValue() == "unknown") {
+          int64_t w = hw::getBitWidth(elements[0].type);
+          if (w <= 0 || hw::getBitWidth(elements[1].type) != w)
+            return rewriter.notifyMatchFailure(op, "unsupported 4-state struct width");
+          fieldOffsetLSB = *fieldIndexOpt == 0 ? 0ULL : static_cast<uint64_t>(w);
+        } else {
+          uint64_t prefixWidth = 0;
+          for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
+            int64_t w = hw::getBitWidth(elements[i].type);
+            if (w <= 0)
+              return rewriter.notifyMatchFailure(op,
+                                                 "unsupported struct field width");
+            prefixWidth += static_cast<uint64_t>(w);
+          }
+          uint64_t structWidth = static_cast<uint64_t>(hw::getBitWidth(structTy));
+          uint64_t uFieldWidth = static_cast<uint64_t>(fieldWidth);
+          if (prefixWidth + uFieldWidth > structWidth)
+            return rewriter.notifyMatchFailure(op, "struct field offset overflow");
+          fieldOffsetLSB = structWidth - prefixWidth - uFieldWidth;
+        }
+
+        uint64_t newOffset = baseOffset + fieldOffsetLSB;
         if (newOffset + static_cast<uint64_t>(fieldWidth) > totalWidth)
           return rewriter.notifyMatchFailure(op, "struct field slice exceeds runtime width");
 
@@ -3302,19 +3923,40 @@ struct StructFieldInOutOpConversion
         auto fieldIndexOpt = structTy.getFieldIndex(op.getFieldAttr());
         if (!fieldIndexOpt)
           return rewriter.notifyMatchFailure(op, "unknown struct field");
-        uint64_t fieldOffset = 0;
         auto elements = structTy.getElements();
-        for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
-          int64_t w = hw::getBitWidth(elements[i].type);
-          if (w <= 0)
-            return rewriter.notifyMatchFailure(op, "unsupported struct field width");
-          fieldOffset += static_cast<uint64_t>(w);
-        }
+
         Type fieldTy = elements[*fieldIndexOpt].type;
         int64_t fieldWidth = hw::getBitWidth(fieldTy);
         if (fieldWidth <= 0)
           return rewriter.notifyMatchFailure(op, "unsupported extracted field type");
-        uint64_t newOffset = baseOffset + fieldOffset;
+
+        // Match HW struct packing (MSB-first). Special-case the 4-state
+        // `{value, unknown}` encoding which we canonicalize as value in low
+        // bits.
+        uint64_t fieldOffsetLSB = 0;
+        if (elements.size() == 2 &&
+            elements[0].name.getValue() == "value" &&
+            elements[1].name.getValue() == "unknown") {
+          int64_t w = hw::getBitWidth(elements[0].type);
+          if (w <= 0 || hw::getBitWidth(elements[1].type) != w)
+            return rewriter.notifyMatchFailure(op, "unsupported 4-state struct width");
+          fieldOffsetLSB = *fieldIndexOpt == 0 ? 0ULL : static_cast<uint64_t>(w);
+        } else {
+          uint64_t prefixWidth = 0;
+          for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
+            int64_t w = hw::getBitWidth(elements[i].type);
+            if (w <= 0)
+              return rewriter.notifyMatchFailure(op, "unsupported struct field width");
+            prefixWidth += static_cast<uint64_t>(w);
+          }
+          uint64_t structWidth = static_cast<uint64_t>(hw::getBitWidth(structTy));
+          uint64_t uFieldWidth = static_cast<uint64_t>(fieldWidth);
+          if (prefixWidth + uFieldWidth > structWidth)
+            return rewriter.notifyMatchFailure(op, "struct field offset overflow");
+          fieldOffsetLSB = structWidth - prefixWidth - uFieldWidth;
+        }
+
+        uint64_t newOffset = baseOffset + fieldOffsetLSB;
         if (newOffset + static_cast<uint64_t>(fieldWidth) > totalWidth)
           return rewriter.notifyMatchFailure(op, "struct field slice exceeds runtime width");
 
@@ -3331,6 +3973,65 @@ struct StructFieldInOutOpConversion
         rewriter.replaceOp(op, handleToken);
         return success();
       }
+    }
+
+    // Handle dynamic runtime signal ids (e.g. virtual interfaces stored in i64
+    // fields). Encode the struct field select as a constant dynamic extract so
+    // probe/drive conversions can still resolve a runtime slice.
+    ResolvedRuntimeSignal resolved;
+    if (succeeded(resolveRuntimeSignal(adaptor.getInput(), resolved)) &&
+        resolved.dynSigId) {
+      uint64_t baseOffset = resolved.baseOffset;
+      uint64_t totalWidth = resolved.totalWidth;
+      if (totalWidth == 0)
+        totalWidth = static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
+      if (totalWidth == 0 || totalWidth > 64)
+        return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
+
+      auto structTy = type_cast<hw::StructType>(adaptor.getInput().getType());
+      auto fieldIndexOpt = structTy.getFieldIndex(op.getFieldAttr());
+      if (!fieldIndexOpt)
+        return rewriter.notifyMatchFailure(op, "unknown struct field");
+      auto elements = structTy.getElements();
+
+      Type fieldTy = elements[*fieldIndexOpt].type;
+      int64_t fieldWidth = hw::getBitWidth(fieldTy);
+      if (fieldWidth <= 0)
+        return rewriter.notifyMatchFailure(op, "unsupported extracted field type");
+
+      uint64_t fieldOffsetLSB = 0;
+      if (elements.size() == 2 &&
+          elements[0].name.getValue() == "value" &&
+          elements[1].name.getValue() == "unknown") {
+        int64_t w = hw::getBitWidth(elements[0].type);
+        if (w <= 0 || hw::getBitWidth(elements[1].type) != w)
+          return rewriter.notifyMatchFailure(op, "unsupported 4-state struct width");
+        fieldOffsetLSB = *fieldIndexOpt == 0 ? 0ULL : static_cast<uint64_t>(w);
+      } else {
+        uint64_t prefixWidth = 0;
+        for (uint32_t i = 0; i < *fieldIndexOpt; ++i) {
+          int64_t w = hw::getBitWidth(elements[i].type);
+          if (w <= 0)
+            return rewriter.notifyMatchFailure(op, "unsupported struct field width");
+          prefixWidth += static_cast<uint64_t>(w);
+        }
+        uint64_t structWidth = static_cast<uint64_t>(hw::getBitWidth(structTy));
+        uint64_t uFieldWidth = static_cast<uint64_t>(fieldWidth);
+        if (prefixWidth + uFieldWidth > structWidth)
+          return rewriter.notifyMatchFailure(op, "struct field offset overflow");
+        fieldOffsetLSB = structWidth - prefixWidth - uFieldWidth;
+      }
+
+      uint64_t newOffset = baseOffset + fieldOffsetLSB;
+      if (newOffset + static_cast<uint64_t>(fieldWidth) > totalWidth)
+        return rewriter.notifyMatchFailure(op, "struct field slice exceeds runtime width");
+
+      Value offsetVal = buildI64Constant(rewriter, op.getLoc(), fieldOffsetLSB);
+      auto dyn = rewriter.create<mlir::UnrealizedConversionCastOp>(
+          op.getLoc(), TypeRange{fieldTy}, ValueRange{adaptor.getInput(), offsetVal});
+      dyn->setAttr(kArcilatorSigDynExtractAttr, rewriter.getUnitAttr());
+      rewriter.replaceOp(op, dyn.getResult(0));
+      return success();
     }
 
     rewriter.replaceOpWithNewOp<hw::StructExtractOp>(op, adaptor.getInput(),
@@ -3542,6 +4243,8 @@ struct ConvertToArcsPass
 } // namespace
 
 void ConvertToArcsPass::runOnOperation() {
+  llvm::DenseMap<uint64_t, ArcilatorRuntimeSigInit> runtimeSigInits;
+
   // Drop dead string labels early so they don't leak SV constants through the
   // pipeline.
   SmallVector<Operation *> toErase;
@@ -3599,6 +4302,13 @@ void ConvertToArcsPass::runOnOperation() {
         wait->setAttr(kArcilatorWaitIdAttr,
                       idBuilder.getI32IntegerAttr(nextWaitId++));
     });
+  });
+  getOperation().walk([&](llhd::SignalOp sig) {
+    if (auto sigIdAttr = sig->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
+      uint64_t id = static_cast<uint64_t>(sigIdAttr.getInt());
+      if (id + 1 > nextSigId)
+        nextSigId = static_cast<uint32_t>(id + 1);
+    }
   });
   getOperation().walk([&](llhd::SignalOp sig) {
     if (!sig->hasAttr(kArcilatorSigIdAttr))
@@ -3689,10 +4399,13 @@ void ConvertToArcsPass::runOnOperation() {
               .create<mlir::UnrealizedConversionCastOp>(loc, type, inputs)
               .getResult(0);
         if (auto inout = dyn_cast<hw::InOutType>(input.getType())) {
-          if (inout.getElementType() == type)
-            return builder
-                .create<mlir::UnrealizedConversionCastOp>(loc, type, inputs)
-                .getResult(0);
+          auto stripAlias = [](Type t) -> Type {
+            while (auto alias = dyn_cast<hw::TypeAliasType>(t))
+              t = alias.getInnerType();
+            return t;
+          };
+          if (stripAlias(inout.getElementType()) == stripAlias(type))
+            return builder.create<llhd::PrbOp>(loc, input).getResult();
         }
         if (auto desiredInOut = dyn_cast<hw::InOutType>(type)) {
           if (desiredInOut.getElementType() == input.getType())
@@ -3702,6 +4415,28 @@ void ConvertToArcsPass::runOnOperation() {
         }
         return {};
       });
+
+  // When dropping `hw.inout` types to plain SSA values, materialize reads as
+  // explicit probes rather than leaving unresolved casts behind.
+  converter.addTargetMaterialization(
+      [](OpBuilder &builder, Type resultType, ValueRange inputs,
+         Location loc) -> Value {
+        if (inputs.size() != 1)
+          return {};
+        Value input = inputs.front();
+        auto inout = dyn_cast<hw::InOutType>(input.getType());
+        if (!inout)
+          return {};
+        auto stripAlias = [](Type t) -> Type {
+          while (auto alias = dyn_cast<hw::TypeAliasType>(t))
+            t = alias.getInnerType();
+          return t;
+        };
+        if (stripAlias(inout.getElementType()) != stripAlias(resultType))
+          return {};
+        return builder.create<llhd::PrbOp>(loc, input).getResult();
+      });
+
   converter.addTargetMaterialization(
       [](OpBuilder &builder, hw::InOutType type, ValueRange inputs,
          Location loc) -> Value {
@@ -3723,7 +4458,7 @@ void ConvertToArcsPass::runOnOperation() {
   patterns.add<TimeToIntOpConversion>(converter, &getContext());
   patterns.add<IntToTimeOpConversion>(converter, &getContext());
   patterns.add<ConstantTimeOpConversion>(converter, &getContext());
-  patterns.add<SignalOpConversion>(converter, &getContext());
+  patterns.add<SignalOpConversion>(converter, &getContext(), &runtimeSigInits);
   patterns.add<ProbeOpConversion>(converter, &getContext());
   patterns.add<DrvOpConversion>(converter, &getContext());
   patterns.add<SigExtractOpConversion>(converter, &getContext());
@@ -3873,4 +4608,921 @@ void ConvertToArcsPass::runOnOperation() {
   outliner.tapRegisters = tapRegisters;
   if (failed(outliner.run(getOperation())))
     return signalPassFailure();
+
+  // Canonicalize packing/unpacking of 4-state structs when bitcasting to/from
+  // integers.
+  //
+  // The cycle scheduler, edge detectors, and runtime signal packing assume a
+  // stable layout for any 4-state `{value, unknown}` structs (including when
+  // they appear nested inside interface bundles):
+  //   [value (low bits), unknown (high bits)]
+  //
+  // Materialize this layout explicitly to avoid relying on `hw.bitcast`
+  // field-order semantics for aggregates.
+  SmallVector<hw::BitcastOp> stableBitcastsToErase;
+  auto stripInoutType = [](Type ty) -> Type {
+    if (auto inoutTy = dyn_cast<hw::InOutType>(ty))
+      return inoutTy.getElementType();
+    return ty;
+  };
+  struct FourStateLayout {
+    unsigned fieldWidth = 0;
+    unsigned valueIdx = 0;
+    unsigned unknownIdx = 0;
+  };
+
+  auto getFourStateLayout = [&](Type ty) -> std::optional<FourStateLayout> {
+    auto structTy = dyn_cast<hw::StructType>(stripInoutType(ty));
+    if (!structTy)
+      return std::nullopt;
+    auto elements = structTy.getElements();
+    if (elements.size() != 2)
+      return std::nullopt;
+    auto int0 = dyn_cast<IntegerType>(elements[0].type);
+    auto int1 = dyn_cast<IntegerType>(elements[1].type);
+    if (!int0 || !int1 || int0.getWidth() != int1.getWidth())
+      return std::nullopt;
+
+    auto classify = [](StringRef name) -> std::optional<bool> {
+      // Return `true` for value, `false` for unknown, and `nullopt` otherwise.
+      if (name == "value" || name == "aval")
+        return true;
+      if (name == "unknown" || name == "bval")
+        return false;
+      return std::nullopt;
+    };
+
+    std::optional<unsigned> valueIdx;
+    std::optional<unsigned> unknownIdx;
+    for (auto [idx, element] : llvm::enumerate(elements)) {
+      auto kind = classify(element.name.getValue());
+      if (!kind)
+        continue;
+      if (*kind)
+        valueIdx = static_cast<unsigned>(idx);
+      else
+        unknownIdx = static_cast<unsigned>(idx);
+    }
+    if (!valueIdx || !unknownIdx || *valueIdx == *unknownIdx)
+      return std::nullopt;
+
+    FourStateLayout layout;
+    layout.fieldWidth = static_cast<unsigned>(int0.getWidth());
+    layout.valueIdx = *valueIdx;
+    layout.unknownIdx = *unknownIdx;
+    return layout;
+  };
+
+  std::function<bool(Type)> containsFourState;
+  containsFourState = [&](Type ty) -> bool {
+    ty = stripInoutType(ty);
+    if (auto structTy = dyn_cast<hw::StructType>(ty)) {
+      if (getFourStateLayout(structTy))
+        return true;
+      for (auto element : structTy.getElements())
+        if (containsFourState(element.type))
+          return true;
+      return false;
+    }
+    if (auto arrTy = dyn_cast<hw::ArrayType>(ty))
+      return containsFourState(arrTy.getElementType());
+    return false;
+  };
+
+  std::function<Value(OpBuilder &, Location, Value, Type)> packStable;
+  std::function<Value(OpBuilder &, Location, Value, Type)> unpackStable;
+
+  packStable = [&](OpBuilder &b, Location loc, Value v, Type ty) -> Value {
+    ty = stripInoutType(ty);
+    if (auto intTy = dyn_cast<IntegerType>(ty)) {
+      if (v.getType() == intTy)
+        return v;
+      if (auto vIntTy = dyn_cast<IntegerType>(v.getType())) {
+        if (vIntTy.getWidth() > intTy.getWidth())
+          return comb::ExtractOp::create(b, loc, v, /*lowBit=*/0,
+                                         /*width=*/intTy.getWidth());
+        Value zeros =
+            hw::ConstantOp::create(b, loc,
+                                   b.getIntegerType(intTy.getWidth() -
+                                                    vIntTy.getWidth()),
+                                   0);
+        return b.createOrFold<comb::ConcatOp>(loc, zeros, v);
+      }
+      return {};
+    }
+
+    if (auto arrTy = dyn_cast<hw::ArrayType>(ty)) {
+      SmallVector<Value> parts;
+      parts.reserve(arrTy.getNumElements());
+      for (uint64_t idx = 0, e = arrTy.getNumElements(); idx < e; ++idx) {
+        Value i = hw::ConstantOp::create(b, loc, b.getI64Type(), idx);
+        Value elem = hw::ArrayGetOp::create(b, loc, v, i);
+        Value packedElem = packStable(b, loc, elem, arrTy.getElementType());
+        if (!packedElem)
+          return {};
+        parts.push_back(packedElem);
+      }
+      if (parts.empty())
+        return {};
+      Value packed = parts.front();
+      for (Value part : llvm::drop_begin(parts))
+        packed = b.createOrFold<comb::ConcatOp>(loc, packed, part);
+      return packed;
+    }
+
+    auto structTy = dyn_cast<hw::StructType>(ty);
+    if (!structTy)
+      return {};
+
+    if (auto fourState = getFourStateLayout(structTy)) {
+      auto elements = structTy.getElements();
+      Value valueBits = b.createOrFold<hw::StructExtractOp>(
+          loc, v, elements[fourState->valueIdx].name);
+      Value unknownBits = b.createOrFold<hw::StructExtractOp>(
+          loc, v, elements[fourState->unknownIdx].name);
+      return b.createOrFold<comb::ConcatOp>(loc, unknownBits, valueBits);
+    }
+
+    SmallVector<Value> parts;
+    parts.reserve(structTy.getElements().size());
+    for (auto element : structTy.getElements()) {
+      Value field = b.createOrFold<hw::StructExtractOp>(loc, v, element.name);
+      Value packedField = packStable(b, loc, field, element.type);
+      if (!packedField)
+        return {};
+      parts.push_back(packedField);
+    }
+
+    if (parts.empty())
+      return {};
+    Value packed = parts.front();
+    for (Value part : llvm::drop_begin(parts))
+      packed = b.createOrFold<comb::ConcatOp>(loc, packed, part);
+    return packed;
+  };
+
+  unpackStable = [&](OpBuilder &b, Location loc, Value bits, Type ty) -> Value {
+    ty = stripInoutType(ty);
+    if (auto intTy = dyn_cast<IntegerType>(ty)) {
+      if (bits.getType() == intTy)
+        return bits;
+      if (auto bitsIntTy = dyn_cast<IntegerType>(bits.getType())) {
+        if (bitsIntTy.getWidth() > intTy.getWidth())
+          return comb::ExtractOp::create(b, loc, bits, /*lowBit=*/0,
+                                         /*width=*/intTy.getWidth());
+        Value zeros = hw::ConstantOp::create(
+            b, loc, b.getIntegerType(intTy.getWidth() - bitsIntTy.getWidth()),
+            0);
+        return b.createOrFold<comb::ConcatOp>(loc, zeros, bits);
+      }
+      return {};
+    }
+
+    if (auto arrTy = dyn_cast<hw::ArrayType>(ty)) {
+      int64_t elemWidth = hw::getBitWidth(stripInoutType(arrTy.getElementType()));
+      if (elemWidth <= 0)
+        return {};
+      SmallVector<Value> elems(arrTy.getNumElements());
+      unsigned offset = 0;
+      for (int64_t i = static_cast<int64_t>(arrTy.getNumElements()) - 1; i >= 0;
+           --i) {
+        Value elemBits = comb::ExtractOp::create(b, loc, bits, /*lowBit=*/offset,
+                                                 /*width=*/elemWidth);
+        Value elemVal =
+            unpackStable(b, loc, elemBits, arrTy.getElementType());
+        if (!elemVal)
+          return {};
+        elems[static_cast<size_t>(i)] = elemVal;
+        offset += static_cast<unsigned>(elemWidth);
+      }
+      return hw::ArrayCreateOp::create(b, loc, arrTy, elems);
+    }
+
+    auto structTy = dyn_cast<hw::StructType>(ty);
+    if (!structTy)
+      return {};
+
+    if (auto fourState = getFourStateLayout(structTy)) {
+      unsigned w = fourState->fieldWidth;
+      Value valueBits = comb::ExtractOp::create(b, loc, bits, /*lowBit=*/0,
+                                                /*width=*/w);
+      Value unknownBits = comb::ExtractOp::create(b, loc, bits, /*lowBit=*/w,
+                                                  /*width=*/w);
+      SmallVector<Value> elems(structTy.getElements().size());
+      elems[fourState->valueIdx] = valueBits;
+      elems[fourState->unknownIdx] = unknownBits;
+      return b.createOrFold<hw::StructCreateOp>(loc, structTy, elems);
+    }
+
+    auto elements = structTy.getElements();
+    SmallVector<Value> fieldVals(elements.size());
+    unsigned offset = 0;
+    for (auto [idx, element] :
+         llvm::enumerate(llvm::reverse(elements))) {
+      (void)idx;
+      int64_t fieldWidth = hw::getBitWidth(stripInoutType(element.type));
+      if (fieldWidth <= 0)
+        return {};
+      Value fieldBits = comb::ExtractOp::create(b, loc, bits, /*lowBit=*/offset,
+                                                /*width=*/fieldWidth);
+      Value fieldVal = unpackStable(b, loc, fieldBits, element.type);
+      if (!fieldVal)
+        return {};
+      fieldVals[static_cast<size_t>(elements.size()) -
+                static_cast<size_t>(idx) - 1] = fieldVal;
+      offset += static_cast<unsigned>(fieldWidth);
+    }
+    return b.createOrFold<hw::StructCreateOp>(loc, structTy, fieldVals);
+  };
+
+  getOperation().walk([&](hw::BitcastOp cast) {
+    Location loc = cast.getLoc();
+    Type inTy = stripInoutType(cast.getInput().getType());
+    Type outTy = stripInoutType(cast.getType());
+
+    // Only rewrite pure value bitcasts; inout bitcasts would require explicit
+    // read/write ops which are outside this canonicalization's scope.
+    if (cast.getInput().getType() != inTy || cast.getType() != outTy)
+      return;
+
+    // Only rewrite bitcasts that involve 4-state structs somewhere in the
+    // aggregate. Otherwise preserve default `hw.bitcast` semantics.
+    bool needsStableLayout = containsFourState(inTy) || containsFourState(outTy);
+    if (!needsStableLayout)
+      return;
+
+    auto inIntTy = dyn_cast<IntegerType>(inTy);
+    auto outIntTy = dyn_cast<IntegerType>(outTy);
+
+    OpBuilder b(cast);
+
+    // aggregate -> int
+    if (outIntTy && isa<hw::StructType, hw::ArrayType>(inTy)) {
+      Value packed = packStable(b, loc, cast.getInput(), inTy);
+      if (!packed || packed.getType() != outIntTy)
+        return;
+      cast.getResult().replaceAllUsesWith(packed);
+      stableBitcastsToErase.push_back(cast);
+      return;
+    }
+
+    // int -> aggregate
+    if (inIntTy && isa<hw::StructType, hw::ArrayType>(outTy)) {
+      Value unpacked = unpackStable(b, loc, cast.getInput(), outTy);
+      if (!unpacked || unpacked.getType() != outTy)
+        return;
+      cast.getResult().replaceAllUsesWith(unpacked);
+      stableBitcastsToErase.push_back(cast);
+      return;
+    }
+  });
+
+  for (auto cast : stableBitcastsToErase)
+    cast.erase();
+
+  // Some scheduled `wait_event` patterns end up stashing signal-derived
+  // expressions into the per-process frame exactly once (typically at time 0)
+  // and then reusing that frozen value on every wake-up. This breaks edge
+  // detection for interface clocks and similar 4-state signals.
+  //
+  // Detect frame slots with a single store that depends on a runtime signal load
+  // and replace frame loads *outside* polling blocks with a rematerialized
+  // version of the stored expression.
+  getOperation().walk([&](arc::ExecuteOp execOp) {
+    Region &region = execOp.getBody();
+    if (region.empty())
+      return;
+
+    DenseSet<Block *> waitBlocks;
+    for (Block &block : region) {
+      for (Operation &op : block) {
+        auto call = dyn_cast<mlir::func::CallOp>(op);
+        if (!call)
+          continue;
+        if (call.getCallee() == "__arcilator_wait_change" ||
+            call.getCallee() == "__arcilator_wait_delay") {
+          waitBlocks.insert(&block);
+          break;
+        }
+      }
+    }
+
+    auto makeKey = [](int64_t procId, int64_t slot) -> uint64_t {
+      return (static_cast<uint64_t>(static_cast<uint32_t>(procId)) << 32) |
+             static_cast<uint32_t>(slot);
+    };
+
+    DenseMap<uint64_t, SmallVector<mlir::func::CallOp>> storesByKey;
+    DenseMap<uint64_t, SmallVector<mlir::func::CallOp>> loadsByKey;
+
+    execOp.walk([&](mlir::func::CallOp call) {
+      StringRef callee = call.getCallee();
+      if (callee != "__arcilator_frame_store_u64" &&
+          callee != "__arcilator_frame_load_u64")
+        return;
+
+      auto procIdBits = tryEvalIntConstant(call.getOperand(0), /*bitWidth=*/32);
+      auto slotBits = tryEvalIntConstant(call.getOperand(1), /*bitWidth=*/32);
+      if (!procIdBits || !slotBits)
+        return;
+      uint64_t key = makeKey(procIdBits->getSExtValue(), slotBits->getSExtValue());
+
+      if (callee == "__arcilator_frame_store_u64")
+        storesByKey[key].push_back(call);
+      else
+        loadsByKey[key].push_back(call);
+    });
+
+    auto dependsOnCall = [&](Value value, StringRef name) -> bool {
+      DenseSet<Value> visited;
+      SmallVector<Value> worklist;
+      worklist.push_back(value);
+      while (!worklist.empty()) {
+        Value v = stripCasts(worklist.pop_back_val());
+        if (!v || !visited.insert(v).second)
+          continue;
+        if (auto call = v.getDefiningOp<mlir::func::CallOp>())
+          if (call.getCallee() == name)
+            return true;
+        if (Operation *defOp = v.getDefiningOp())
+          for (Value operand : defOp->getOperands())
+            worklist.push_back(operand);
+      }
+      return false;
+    };
+
+    SmallVector<mlir::func::CallOp> loadsToErase;
+    for (auto &it : storesByKey) {
+      uint64_t key = it.first;
+      auto &stores = it.second;
+      if (stores.size() != 1)
+        continue;
+      auto loadsIt = loadsByKey.find(key);
+      if (loadsIt == loadsByKey.end())
+        continue;
+      auto store = stores.front();
+      Value storedValue = store.getOperand(2);
+      if (!storedValue)
+        continue;
+      if (!dependsOnCall(storedValue, "__arcilator_sig_load_u64"))
+        continue;
+      if (dependsOnCall(storedValue, "__arcilator_frame_load_u64"))
+        continue;
+
+      for (auto load : loadsIt->second) {
+        if (waitBlocks.contains(load->getBlock()))
+          continue;
+        mlir::IRRewriter rewriter(load.getContext());
+        rewriter.setInsertionPoint(load);
+        DenseMap<Value, Value> memo;
+        auto remat = rematerializeValueForPolling(storedValue, memo, rewriter);
+        if (failed(remat) || (*remat).getType() != load.getResult(0).getType())
+          continue;
+        load.getResult(0).replaceAllUsesWith(*remat);
+        loadsToErase.push_back(load);
+      }
+    }
+
+    for (auto load : loadsToErase)
+      if (load && load->use_empty())
+        load.erase();
+  });
+
+  // Work around a scheduler lowering bug for `wait_event`-lowered edge
+  // detectors.
+  //
+  // Some UVM-style testbenches rely on `always @(posedge clk)` sequential logic
+  // where `clk` is a 4-state struct `{value, unknown}`. After `lowerCycleScheduler`
+  // spills the pre-wait `notOld` value into the runtime frame, a later rewrite
+  // can accidentally recompute `notOld` from the *post-wait* value instead of
+  // reloading it, producing a vacuous `(!after) & after` trigger that never
+  // fires. Detect that pattern in the resulting `arc.execute` blocks and patch
+  // the trigger to use the spilled frame load.
+  //
+  // This keeps the lowering honest (no stubbing) and restores proper clocked
+  // behavior for head-to-head VCD parity with Verilator.
+  getOperation().walk([&](arc::ExecuteOp execOp) {
+    bool debugEdgePatch = std::getenv("CIRCT_ARC_EDGE_PATCH_DEBUG") != nullptr;
+    bool debugEdgePatchVerbose =
+        std::getenv("CIRCT_ARC_EDGE_PATCH_DEBUG_VERBOSE") != nullptr;
+    IntegerAttr procIdAttr =
+        execOp->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr);
+    int64_t debugProcId = procIdAttr ? procIdAttr.getInt() : -1;
+
+    Region &region = execOp.getBody();
+    if (region.empty())
+      return;
+
+    // Group frame-load calls by block so we can patch within a block without
+    // guessing dominance. Prefer unused loads when selecting the pre-wait
+    // trigger value (those are a strong indicator the lowering became vacuous).
+    DenseMap<Block *, SmallVector<mlir::func::CallOp>> frameLoadsByBlock;
+    for (Block &block : region) {
+      for (Operation &op : block) {
+        auto call = dyn_cast<mlir::func::CallOp>(op);
+        if (!call)
+          continue;
+        if (call.getCallee() != "__arcilator_frame_load_u64")
+          continue;
+        if (call.getNumResults() != 1)
+          continue;
+        if (!call.getResult(0).getType().isInteger(64))
+          continue;
+        frameLoadsByBlock[&block].push_back(call);
+      }
+    }
+
+    for (Block &block : region) {
+      auto loadsIt = frameLoadsByBlock.find(&block);
+      if (loadsIt == frameLoadsByBlock.end() || loadsIt->second.empty())
+        continue;
+
+      // Only patch the first matching broken trigger per block to keep the
+      // rewrite conservative.
+      mlir::func::CallOp frameLoad;
+      for (auto call : loadsIt->second) {
+        if (call.getResult(0).use_empty()) {
+          frameLoad = call;
+          break;
+        }
+      }
+      if (!frameLoad)
+        frameLoad = loadsIt->second.front();
+      bool patched = false;
+      if (debugEdgePatch) {
+        llvm::errs() << "[convert-to-arcs] edgepatch proc_id=" << debugProcId
+                     << " block=" << &block
+                     << " frame_loads=" << loadsIt->second.size()
+                     << " selected_unused=" << frameLoad.getResult(0).use_empty()
+                     << "\n";
+      }
+
+      auto isOne = [](Value v) -> bool {
+        auto cst = v.getDefiningOp<hw::ConstantOp>();
+        return cst && cst.getValue().isOne();
+      };
+      auto xorNotOperand = [&](comb::XorOp xorOp) -> Value {
+        auto inputs = xorOp.getInputs();
+        if (inputs.size() != 2)
+          return {};
+        if (isOne(inputs[0]))
+          return inputs[1];
+        if (isOne(inputs[1]))
+          return inputs[0];
+        return {};
+      };
+
+      // Treat two values as equivalent if they are structurally identical up
+      // to CSE misses (e.g. repeated `__arcilator_sig_load_u64` calls feeding
+      // identical `comb.extract` / `xor 1` patterns).
+      std::function<bool(Value, Value, unsigned)> equiv =
+          [&](Value a, Value b, unsigned depth) -> bool {
+        if (a == b)
+          return true;
+        if (depth > 6)
+          return false;
+
+        auto sameConst = [](Value x, Value y) -> bool {
+          auto xc = x.getDefiningOp<hw::ConstantOp>();
+          auto yc = y.getDefiningOp<hw::ConstantOp>();
+          return xc && yc && xc.getValue() == yc.getValue();
+        };
+        if (sameConst(a, b))
+          return true;
+
+        auto callA = a.getDefiningOp<mlir::func::CallOp>();
+        auto callB = b.getDefiningOp<mlir::func::CallOp>();
+        if (callA && callB && callA.getCallee() == callB.getCallee() &&
+            callA.getNumOperands() == callB.getNumOperands() &&
+            callA.getNumResults() == 1 && callB.getNumResults() == 1) {
+          bool argsMatch = true;
+          for (auto [opA, opB] :
+               llvm::zip(callA.getOperands(), callB.getOperands())) {
+            if (opA == opB || sameConst(opA, opB))
+              continue;
+            argsMatch = false;
+            break;
+          }
+          if (argsMatch)
+            return true;
+        }
+
+        auto extA = a.getDefiningOp<comb::ExtractOp>();
+        auto extB = b.getDefiningOp<comb::ExtractOp>();
+        if (extA && extB && extA.getLowBit() == extB.getLowBit() &&
+            extA.getType() == extB.getType())
+          return equiv(extA.getInput(), extB.getInput(), depth + 1);
+
+        auto xorA = a.getDefiningOp<comb::XorOp>();
+        auto xorB = b.getDefiningOp<comb::XorOp>();
+        if (xorA && xorB && xorA.getTwoState() && xorB.getTwoState()) {
+          Value aOther = xorNotOperand(xorA);
+          Value bOther = xorNotOperand(xorB);
+          if (aOther && bOther)
+            return equiv(aOther, bOther, depth + 1);
+        }
+
+        auto icmpA = a.getDefiningOp<comb::ICmpOp>();
+        auto icmpB = b.getDefiningOp<comb::ICmpOp>();
+        if (icmpA && icmpB && icmpA.getTwoState() == icmpB.getTwoState() &&
+            icmpA.getPredicate() == icmpB.getPredicate()) {
+          if (equiv(icmpA.getLhs(), icmpB.getLhs(), depth + 1) &&
+              equiv(icmpA.getRhs(), icmpB.getRhs(), depth + 1))
+            return true;
+          switch (icmpA.getPredicate()) {
+          case comb::ICmpPredicate::eq:
+          case comb::ICmpPredicate::ne:
+            if (equiv(icmpA.getLhs(), icmpB.getRhs(), depth + 1) &&
+                equiv(icmpA.getRhs(), icmpB.getLhs(), depth + 1))
+              return true;
+            break;
+          default:
+            break;
+          }
+        }
+
+        auto andA = a.getDefiningOp<comb::AndOp>();
+        auto andB = b.getDefiningOp<comb::AndOp>();
+        if (andA && andB && andA.getTwoState() == andB.getTwoState()) {
+          auto inputsA = andA.getInputs();
+          auto inputsB = andB.getInputs();
+          if (inputsA.size() != inputsB.size())
+            return false;
+          SmallVector<bool> matched(inputsB.size(), false);
+          for (Value inputA : inputsA) {
+            bool found = false;
+            for (size_t i = 0, e = inputsB.size(); i != e; ++i) {
+              if (matched[i])
+                continue;
+              if (!equiv(inputA, inputsB[i], depth + 1))
+                continue;
+              matched[i] = true;
+              found = true;
+              break;
+            }
+            if (!found)
+              return false;
+          }
+          return true;
+        }
+
+        return false;
+      };
+
+      // Prefer an existing unpacked `oldNot` (i1) extract from a frame load in
+      // this block. If none exists, we will materialize one from `frameLoad`.
+      Value oldNotValue;
+      for (auto call : loadsIt->second) {
+        for (Operation *user : call.getResult(0).getUsers()) {
+          auto extract = dyn_cast<comb::ExtractOp>(user);
+          if (!extract)
+            continue;
+          if (extract.getLowBit() != 0)
+            continue;
+          if (!extract.getType().isInteger(1))
+            continue;
+          oldNotValue = extract.getResult();
+          break;
+        }
+        if (oldNotValue)
+          break;
+      }
+
+      for (Operation &op : block.without_terminator()) {
+        auto andOp = dyn_cast<comb::AndOp>(op);
+        if (!andOp || !andOp.getTwoState())
+          continue;
+
+        // Look for `and(!A, <operands-of-A...>)` where `A` itself is an AND.
+        // This is always false and indicates the edge trigger got rewritten
+        // from `(!before) & after` into `(!after) & after`.
+        Value notA;
+        for (Value candidate : andOp.getInputs()) {
+          auto xorOp = candidate.getDefiningOp<comb::XorOp>();
+          if (!xorOp || !xorOp.getTwoState())
+            continue;
+          // Must be `xor <x>, 1` or `xor 1, <x>`.
+          Value aVal = xorNotOperand(xorOp);
+          if (!aVal)
+            continue;
+          auto aAnd = aVal.getDefiningOp<comb::AndOp>();
+          if (!aAnd || !aAnd.getTwoState())
+            continue;
+
+          // Prefer matching `and(!A, A)` (where `A` may have been recomputed
+          // with redundant signal loads) over the later-flattened
+          // `and(!A, <operands-of-A...>)` form.
+          SmallVector<Value> outerInputs;
+          for (Value v : andOp.getInputs()) {
+            if (v != candidate)
+              outerInputs.push_back(v);
+          }
+
+          bool matchesByValue = llvm::any_of(
+              outerInputs, [&](Value v) { return equiv(aVal, v, /*depth=*/0); });
+          bool matches = matchesByValue;
+
+          SmallVector<bool> used(outerInputs.size(), false);
+          auto hasEquivalent = [&](Value needle) -> bool {
+            for (size_t i = 0, e = outerInputs.size(); i != e; ++i) {
+              if (used[i])
+                continue;
+              if (!equiv(needle, outerInputs[i], /*depth=*/0))
+                continue;
+              used[i] = true;
+              return true;
+            }
+            return false;
+          };
+
+          bool matchesByOperands = false;
+          if (!matches) {
+            matchesByOperands = llvm::all_of(
+                aAnd.getInputs(), [&](Value v) { return hasEquivalent(v); });
+            matches = matchesByOperands;
+          }
+
+          if (debugEdgePatch && procIdAttr) {
+            llvm::errs() << "[convert-to-arcs] edgepatch proc_id=" << debugProcId
+                         << " candidate_matches value=" << matchesByValue
+                         << " operands=" << matchesByOperands
+                         << " outer_inputs=" << outerInputs.size() << "\n";
+            if (debugEdgePatchVerbose) {
+              llvm::errs() << "  andOp: ";
+              andOp.print(llvm::errs());
+              llvm::errs() << "\n";
+              if (Operation *aDef = aVal.getDefiningOp()) {
+                llvm::errs() << "  aVal: ";
+                aDef->print(llvm::errs());
+                llvm::errs() << "\n";
+              }
+              if (!outerInputs.empty()) {
+                if (Operation *bDef = outerInputs.front().getDefiningOp()) {
+                  llvm::errs() << "  bVal: ";
+                  bDef->print(llvm::errs());
+                  llvm::errs() << "\n";
+                }
+                auto aAndDbg = aVal.getDefiningOp<comb::AndOp>();
+                auto bAndDbg = outerInputs.front().getDefiningOp<comb::AndOp>();
+                if (aAndDbg && bAndDbg) {
+                  llvm::errs() << "  aVal inputs:\n";
+                  for (Value in : aAndDbg.getInputs()) {
+                    llvm::errs() << "    ";
+                    if (Operation *def = in.getDefiningOp())
+                      def->print(llvm::errs());
+                    else
+                      llvm::errs() << "<blockarg>";
+                    llvm::errs() << "\n";
+                  }
+                  llvm::errs() << "  bVal inputs:\n";
+                  for (Value in : bAndDbg.getInputs()) {
+                    llvm::errs() << "    ";
+                    if (Operation *def = in.getDefiningOp())
+                      def->print(llvm::errs());
+                    else
+                      llvm::errs() << "<blockarg>";
+                    llvm::errs() << "\n";
+                  }
+                  llvm::errs() << "  equiv matrix:\n";
+                  for (Value inA : aAndDbg.getInputs()) {
+                    for (Value inB : bAndDbg.getInputs()) {
+                      auto icmpA = inA.getDefiningOp<comb::ICmpOp>();
+                      auto icmpB = inB.getDefiningOp<comb::ICmpOp>();
+                      if (icmpA && icmpB) {
+                        llvm::errs() << "    icmp attrs: twoState "
+                                     << icmpA.getTwoState() << " vs "
+                                     << icmpB.getTwoState() << " pred "
+                                     << static_cast<int>(icmpA.getPredicate())
+                                     << " vs "
+                                     << static_cast<int>(icmpB.getPredicate())
+                                     << "\n";
+                      }
+                      llvm::errs() << "    equiv=" << equiv(inA, inB, /*depth=*/0)
+                                   << "  ";
+                      if (Operation *defA = inA.getDefiningOp())
+                        defA->print(llvm::errs());
+                      else
+                        llvm::errs() << "<blockarg>";
+                      llvm::errs() << "  vs  ";
+                      if (Operation *defB = inB.getDefiningOp())
+                        defB->print(llvm::errs());
+                      else
+                        llvm::errs() << "<blockarg>";
+                      llvm::errs() << "\n";
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          if (!matches)
+            continue;
+
+          notA = candidate;
+          break;
+        }
+        if (!notA)
+          continue;
+
+        Value oldNot = oldNotValue;
+        if (!oldNot) {
+          // Materialize `oldNot` from the spilled i64: extract bit0.
+          OpBuilder b(andOp);
+          Value oldNotPacked = frameLoad.getResult(0);
+          oldNot = comb::ExtractOp::create(b, andOp.getLoc(), oldNotPacked,
+                                           /*lowBit=*/0, /*width=*/1);
+        }
+
+        // Replace the `!after` operand with the spilled `!before`.
+        andOp->replaceUsesOfWith(notA, oldNot);
+        patched = true;
+        if (debugEdgePatch)
+          llvm::errs() << "[convert-to-arcs] edgepatch proc_id=" << debugProcId
+                       << " patched block=" << &block << "\n";
+        break;
+      }
+
+      (void)patched;
+    }
+  });
+
+  // At this point the Arc pipeline must not contain any remaining LLHD probe
+  // operations, otherwise the Arc-to-LLVM lowering will fail to legalize them.
+  //
+  // `llhd.prb` operations can still appear as type-conversion materializations
+  // when SV interface lowering introduces opaque interface handles (e.g.
+  // virtual interfaces stored as i64 values). Lower these probes to arcilator
+  // runtime signal loads.
+  SmallVector<llhd::PrbOp> leftoverProbes;
+  getOperation().walk([&](llhd::PrbOp prb) { leftoverProbes.push_back(prb); });
+  bool probeLoweringFailed = false;
+  for (llhd::PrbOp prb : leftoverProbes) {
+    ResolvedRuntimeSignal resolved;
+    if (failed(resolveRuntimeSignal(prb.getSignal(), resolved)) ||
+        (!resolved.sigIdAttr && !resolved.dynSigId)) {
+      prb.emitOpError() << "unsupported probe source for runtime lowering";
+      probeLoweringFailed = true;
+      continue;
+    }
+
+    Type resultTy = prb.getType();
+    int64_t resultWidth = hw::getBitWidth(resultTy);
+    if (resultWidth <= 0 || resultWidth > 64) {
+      prb.emitOpError() << "unsupported probed type for runtime lowering: "
+                        << resultTy;
+      probeLoweringFailed = true;
+      continue;
+    }
+
+    uint64_t totalWidth = resolved.totalWidth;
+    if (totalWidth == 0) {
+      int64_t bw = hw::getBitWidth(resultTy);
+      if (bw > 0)
+        totalWidth = static_cast<uint64_t>(bw);
+    }
+    if (totalWidth == 0 || totalWidth > 64) {
+      prb.emitOpError() << "unsupported runtime signal width for probe: "
+                        << totalWidth;
+      probeLoweringFailed = true;
+      continue;
+    }
+
+    auto module = prb->getParentOfType<mlir::ModuleOp>();
+    if (!module) {
+      prb.emitOpError() << "missing module for runtime hook";
+      probeLoweringFailed = true;
+      continue;
+    }
+
+    OpBuilder b(prb);
+    Location loc = prb.getLoc();
+
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_load_u64",
+        b.getFunctionType({b.getI32Type(), b.getI32Type()}, {b.getI64Type()}));
+
+    uint32_t procId = 0xFFFFFFFFu;
+    if (auto exec = prb->getParentOfType<arc::ExecuteOp>()) {
+      if (auto attr = exec->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+        procId = static_cast<uint32_t>(attr.getInt());
+    } else if (auto proc = prb->getParentOfType<llhd::ProcessOp>()) {
+      if (auto attr = proc->getAttrOfType<IntegerAttr>(kArcilatorProcIdAttr))
+        procId = static_cast<uint32_t>(attr.getInt());
+    }
+    Value procIdVal = buildI32Constant(b, loc, procId);
+
+    Value sigIdVal;
+    if (resolved.sigIdAttr) {
+      sigIdVal = buildI32Constant(b, loc, resolved.sigIdAttr.getInt());
+    } else {
+      Value dyn = resolved.dynSigId;
+      auto dynTy = dyn_cast<IntegerType>(dyn.getType());
+      if (!dynTy) {
+        prb.emitOpError() << "unsupported dynamic signal id type: "
+                          << dyn.getType();
+        probeLoweringFailed = true;
+        continue;
+      }
+      if (dynTy.getWidth() < 32)
+        dyn = comb::createZExt(b, loc, dyn, 32);
+      else if (dynTy.getWidth() > 32)
+        dyn = comb::ExtractOp::create(b, loc, dyn, 0, 32);
+      sigIdVal = dyn;
+    }
+
+    Value loaded =
+        b.create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+                                     b.getI64Type(),
+                                     ValueRange{sigIdVal, procIdVal})
+            .getResult(0);
+
+    Value bitsVal = loaded;
+    uint64_t sliceOffset = resolved.baseOffset;
+    if (resolved.dynamicOffset) {
+      Value offsetVal = resolved.dynamicOffset;
+      auto offsetTy = dyn_cast<IntegerType>(offsetVal.getType());
+      if (!offsetTy) {
+        prb.emitOpError() << "unsupported dynamic extract index type: "
+                          << offsetVal.getType();
+        probeLoweringFailed = true;
+        continue;
+      }
+      if (offsetTy.getWidth() < 64)
+        offsetVal = comb::createZExt(b, loc, offsetVal, 64);
+      else if (offsetTy.getWidth() > 64)
+        offsetVal = comb::ExtractOp::create(b, loc, offsetVal, 0, 64);
+
+      if (sliceOffset != 0) {
+        Value baseOff = buildI64Constant(b, loc, sliceOffset);
+        offsetVal = comb::AddOp::create(b, loc, baseOff, offsetVal, true);
+      }
+      offsetVal = b.createOrFold<comb::AndOp>(
+          loc, offsetVal, buildI64Constant(b, loc, 63));
+
+      Value shifted = b.createOrFold<comb::ShrUOp>(loc, loaded, offsetVal);
+      bitsVal = shifted;
+      if (resultWidth != 64) {
+        bitsVal = comb::ExtractOp::create(b, loc, b.getIntegerType(resultWidth),
+                                          shifted, 0);
+      }
+    } else {
+      if (sliceOffset + static_cast<uint64_t>(resultWidth) > 64) {
+        prb.emitOpError()
+            << "signal slice exceeds 64-bit runtime storage for probe";
+        probeLoweringFailed = true;
+        continue;
+      }
+      if (resultWidth != 64 || sliceOffset != 0) {
+        bitsVal = comb::ExtractOp::create(b, loc, b.getIntegerType(resultWidth),
+                                          loaded, sliceOffset);
+      }
+    }
+
+    Value replacement = bitsVal;
+    if (replacement.getType() != resultTy)
+      replacement = b.createOrFold<hw::BitcastOp>(loc, resultTy, replacement);
+    prb.replaceAllUsesWith(replacement);
+    prb.erase();
+  }
+  if (probeLoweringFailed) {
+    emitError(getOperation().getLoc())
+        << "failed to lower LLHD probes after arc conversion";
+    return signalPassFailure();
+  }
+
+  // Persist runtime-managed signal initial values on the Arc model op so they
+  // survive later canonicalization/DCE and can be exported via state.json.
+  if (!runtimeSigInits.empty()) {
+    OpBuilder b(&getContext());
+    SmallVector<std::pair<uint64_t, ArcilatorRuntimeSigInit>> items;
+    items.reserve(runtimeSigInits.size());
+    for (auto &it : runtimeSigInits)
+      items.push_back({it.first, it.second});
+    llvm::sort(items, [](auto &a, auto &b) { return a.first < b.first; });
+
+    SmallVector<Attribute> entries;
+    entries.reserve(items.size());
+    for (auto &it : items) {
+      uint64_t sigId = it.first;
+      const auto &rec = it.second;
+      NamedAttrList dict;
+      dict.append("sigId", b.getI64IntegerAttr(sigId));
+      dict.append("initU64", b.getI64IntegerAttr(rec.initU64));
+      dict.append("totalWidth", b.getI64IntegerAttr(rec.totalWidth));
+      entries.push_back(DictionaryAttr::get(&getContext(), dict));
+    }
+    auto arr = b.getArrayAttr(entries);
+    // ConvertToArcs runs before `arc::LowerState` creates `arc.model` ops from
+    // HW modules. Stash the summary attribute on any existing models and on
+    // the originating HW modules so later passes can propagate it onto the
+    // final `arc.model` (consumed by ModelInfo/state.json export).
+    getOperation().walk([&](arc::ModelOp modelOp) {
+      modelOp->setAttr(kArcilatorSigInitsAttr, arr);
+    });
+    getOperation().walk([&](hw::HWModuleOp moduleOp) {
+      moduleOp->setAttr(kArcilatorSigInitsAttr, arr);
+    });
+  }
+
 }

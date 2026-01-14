@@ -815,8 +815,23 @@ void HoistSignalsPass::runOnOperation() {
           regions.push_back(&region);
   });
   for (auto *region : regions) {
-    ProbeHoister(*region).hoist();
-    if (auto processOp = dyn_cast<ProcessOp>(region->getParentOp()))
+    // Do not hoist probes/drives out of processes that contain `llhd.wait`.
+    //
+    // Such processes model temporal control flow (delays, events) and are later
+    // lowered by arcilator using a cycle-driven scheduler. Hoisting a probe out
+    // of the process turns the read into an SSA capture that becomes constant
+    // across suspensions/resumes, which breaks common patterns like:
+    //   forever begin #(50) sig = ~sig; end
+    //
+    // Keep these processes intact so each resume observes the current signal
+    // value.
+    if (auto processOp = dyn_cast<ProcessOp>(region->getParentOp())) {
+      if (!processOp.getOps<WaitOp>().empty())
+        continue;
+      ProbeHoister(*region).hoist();
       DriveHoister(processOp).hoist();
+      continue;
+    }
+    ProbeHoister(*region).hoist();
   }
 }

@@ -854,6 +854,78 @@ struct StmtVisitor {
     return context.convertTimingControl(stmt.timing, stmt.stmt);
   }
 
+  // Handle `wait(<expr>) <stmt>;`.
+  LogicalResult visit(const slang::ast::WaitStatement &stmt) {
+    // Create the blocks for the wait condition check, the suspend point, the
+    // post-wait statement, and the exit.
+    auto &exitBlock = createBlock();
+    auto &bodyBlock = createBlock();
+    auto &waitBlock = createBlock();
+    auto &checkBlock = createBlock();
+    cf::BranchOp::create(builder, loc, &checkBlock);
+
+    // Evaluate the condition in the check block, collecting all variables read
+    // as part of the expression so we can observe them for changes while
+    // waiting.
+    builder.setInsertionPointToEnd(&checkBlock);
+    llvm::SmallSetVector<Value, 8> observedValues;
+    Value cond;
+    {
+      auto previousCallback = context.rvalueReadCallback;
+      auto done = llvm::make_scope_exit(
+          [&] { context.rvalueReadCallback = previousCallback; });
+      context.rvalueReadCallback = [&](moore::ReadOp readOp) {
+        observedValues.insert(readOp.getInput());
+        if (previousCallback)
+          previousCallback(readOp);
+      };
+      cond = context.convertRvalueExpression(stmt.cond);
+      if (!cond)
+        return failure();
+    }
+    cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+    cond = moore::ToBuiltinBoolOp::create(builder, loc, cond);
+    cf::CondBranchOp::create(builder, loc, cond, &bodyBlock, &waitBlock);
+
+    // Suspend in the wait block until any of the observed values changes, then
+    // re-check the condition.
+    builder.setInsertionPointToEnd(&waitBlock);
+    auto waitOp = moore::WaitEventOp::create(builder, loc);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
+      auto previousCallback = context.rvalueReadCallback;
+      auto done = llvm::make_scope_exit(
+          [&] { context.rvalueReadCallback = previousCallback; });
+      // Reads performed solely to populate the wait op should not be reported
+      // to any surrounding implicit event collection.
+      context.rvalueReadCallback = nullptr;
+      for (auto observed : observedValues) {
+        auto value = moore::ReadOp::create(builder, loc, observed);
+        moore::DetectEventOp::create(builder, loc, moore::Edge::AnyChange,
+                                     value, Value{});
+      }
+    }
+    cf::BranchOp::create(builder, loc, &checkBlock);
+
+    // Convert the trailing statement once the wait has completed.
+    builder.setInsertionPointToEnd(&bodyBlock);
+    if (failed(context.convertStatement(stmt.stmt)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &exitBlock);
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
   // Handle `->e;` and `->>e;` event triggers.
   //
   // We currently model SystemVerilog `event` values as an integer token. A
@@ -862,6 +934,96 @@ struct StmtVisitor {
   LogicalResult visit(const slang::ast::EventTriggerStatement &stmt) {
     if (stmt.timing)
       return mlir::emitError(loc) << "unsupported timed event trigger";
+
+    // Class property events are lowered through the runtime-backed class object
+    // model, and thus do not have a direct `ref` storage location. Handle them
+    // here by reading the current token from the class object and writing back
+    // the incremented value.
+    if (auto *named = stmt.target.as_if<slang::ast::NamedValueExpression>()) {
+      if (auto *prop =
+              named->symbol.as_if<slang::ast::ClassPropertySymbol>()) {
+        auto fieldType = context.convertType(prop->getType());
+        if (!fieldType)
+          return failure();
+        auto intTy = dyn_cast<moore::IntType>(fieldType);
+        if (!intTy || !intTy.getBitSize().has_value() ||
+            *intTy.getBitSize() != 32) {
+          auto d = mlir::emitError(loc, "unsupported class event trigger type: ")
+                   << fieldType;
+          d.attachNote(context.convertLocation(prop->location))
+              << "property declared here";
+          return failure();
+        }
+
+        auto getOrCreateExternFunc = [&](StringRef name, FunctionType fnType) {
+          if (auto existing =
+                  context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(name)) {
+            if (existing.getFunctionType() != fnType) {
+              mlir::emitError(loc, "conflicting declarations for `")
+                  << name << "`";
+              return mlir::func::FuncOp();
+            }
+            return existing;
+          }
+          OpBuilder::InsertionGuard g(context.builder);
+          context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+          context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+          auto fn =
+              mlir::func::FuncOp::create(context.builder, loc, name, fnType);
+          fn.setPrivate();
+          return fn;
+        };
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        Value handleVal;
+        if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+          handleVal = moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0,
+                                                /*isSigned=*/true);
+        } else {
+          if (context.thisStack.empty()) {
+            auto d = mlir::emitError(loc, "event trigger on class property `")
+                     << prop->name << "` without a `this` handle";
+            d.attachNote(context.convertLocation(prop->location))
+                << "property declared here";
+            return failure();
+          }
+          handleVal = context.thisStack.back();
+          handleVal = context.materializeConversion(i32Ty, handleVal,
+                                                    /*isSigned=*/false, loc);
+          if (!handleVal)
+            return failure();
+        }
+
+        int32_t fieldId = context.getOrAssignClassFieldId(*prop);
+        Value fieldIdVal =
+            moore::ConstantOp::create(builder, loc, i32Ty, fieldId,
+                                      /*isSigned=*/true);
+
+        auto getFnType =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+        auto getFn = getOrCreateExternFunc("circt_sv_class_get_i32", getFnType);
+        if (!getFn)
+          return failure();
+        Value cur = mlir::func::CallOp::create(builder, loc, getFn,
+                                               {handleVal, fieldIdVal})
+                        .getResult(0);
+
+        Value one = moore::ConstantOp::create(builder, loc, i32Ty, 1,
+                                              /*isSigned=*/true);
+        Value next = moore::AddOp::create(builder, loc, cur, one).getResult();
+
+        auto setFnType = FunctionType::get(context.getContext(),
+                                           {i32Ty, i32Ty, i32Ty}, {});
+        auto setFn =
+            getOrCreateExternFunc("circt_sv_class_set_i32", setFnType);
+        if (!setFn)
+          return failure();
+        builder.create<mlir::func::CallOp>(loc, setFn,
+                                           ValueRange{handleVal, fieldIdVal, next});
+        return success();
+      }
+    }
 
     Value lhs = context.convertLvalueExpression(stmt.target);
     if (!lhs)
@@ -973,6 +1135,46 @@ struct StmtVisitor {
     cond = context.convertToBool(cond);
     if (!cond)
       return failure();
+
+    // For deferred immediate assertions (`assert #0` / `assert final`), ignore
+    // action blocks for now and keep only the verification semantics. Questa
+    // does not execute `else` blocks for these forms (it reports an assertion
+    // failure but does not run `$error` / `uvm_error` actions), and sv-tests
+    // treats such runs as PASS. Lowering them as "if-else" control flow causes
+    // arcilator to emit `:assert:` markers and fail tests that are expected to
+    // pass.
+    if (stmt.isFinal || stmt.isDeferred) {
+      // Moore assertion ops currently require a `moore.procedure` parent. When
+      // an immediate assertion appears inside a function/task body that is
+      // lowered as an isolated region (e.g. `func.func`), keep the condition
+      // evaluation for side effects but otherwise drop the assertion.
+      if (!builder.getInsertionBlock() ||
+          !isa<moore::ProcedureOp>(builder.getInsertionBlock()->getParentOp()))
+        return success();
+
+      auto defer = moore::DeferAssert::Immediate;
+      if (stmt.isFinal)
+        defer = moore::DeferAssert::Final;
+      else if (stmt.isDeferred)
+        defer = moore::DeferAssert::Observed;
+
+      switch (stmt.assertionKind) {
+      case slang::ast::AssertionKind::Assert:
+        moore::AssertOp::create(builder, loc, defer, cond, StringAttr{});
+        return success();
+      case slang::ast::AssertionKind::Assume:
+        moore::AssumeOp::create(builder, loc, defer, cond, StringAttr{});
+        return success();
+      case slang::ast::AssertionKind::CoverProperty:
+        moore::CoverOp::create(builder, loc, defer, cond, StringAttr{});
+        return success();
+      default:
+        break;
+      }
+      mlir::emitError(loc) << "unsupported immediate assertion kind: "
+                           << slang::ast::toString(stmt.assertionKind);
+      return failure();
+    }
 
     // Handle assertion statements that don't have an action block.
     if (stmt.ifTrue && stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {

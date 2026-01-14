@@ -18,6 +18,8 @@
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/PortConverter.h"
+#include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/Moore/MooreOps.h"
@@ -47,6 +49,8 @@ using namespace circt::sv;
 
 namespace {
 
+static constexpr const char kArcilatorSigIdAttr[] = "arcilator.sig_id";
+
 static bool isInProceduralRegion(Operation *op) {
   for (Operation *parent = op ? op->getParentOp() : nullptr; parent;
        parent = parent->getParentOp()) {
@@ -62,6 +66,86 @@ static Value getInterfaceBase(Value v) {
   while (auto mp = v.getDefiningOp<sv::GetModportOp>())
     v = mp.getIface();
   return v;
+}
+
+static bool isFourValuedIntStruct(Type type, Type &bitsType) {
+  auto structTy = dyn_cast<hw::StructType>(type);
+  if (!structTy)
+    return false;
+  auto elements = structTy.getElements();
+  if (elements.size() != 2)
+    return false;
+  if (elements[0].name.getValue() != "value" ||
+      elements[1].name.getValue() != "unknown")
+    return false;
+  if (elements[0].type != elements[1].type)
+    return false;
+  bitsType = elements[0].type;
+  return hw::getBitWidth(bitsType) > 0;
+}
+
+static Value materializeTwoFourStateConversion(OpBuilder &builder, Location loc,
+                                               Value input, Type dstType) {
+  if (!input || input.getType() == dstType)
+    return input;
+
+  Type dstBitsType;
+  Type srcBitsType;
+  bool dstIsFour = isFourValuedIntStruct(dstType, dstBitsType);
+  bool srcIsFour = isFourValuedIntStruct(input.getType(), srcBitsType);
+
+  auto getOrBitcast = [&](Value v, Type ty) -> Value {
+    if (!v || v.getType() == ty)
+      return v;
+    if (hw::getBitWidth(v.getType()) != hw::getBitWidth(ty))
+      return {};
+    return builder.create<hw::BitcastOp>(loc, ty, v);
+  };
+
+  // 2-state integer -> 4-state struct {value, unknown=0}
+  if (dstIsFour && !srcIsFour) {
+    int64_t w = hw::getBitWidth(dstBitsType);
+    if (w <= 0)
+      return {};
+    Value valueBits = getOrBitcast(input, dstBitsType);
+    if (!valueBits)
+      return {};
+    Type computeTy = IntegerType::get(builder.getContext(), w);
+    Value zero = builder.create<hw::ConstantOp>(loc, computeTy, 0);
+    Value unknownBits = getOrBitcast(zero, dstBitsType);
+    if (!unknownBits)
+      return {};
+    auto structTy = cast<hw::StructType>(dstType);
+    return builder.create<hw::StructCreateOp>(loc, structTy,
+                                              ValueRange{valueBits, unknownBits});
+  }
+
+  // 4-state struct -> 2-state integer (treat unknown bits as 0).
+  if (!dstIsFour && srcIsFour) {
+    int64_t w = hw::getBitWidth(srcBitsType);
+    if (w <= 0)
+      return {};
+    auto structTy = cast<hw::StructType>(input.getType());
+    Value valueBits =
+        builder.create<hw::StructExtractOp>(loc, input,
+                                            builder.getStringAttr("value"));
+    Value unknownBits =
+        builder.create<hw::StructExtractOp>(loc, input,
+                                            builder.getStringAttr("unknown"));
+
+    Type computeTy = IntegerType::get(builder.getContext(), w);
+    valueBits = getOrBitcast(valueBits, computeTy);
+    unknownBits = getOrBitcast(unknownBits, computeTy);
+    if (!valueBits || !unknownBits)
+      return {};
+
+    Value ones = builder.create<hw::ConstantOp>(loc, computeTy, -1);
+    Value notUnknown = builder.create<comb::XorOp>(loc, unknownBits, ones);
+    Value masked = builder.create<comb::AndOp>(loc, valueBits, notUnknown);
+    return getOrBitcast(masked, dstType);
+  }
+
+  return {};
 }
 
 struct InterfaceInfo {
@@ -184,7 +268,8 @@ class LowerInterfacesPass
     : public circt::sv::impl::LowerInterfacesBase<LowerInterfacesPass> {
 public:
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
-    registry.insert<hw::HWDialect, llhd::LLHDDialect, sv::SVDialect>();
+    registry.insert<hw::HWDialect, comb::CombDialect, llhd::LLHDDialect,
+                    sv::SVDialect>();
   }
   void runOnOperation() override;
 
@@ -203,11 +288,15 @@ public:
   getOrCreateLoweredInterfaceInstance(sv::InterfaceInstanceOp inst,
                                       hw::HWModuleOp parentModule);
 
-private:
+	private:
   LogicalResult populateInterfaceInfo(ModuleOp module);
   LogicalResult buildPlans(hw::InstanceGraph &graph);
   LogicalResult lowerModules(hw::InstanceGraph &graph);
   LogicalResult lowerInterfaceInstances(ModuleOp module);
+  LogicalResult lowerUnrealizedInterfaceCasts(ModuleOp module);
+  LogicalResult lowerInterfaceHandleCasts(ModuleOp module);
+
+  uint32_t nextInterfaceSigId = 0;
 };
 
 // Port conversion that rewrites interface/modport ports to lowered structs.
@@ -454,6 +543,16 @@ static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
                     "inout struct, got "
                  << baseValue.getType();
         }
+        if (replacement.getType() != read.getType()) {
+          Value converted =
+              materializeTwoFourStateConversion(builder, read.getLoc(),
+                                                replacement, read.getType());
+          if (!converted)
+            return read.emitOpError()
+                   << "unsupported interface read type conversion from "
+                   << replacement.getType() << " to " << read.getType();
+          replacement = converted;
+        }
         read.replaceAllUsesWith(replacement);
         read.erase();
         continue;
@@ -474,6 +573,18 @@ static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
         ImplicitLocOpBuilder builder(assign.getLoc(), assign);
         Value fieldHandle =
             builder.create<sv::StructFieldInOutOp>(baseValue, fieldAttr);
+        Value rhs = assign.getRhs();
+        Type fieldType = cast<hw::InOutType>(fieldHandle.getType()).getElementType();
+        if (rhs.getType() != fieldType) {
+          Value converted =
+              materializeTwoFourStateConversion(builder, assign.getLoc(), rhs,
+                                                fieldType);
+          if (!converted)
+            return assign.emitOpError()
+                   << "unsupported interface assign type conversion from "
+                   << rhs.getType() << " to " << fieldType;
+          rhs = converted;
+        }
         bool inProceduralRegion = isInProceduralRegion(assign);
         // Prefer LLHD drives over SV assign ops so downstream passes (Arc/LLVM)
         // never see residual SV dialect statements.
@@ -486,9 +597,24 @@ static LogicalResult lowerInterfaceValueImpl(InterfaceInfo *info,
             builder, assign.getLoc(), 0, "ns",
             /*delta=*/inProceduralRegion ? 1 : 0,
             /*epsilon=*/inProceduralRegion ? 0 : 1);
-        llhd::DrvOp::create(builder, assign.getLoc(), fieldHandle,
-                            assign.getRhs(), delay, Value{});
+        llhd::DrvOp::create(builder, assign.getLoc(), fieldHandle, rhs, delay,
+                            Value{});
         assign.erase();
+        continue;
+      }
+
+      // Allow interface handles to flow through `unrealized_conversion_cast`.
+      // This is used by higher-level shims (e.g. virtual interfaces stored in
+      // runtime tables) to cast interface values to opaque pointer-like types
+      // such as `moore.chandle`, and back.
+      if (auto cast = dyn_cast<mlir::UnrealizedConversionCastOp>(user)) {
+        ImplicitLocOpBuilder builder(cast.getLoc(), cast);
+        auto repl = mlir::UnrealizedConversionCastOp::create(
+            builder, cast.getLoc(), cast.getResultTypes(), ValueRange{baseValue});
+        for (auto [oldRes, newRes] :
+             llvm::zip_equal(cast.getResults(), repl.getResults()))
+          oldRes.replaceAllUsesWith(newRes);
+        toErase.push_back(cast);
         continue;
       }
 
@@ -730,6 +856,11 @@ FailureOr<Value> LowerInterfacesPass::getOrCreateLoweredInterfaceInstance(
   Value lowered =
       llhd::SignalOp::create(builder, inst.getLoc(),
                              builder.getStringAttr(inst.getName()), init);
+  if (auto sigOp = lowered.getDefiningOp<llhd::SignalOp>()) {
+    if (!sigOp->hasAttr(kArcilatorSigIdAttr))
+      sigOp->setAttr(kArcilatorSigIdAttr,
+                     builder.getI32IntegerAttr(nextInterfaceSigId++));
+  }
   loweredInterfaceInstances[key] = lowered;
   return lowered;
 }
@@ -777,6 +908,129 @@ LogicalResult LowerInterfacesPass::lowerInterfaceInstances(ModuleOp module) {
   return success();
 }
 
+LogicalResult
+LowerInterfacesPass::lowerUnrealizedInterfaceCasts(ModuleOp module) {
+  SmallVector<mlir::UnrealizedConversionCastOp> ifaceCasts;
+  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (cast.getNumOperands() != 1 || cast.getNumResults() != 1)
+      return;
+    Type resultTy = cast.getResult(0).getType();
+    if (isa<sv::InterfaceType>(resultTy) || isa<sv::ModportType>(resultTy))
+      ifaceCasts.push_back(cast);
+  });
+  if (ifaceCasts.empty())
+    return success();
+
+  for (auto cast : ifaceCasts) {
+    Type resultTy = cast.getResult(0).getType();
+    InterfaceInfo *info = nullptr;
+    StringAttr declaredModport;
+
+    if (auto ifaceTy = dyn_cast<sv::InterfaceType>(resultTy)) {
+      auto symName = ifaceTy.getInterface().getAttr();
+      auto it = interfaces.find(symName);
+      if (it == interfaces.end())
+        return cast.emitOpError() << "references unknown interface " << symName;
+      info = &it->second;
+    } else if (auto modportTy = dyn_cast<sv::ModportType>(resultTy)) {
+      SymbolRefAttr modportRef = modportTy.getModport();
+      declaredModport = modportRef.getLeafReference();
+      auto symName = modportRef.getRootReference();
+      auto it = interfaces.find(symName);
+      if (it == interfaces.end())
+        return cast.emitOpError() << "references unknown interface " << symName;
+      info = &it->second;
+    } else {
+      continue;
+    }
+
+    if (!info || info->fields.empty())
+      return cast.emitOpError()
+             << "interface lowering is not meaningful for empty interface";
+
+    // Treat these casts as producing a reference-like interface handle.
+    // Materialize a lowered inout<struct> base from the opaque operand.
+    hw::StructType structTy = info->getStructType();
+    Type loweredType = hw::InOutType::get(structTy);
+
+    OpBuilder builder(cast);
+    builder.setInsertionPointAfter(cast);
+    Value loweredBase =
+        mlir::UnrealizedConversionCastOp::create(builder, cast.getLoc(),
+                                                 loweredType,
+                                                 ValueRange{cast.getOperand(0)})
+            .getResult(0);
+
+    if (failed(lowerInterfaceValueImpl(
+            info, declaredModport, cast.getResult(0), loweredBase,
+            /*directModport=*/declaredModport)))
+      return failure();
+
+    if (!cast.getResult(0).use_empty())
+      return cast.emitOpError("unsupported uses remain after lowering");
+    cast.erase();
+  }
+  return success();
+}
+
+LogicalResult LowerInterfacesPass::lowerInterfaceHandleCasts(ModuleOp module) {
+  SmallVector<mlir::UnrealizedConversionCastOp> casts;
+  module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+    if (cast.getNumOperands() != 1 || cast.getNumResults() != 1)
+      return;
+    if (!isa<IntegerType>(cast.getResult(0).getType()))
+      return;
+    casts.push_back(cast);
+  });
+  if (casts.empty())
+    return success();
+
+  for (auto cast : casts) {
+    auto resultIntTy = dyn_cast<IntegerType>(cast.getResult(0).getType());
+    if (!resultIntTy)
+      continue;
+    unsigned width = resultIntTy.getWidth();
+    if (width == 0 || width > 64)
+      continue;
+
+    Value input = cast.getOperand(0);
+    if (auto inout = dyn_cast<hw::InOutType>(input.getType()))
+      input = getInterfaceBase(input);
+
+    // Strip trivial conversion casts and locate a lowered interface signal.
+    Value base = input;
+    while (auto inner = base.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (inner.getNumOperands() != 1 || inner.getNumResults() != 1)
+        break;
+      base = inner.getOperand(0);
+    }
+
+    auto sigOp = base.getDefiningOp<llhd::SignalOp>();
+    if (!sigOp)
+      continue;
+
+    auto sigIdAttr = sigOp->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr);
+    if (!sigIdAttr) {
+      OpBuilder b(sigOp);
+      sigIdAttr = b.getI32IntegerAttr(nextInterfaceSigId++);
+      sigOp->setAttr(kArcilatorSigIdAttr, sigIdAttr);
+    }
+
+    int64_t sigId = sigIdAttr.getInt();
+    APInt sigBits(width, static_cast<uint64_t>(sigId), /*isSigned=*/false);
+    ImplicitLocOpBuilder b(cast.getLoc(), cast);
+    Value handle = hw::ConstantOp::create(b, cast.getLoc(), sigBits);
+    if (handle.getType() != cast.getResult(0).getType())
+      handle =
+          b.createOrFold<hw::BitcastOp>(cast.getLoc(), cast.getResult(0).getType(),
+                                        handle);
+    cast.getResult(0).replaceAllUsesWith(handle);
+    cast.erase();
+  }
+
+  return success();
+}
+
 void LowerInterfacesPass::runOnOperation() {
   ModuleOp module = getOperation();
   auto &instanceGraph = getAnalysis<hw::InstanceGraph>();
@@ -787,6 +1041,10 @@ void LowerInterfacesPass::runOnOperation() {
   if (failed(lowerModules(instanceGraph)))
     return signalPassFailure();
   if (failed(lowerInterfaceInstances(module)))
+    return signalPassFailure();
+  if (failed(lowerUnrealizedInterfaceCasts(module)))
+    return signalPassFailure();
+  if (failed(lowerInterfaceHandleCasts(module)))
     return signalPassFailure();
 }
 
