@@ -553,7 +553,10 @@ tryEvaluateMooreIntValue(Value value,
 /// is not zero it returns the max value integer of target-width.
 static Value adjustIntegerWidth(OpBuilder &builder, Value value,
                                 uint32_t targetWidth, Location loc) {
-  uint32_t intWidth = value.getType().getIntOrFloatBitWidth();
+  auto intType = dyn_cast<IntegerType>(value.getType());
+  if (!intType)
+    return {};
+  uint32_t intWidth = intType.getWidth();
   if (intWidth == targetWidth)
     return value;
 
@@ -2443,12 +2446,36 @@ struct DynExtractOpConversion : public OpConversionPattern<DynExtractOp> {
     Type inputType = adaptor.getInput().getType();
 
     if (auto intType = dyn_cast<IntegerType>(inputType)) {
-      Value amount = adjustIntegerWidth(rewriter, adaptor.getLowBit(),
-                                        intType.getWidth(), op->getLoc());
-      Value value = comb::ShrUOp::create(rewriter, op->getLoc(),
-                                         adaptor.getInput(), amount);
+      auto loc = op.getLoc();
+      Value lowBit = adaptor.getLowBit();
+      Value amountUnknownAny =
+          hw::ConstantOp::create(rewriter, loc, rewriter.getI1Type(), 0);
+      if (isFourValuedIntType(lowBit.getType())) {
+        Value lowValue = getFourValuedValue(rewriter, loc, lowBit);
+        Value lowUnknown = getFourValuedUnknown(rewriter, loc, lowBit);
+        Value zeroVec = hw::ConstantOp::create(
+            rewriter, loc, cast<IntegerType>(lowUnknown.getType()), 0);
+        amountUnknownAny = rewriter.createOrFold<comb::ICmpOp>(
+            loc, comb::ICmpPredicate::ne, lowUnknown, zeroVec);
+        lowBit = lowValue;
+      }
 
-      rewriter.replaceOpWithNewOp<comb::ExtractOp>(op, resultType, value, 0);
+      Value amount =
+          adjustIntegerWidth(rewriter, lowBit, intType.getWidth(), loc);
+      if (!amount)
+        return failure();
+      Value value = comb::ShrUOp::create(rewriter, loc, adaptor.getInput(),
+                                         amount);
+
+      if (!isa<IntegerType>(resultType))
+        return failure();
+      Value extracted =
+          rewriter.createOrFold<comb::ExtractOp>(loc, resultType, value, 0);
+      Value zero =
+          hw::ConstantOp::create(rewriter, loc, cast<IntegerType>(resultType), 0);
+      Value mux =
+          rewriter.createOrFold<comb::MuxOp>(loc, amountUnknownAny, zero, extracted);
+      rewriter.replaceOp(op, mux);
       return success();
     }
 
@@ -2476,6 +2503,8 @@ struct DynExtractOpConversion : public OpConversionPattern<DynExtractOp> {
       }
 
       Value amount = adjustIntegerWidth(rewriter, lowBit, vecTy.getWidth(), loc);
+      if (!amount)
+        return failure();
       Value valueShift =
           rewriter.createOrFold<comb::ShrUOp>(loc, valueBits, amount, false);
       Value unknownShift =
@@ -2505,19 +2534,57 @@ struct DynExtractOpConversion : public OpConversionPattern<DynExtractOp> {
     }
 
     if (auto arrType = dyn_cast<hw::ArrayType>(inputType)) {
+      auto loc = op.getLoc();
       unsigned idxWidth = llvm::Log2_64_Ceil(arrType.getNumElements());
-      Value idx = adjustIntegerWidth(rewriter, adaptor.getLowBit(), idxWidth,
-                                     op->getLoc());
+      Value lowBit = adaptor.getLowBit();
+      Value idxUnknownAny =
+          hw::ConstantOp::create(rewriter, loc, rewriter.getI1Type(), 0);
+      if (isFourValuedIntType(lowBit.getType())) {
+        Value lowValue = getFourValuedValue(rewriter, loc, lowBit);
+        Value lowUnknown = getFourValuedUnknown(rewriter, loc, lowBit);
+        Value zeroVec = hw::ConstantOp::create(
+            rewriter, loc, cast<IntegerType>(lowUnknown.getType()), 0);
+        idxUnknownAny = rewriter.createOrFold<comb::ICmpOp>(
+            loc, comb::ICmpPredicate::ne, lowUnknown, zeroVec);
+        lowBit = lowValue;
+      }
 
-      bool isSingleElementExtract = arrType.getElementType() == resultType;
+      Value idx = adjustIntegerWidth(rewriter, lowBit, idxWidth, loc);
+      if (!idx)
+        return failure();
 
-      if (isSingleElementExtract)
-        rewriter.replaceOpWithNewOp<hw::ArrayGetOp>(op, adaptor.getInput(),
-                                                    idx);
-      else
+      if (isa<hw::ArrayType>(resultType)) {
         rewriter.replaceOpWithNewOp<hw::ArraySliceOp>(op, resultType,
                                                       adaptor.getInput(), idx);
+        return success();
+      }
 
+      Value extracted = rewriter.createOrFold<hw::ArrayGetOp>(
+          loc, adaptor.getInput(), idx);
+      if (!extracted)
+        return failure();
+
+      Value lowered = extracted;
+      if (isFourValuedIntType(extracted.getType())) {
+        auto outTy =
+            cast<IntegerType>(cast<hw::StructType>(extracted.getType())
+                                  .getElements()[0]
+                                  .type);
+        Value allX = createFourValued(
+            rewriter, loc, extracted.getType(),
+            hw::ConstantOp::create(rewriter, loc, outTy, 0),
+            hw::ConstantOp::create(rewriter, loc, outTy, -1));
+        if (!allX)
+          return failure();
+        lowered =
+            rewriter.createOrFold<comb::MuxOp>(loc, idxUnknownAny, allX, extracted);
+      } else if (auto intResult = dyn_cast<IntegerType>(extracted.getType())) {
+        Value zero = hw::ConstantOp::create(rewriter, loc, intResult, 0);
+        lowered = rewriter.createOrFold<comb::MuxOp>(loc, idxUnknownAny, zero,
+                                                     extracted);
+      }
+
+      rewriter.replaceOp(op, lowered);
       return success();
     }
 
@@ -2562,6 +2629,8 @@ struct DynExtractRefOpConversion : public OpConversionPattern<DynExtractRefOp> {
 
       Value amount = adjustIntegerWidth(rewriter, lowBit,
                                         llvm::Log2_64_Ceil(width), loc);
+      if (!amount)
+        return failure();
       Value slicedValueRef = rewriter.create<llhd::SigExtractOp>(
           loc, resultTypes[0], valueRef, amount);
       Value slicedUnknownRef = rewriter.create<llhd::SigExtractOp>(
@@ -2593,6 +2662,8 @@ struct DynExtractRefOpConversion : public OpConversionPattern<DynExtractRefOp> {
       Value amount =
           adjustIntegerWidth(rewriter, lowBit,
                              llvm::Log2_64_Ceil(width), loc);
+      if (!amount)
+        return failure();
       rewriter.replaceOpWithNewOp<llhd::SigExtractOp>(
           op, resultTypes.front(), inputValue, amount);
       return success();
@@ -2604,6 +2675,8 @@ struct DynExtractRefOpConversion : public OpConversionPattern<DynExtractRefOp> {
       Value idx = adjustIntegerWidth(
           rewriter, lowBit,
           llvm::Log2_64_Ceil(arrType.getNumElements()), loc);
+      if (!idx)
+        return failure();
 
       if (resultTypes.size() == 2) {
         Value elementRef =
@@ -3638,6 +3711,8 @@ struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
     Value input = rewriter.createOrFold<hw::BitcastOp>(
         loc, rewriter.getIntegerType(inputBw), adaptor.getInput());
     Value amount = adjustIntegerWidth(rewriter, input, resultBw, loc);
+    if (!amount)
+      return failure();
 
     Value result =
         rewriter.createOrFold<hw::BitcastOp>(loc, resultType, amount);
@@ -4027,6 +4102,8 @@ struct ShlOpConversion : public OpConversionPattern<ShlOp> {
       // Comb shift operations require the same bit-width for value and amount.
       Value adj =
           adjustIntegerWidth(rewriter, amount, resultType.getIntOrFloatBitWidth(), loc);
+      if (!adj)
+        return failure();
       rewriter.replaceOpWithNewOp<comb::ShlOp>(op, resultType, value, adj, false);
       return success();
     }
@@ -4050,6 +4127,8 @@ struct ShlOpConversion : public OpConversionPattern<ShlOp> {
     }
 
     Value adj = adjustIntegerWidth(rewriter, amount, vecTy.getWidth(), loc);
+    if (!adj)
+      return failure();
     Value shiftedValue =
         rewriter.createOrFold<comb::ShlOp>(loc, valueBits, adj, false);
     Value shiftedUnknown =
@@ -4088,6 +4167,8 @@ struct ShrOpConversion : public OpConversionPattern<ShrOp> {
     if (isa<IntegerType>(value.getType())) {
       Value adj =
           adjustIntegerWidth(rewriter, amount, resultType.getIntOrFloatBitWidth(), loc);
+      if (!adj)
+        return failure();
       rewriter.replaceOpWithNewOp<comb::ShrUOp>(op, resultType, value, adj, false);
       return success();
     }
@@ -4110,6 +4191,8 @@ struct ShrOpConversion : public OpConversionPattern<ShrOp> {
     }
 
     Value adj = adjustIntegerWidth(rewriter, amount, vecTy.getWidth(), loc);
+    if (!adj)
+      return failure();
     Value shiftedValue =
         rewriter.createOrFold<comb::ShrUOp>(loc, valueBits, adj, false);
     Value shiftedUnknown =
@@ -4260,6 +4343,8 @@ struct AShrOpConversion : public OpConversionPattern<AShrOp> {
     if (isa<IntegerType>(value.getType())) {
       Value adj =
           adjustIntegerWidth(rewriter, amount, resultType.getIntOrFloatBitWidth(), loc);
+      if (!adj)
+        return failure();
       rewriter.replaceOpWithNewOp<comb::ShrSOp>(op, resultType, value, adj, false);
       return success();
     }
@@ -4282,6 +4367,8 @@ struct AShrOpConversion : public OpConversionPattern<AShrOp> {
     }
 
     Value adj = adjustIntegerWidth(rewriter, amount, vecTy.getWidth(), loc);
+    if (!adj)
+      return failure();
     Value shiftedValue =
         rewriter.createOrFold<comb::ShrSOp>(loc, valueBits, adj, false);
     Value shiftedUnknown =
@@ -4448,6 +4535,20 @@ struct ConditionalOpConversion : public OpConversionPattern<ConditionalOp> {
     // evaluated and merged with the appropriate lookup table. See documentation
     // for `ConditionalOp`.
     auto type = typeConverter->convertType(op.getType());
+    auto loc = op.getLoc();
+
+    Value condition = adaptor.getCondition();
+    if (isFourValuedIntType(condition.getType()))
+      condition = getFourValuedValue(rewriter, loc, condition);
+    if (auto intTy = dyn_cast<IntegerType>(condition.getType())) {
+      if (intTy.getWidth() != 1) {
+        Value zero = hw::ConstantOp::create(rewriter, loc, intTy, 0);
+        condition = rewriter.createOrFold<comb::ICmpOp>(
+            loc, comb::ICmpPredicate::ne, condition, zero);
+      }
+    } else {
+      return failure();
+    }
 
     auto hasNoWriteEffect = [](Region &region) {
       auto result = region.walk([](Operation *operation) {
@@ -4480,13 +4581,12 @@ struct ConditionalOpConversion : public OpConversionPattern<ConditionalOp> {
       rewriter.eraseOp(trueTerm);
       rewriter.eraseOp(falseTerm);
 
-      rewriter.replaceOpWithNewOp<comb::MuxOp>(op, adaptor.getCondition(),
+      rewriter.replaceOpWithNewOp<comb::MuxOp>(op, condition,
                                                convTrueVal, convFalseVal);
       return success();
     }
 
-    auto ifOp =
-        scf::IfOp::create(rewriter, op.getLoc(), type, adaptor.getCondition());
+    auto ifOp = scf::IfOp::create(rewriter, loc, type, condition);
     rewriter.inlineRegionBefore(op.getTrueRegion(), ifOp.getThenRegion(),
                                 ifOp.getThenRegion().end());
     rewriter.inlineRegionBefore(op.getFalseRegion(), ifOp.getElseRegion(),

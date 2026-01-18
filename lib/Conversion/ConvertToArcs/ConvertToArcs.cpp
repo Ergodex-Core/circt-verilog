@@ -247,6 +247,108 @@ static std::optional<APInt> tryEvalRuntimeSignalInit(Value init, Type elemTy) {
   return std::nullopt;
 }
 
+static std::optional<APInt> tryDefaultRuntimeSignalInit(Type elemTy) {
+  elemTy = stripInOutAndAliasTypes(elemTy);
+
+  if (auto intTy = dyn_cast<IntegerType>(elemTy))
+    return APInt(static_cast<unsigned>(intTy.getWidth()), 0);
+
+  unsigned fieldWidth = 0;
+  if (isFourStateValueUnknownStruct(elemTy, fieldWidth)) {
+    unsigned totalWidth = 2 * fieldWidth;
+    return APInt::getAllOnes(totalWidth);
+  }
+
+  if (auto arrayTy = dyn_cast<hw::ArrayType>(elemTy)) {
+    Type elem = arrayTy.getElementType();
+    int64_t elemWidthSigned = hw::getBitWidth(elem);
+    if (elemWidthSigned <= 0)
+      return std::nullopt;
+    unsigned elemWidth = static_cast<unsigned>(elemWidthSigned);
+    uint64_t numElems = arrayTy.getNumElements();
+    uint64_t totalWidthU = numElems * static_cast<uint64_t>(elemWidth);
+    if (totalWidthU == 0 || totalWidthU > 64)
+      return std::nullopt;
+    unsigned totalWidth = static_cast<unsigned>(totalWidthU);
+    APInt packed(totalWidth, 0);
+    for (uint64_t idx = 0; idx < numElems; ++idx) {
+      auto bits = tryDefaultRuntimeSignalInit(elem);
+      if (!bits)
+        return std::nullopt;
+      APInt slice = bits->zextOrTrunc(elemWidth);
+      // HW array packing is MSB-first (element 0 at the top).
+      uint64_t offsetLSB = totalWidthU - (idx + 1) * static_cast<uint64_t>(elemWidth);
+      packed |= slice.zext(totalWidth).shl(offsetLSB);
+    }
+    return packed;
+  }
+
+  if (auto arrayTy = dyn_cast<hw::UnpackedArrayType>(elemTy)) {
+    Type elem = arrayTy.getElementType();
+    int64_t elemWidthSigned = hw::getBitWidth(elem);
+    if (elemWidthSigned <= 0)
+      return std::nullopt;
+    unsigned elemWidth = static_cast<unsigned>(elemWidthSigned);
+    uint64_t numElems = arrayTy.getNumElements();
+    uint64_t totalWidthU = numElems * static_cast<uint64_t>(elemWidth);
+    if (totalWidthU == 0 || totalWidthU > 64)
+      return std::nullopt;
+    unsigned totalWidth = static_cast<unsigned>(totalWidthU);
+    APInt packed(totalWidth, 0);
+    for (uint64_t idx = 0; idx < numElems; ++idx) {
+      auto bits = tryDefaultRuntimeSignalInit(elem);
+      if (!bits)
+        return std::nullopt;
+      APInt slice = bits->zextOrTrunc(elemWidth);
+      uint64_t offsetLSB = totalWidthU - (idx + 1) * static_cast<uint64_t>(elemWidth);
+      packed |= slice.zext(totalWidth).shl(offsetLSB);
+    }
+    return packed;
+  }
+
+  if (auto structTy = dyn_cast<hw::StructType>(elemTy)) {
+    const unsigned structWidth =
+        static_cast<unsigned>(hw::getBitWidth(structTy));
+    if (structWidth == 0 || structWidth > 64)
+      return std::nullopt;
+
+    APInt packed(structWidth, 0);
+    auto elements = structTy.getElements();
+    for (unsigned idx = 0, e = elements.size(); idx < e; ++idx) {
+      Type fieldTy = elements[idx].type;
+      int64_t fieldWidthSigned = hw::getBitWidth(fieldTy);
+      if (fieldWidthSigned <= 0)
+        return std::nullopt;
+      unsigned fieldWidth = static_cast<unsigned>(fieldWidthSigned);
+      if (fieldWidth > 64)
+        return std::nullopt;
+
+      uint64_t fieldOffsetLSB = 0;
+      uint64_t prefixWidth = 0;
+      for (unsigned i = 0; i < idx; ++i) {
+        int64_t w = hw::getBitWidth(elements[i].type);
+        if (w <= 0)
+          return std::nullopt;
+        prefixWidth += static_cast<uint64_t>(w);
+      }
+      uint64_t structWidthU = static_cast<uint64_t>(structWidth);
+      uint64_t fieldWidthU = static_cast<uint64_t>(fieldWidth);
+      if (prefixWidth + fieldWidthU > structWidthU)
+        return std::nullopt;
+      fieldOffsetLSB = structWidthU - prefixWidth - fieldWidthU;
+
+      auto fieldBits = tryDefaultRuntimeSignalInit(fieldTy);
+      if (!fieldBits)
+        return std::nullopt;
+      APInt slice = fieldBits->zextOrTrunc(fieldWidth);
+      packed |= slice.zext(structWidth).shl(fieldOffsetLSB);
+    }
+    return packed;
+  }
+
+  return std::nullopt;
+}
+
 static Attribute getZeroHWAttr(OpBuilder &builder, Type type) {
   if (auto intTy = dyn_cast<IntegerType>(type))
     return builder.getIntegerAttr(intTy, 0);
@@ -340,15 +442,17 @@ static bool needsCycleScheduler(llhd::ProcessOp op) {
   // Also schedule one-shot processes that end in `llhd.halt` so we can model the
   // "run once then stop" semantics via the runtime PC state.
   bool hasHalt = !op.getOps<llhd::HaltOp>().empty();
+  bool hasWait = false;
   bool hasDelay = false;
   bool hasObserved = false;
   op.walk([&](llhd::WaitOp wait) {
+    hasWait = true;
     if (wait.getDelay())
       hasDelay = true;
     if (!wait.getObserved().empty())
       hasObserved = true;
   });
-  return hasHalt || hasDelay || hasObserved;
+  return hasHalt || hasWait || hasDelay || hasObserved;
 }
 
 static bool isRematerializableCallForPolling(mlir::func::CallOp call) {
@@ -366,6 +470,7 @@ static bool isRematerializableCallForPolling(mlir::func::CallOp call) {
          callee == "circt_sv_dynarray_size_i32" ||
          callee == "circt_sv_dynarray_get_i32" ||
          callee == "circt_sv_queue_size_i32" ||
+         callee == "circt_sv_mailbox_num_i32" ||
          callee == "circt_sv_assoc_exists_str_i32" ||
          callee == "circt_sv_assoc_get_str_i32" ||
          callee == "__arcilator_sig_load_u64" ||
@@ -522,14 +627,23 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
     if (isa<hw::InOutType>(ty))
       return false;
     int64_t bw = hw::getBitWidth(ty);
-    return bw > 0 && bw <= 64;
+    if (bw < 0 || bw > 64)
+      return false;
+    // Zero-width values (e.g. array indices for 1-element arrays) still need to
+    // be treated as spillable when we add new scheduler dispatch predecessors.
+    // They can be represented as a constant 0 in the frame.
+    if (bw == 0)
+      return isa<IntegerType>(ty);
+    return true;
   };
   auto packToI64 = [&](Value value) -> FailureOr<Value> {
     Type ty = value.getType();
     int64_t bw = hw::getBitWidth(ty);
-    if (bw <= 0 || bw > 64)
+    if (bw < 0 || bw > 64)
       return failure();
     Location loc = value.getLoc();
+    if (bw == 0)
+      return buildI64Constant(rewriter, loc, 0);
     Value bits = value;
     auto intTy = rewriter.getIntegerType(static_cast<unsigned>(bw));
     if (!isa<IntegerType>(ty))
@@ -541,8 +655,14 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   auto unpackFromI64 = [&](Value packed, Type ty,
                            Location loc) -> FailureOr<Value> {
     int64_t bw = hw::getBitWidth(ty);
-    if (bw <= 0 || bw > 64)
+    if (bw < 0 || bw > 64)
       return failure();
+    if (bw == 0) {
+      Value zero = createZeroHWConstant(rewriter, loc, ty);
+      if (!zero)
+        return failure();
+      return zero;
+    }
     Value bits = packed;
     if (bw < 64)
       bits = comb::ExtractOp::create(rewriter, loc, packed, 0,
@@ -788,7 +908,11 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         isHandleLike = llvm::any_of(op.getResultTypes(), [](Type ty) {
           if (auto alias = dyn_cast<hw::TypeAliasType>(ty))
             ty = alias.getInnerType();
-          return isa<hw::InOutType, hw::StringType>(ty);
+          // Treat opaque runtime "handle" types as hoistable. In particular,
+          // sim formatting ops (`sim.fmt.*`) produce `!sim.fstring` values that
+          // may be shared across scheduler states (e.g. error messages). These
+          // are side-effect free and must dominate all possible state entries.
+          return isa<hw::InOutType, hw::StringType, sim::FormatStringType>(ty);
         });
       }
       if (!isHandleLike)
@@ -804,7 +928,29 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         if (usedOutsideBlock)
           break;
       }
-      if (usedOutsideBlock)
+      if (!usedOutsideBlock)
+        continue;
+
+      // Only hoist operations whose operands are themselves rematerializable
+      // (or already dominate the dispatch block). Otherwise moving the op can
+      // introduce new dominance violations.
+      bool operandsOk = true;
+      for (Value operand : op.getOperands()) {
+        if (isa<BlockArgument>(operand))
+          continue;
+        Operation *defOp = operand.getDefiningOp();
+        if (!defOp) {
+          operandsOk = false;
+          break;
+        }
+        if (defOp->getBlock() == dispatchBlock || defOp->getBlock() == exitBlock)
+          continue;
+        if (!isRematerializableForPolling(defOp)) {
+          operandsOk = false;
+          break;
+        }
+      }
+      if (operandsOk)
         hoistable.push_back(&op);
     }
   }
@@ -1174,6 +1320,9 @@ static bool isEpsilonTime(Value time) {
 static std::optional<uint64_t> getConstantLowBit(Value value) {
   if (auto cst = value.getDefiningOp<hw::ConstantOp>())
     return cst.getValue().getZExtValue();
+  if (auto intTy = dyn_cast<IntegerType>(value.getType()))
+    if (intTy.getWidth() == 0)
+      return 0;
   return std::nullopt;
 }
 
@@ -1610,6 +1759,72 @@ static LogicalResult sinkProcessResultDrives(llhd::ProcessOp proc) {
   newProc.getBody().takeBody(proc.getBody());
   proc.erase();
 
+  return success();
+}
+
+/// Move simple module-level LLHD drives into a single-shot process.
+///
+/// Moore-to-LLHD lowering can represent time-0 initialization effects (e.g.
+/// variable declaration initializers) as module-level `llhd.drv` ops. Our
+/// best-effort `llhd.drv` lowering treats module-level drives as combinational
+/// updates and re-applies them every evaluation, which clobbers procedural
+/// state and diverges from event-driven simulators (Questa).
+///
+/// Hoist constant, time-0 drives into an `llhd.process` that runs once and
+/// halts. The cycle scheduler can then model their "run once" semantics via
+/// per-process PC state.
+static LogicalResult lowerModuleLevelInitDrives(hw::HWModuleOp module) {
+  SmallVector<llhd::DrvOp> initDrives;
+  module.walk([&](llhd::DrvOp drv) {
+    if (drv->getParentOp() != module.getOperation())
+      return;
+
+    auto timeOp = drv.getTime().getDefiningOp<llhd::ConstantTimeOp>();
+    if (!timeOp)
+      return;
+    auto delay = timeOp.getValueAttr();
+    // Moore-to-LLHD sometimes schedules initialization effects into epsilon
+    // slots at time 0. Treat any <0, 0d, *> drive of a constant as a
+    // single-shot initializer.
+    if (delay.getTime() != 0 || delay.getDelta() != 0)
+      return;
+
+    if (Value enable = drv.getEnable()) {
+      auto enableConst = getConstantBoolValue(enable);
+      if (!enableConst || !*enableConst)
+        return;
+    }
+
+    // Restrict to drives of constant-like values. This matches the common
+    // shape for declaration initializers and avoids changing the semantics of
+    // continuous assignments.
+    if (!isCloneableConstant(drv.getValue()))
+      return;
+
+    initDrives.push_back(drv);
+  });
+
+  if (initDrives.empty())
+    return success();
+
+  // Insert the one-shot process into the HW module body (not next to the
+  // module op itself). Otherwise later Arc/LLVM lowering may treat it as a
+  // top-level process and produce illegal IR.
+  OpBuilder builder(module.getBodyBlock()->getTerminator());
+  auto loc = module.getLoc();
+  auto proc = llhd::ProcessOp::create(builder, loc, TypeRange{}, ValueRange{},
+                                      ArrayRef<NamedAttribute>{});
+  // Ensure the cycle-scheduler lowering treats this as a "run once" scheduled
+  // process (PC state) rather than lowering it as pure combinational logic.
+  proc->setAttr(kArcilatorNeedsSchedulerAttr, builder.getUnitAttr());
+  Block &entry = proc.getBody().emplaceBlock();
+
+  // Preserve source order for deterministic initialization behavior.
+  for (llhd::DrvOp drv : initDrives)
+    drv->moveBefore(&entry, entry.end());
+
+  OpBuilder bodyBuilder(&entry, entry.end());
+  (void)llhd::HaltOp::create(bodyBuilder, loc, ValueRange{});
   return success();
 }
 
@@ -3231,12 +3446,17 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
             auto initBits =
                 tryEvalRuntimeSignalInit(adaptor.getInit(), convertedTy);
             if (!initBits) {
-              // Default-initialize 2-state integer signals to 0. This matches SV
-              // semantics and avoids spurious all-ones initialization when the
-              // initializer is not representable as a constant at this point in
-              // the pipeline.
-              if (isa<IntegerType>(stripInOutAndAliasTypes(convertedTy)))
-                initBits = APInt(static_cast<unsigned>(totalWidth), 0);
+              // Default-initialize runtime-managed signals to match SV
+              // semantics:
+              // - 2-state integers default to 0,
+              // - 4-state values default to X (unknown mask set).
+              //
+              // This is particularly important for composite runtime signals
+              // (e.g. interface packs) that contain 2-state fields such as
+              // `bit` clocks; the driver runtime initializes to all-ones by
+              // default, which would otherwise start those fields at 1 and
+              // trigger spurious time-0 events.
+              initBits = tryDefaultRuntimeSignalInit(convertedTy);
             }
             if (initBits) {
               APInt bits =
@@ -3414,6 +3634,20 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
       return success();
     }
 
+    // For runtime-managed signals we need to preserve LLHD delta-time semantics
+    // for SystemVerilog nonblocking assignments. Moore-to-LLHD lowering encodes
+    // NBAs as `llhd.drv` with `delta=1, epsilon=0` (and `time=0`).
+    //
+    // We still ignore the absolute time component here (it is generally modeled
+    // via explicit waits), but we must distinguish delta drives so we can apply
+    // them at the end of the current delta cycle rather than immediately.
+    bool isNbaDrive = false;
+    if (auto timeOp = op.getTime().getDefiningOp<llhd::ConstantTimeOp>()) {
+      auto t = timeOp.getValueAttr();
+      if (t.getTime() == 0 && t.getDelta() > 0 && t.getEpsilon() == 0)
+        isNbaDrive = true;
+    }
+
     Type rawValueTy = adaptor.getValue().getType();
     int64_t valueWidth = hw::getBitWidth(rawValueTy);
     if (valueWidth <= 0 || valueWidth > 64)
@@ -3443,10 +3677,29 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
         rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
                                  {rewriter.getI64Type()}));
     (void)getOrInsertFunc(
+        module, "__arcilator_sig_load_nba_u64",
+        rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                                 {rewriter.getI64Type()}));
+    (void)getOrInsertFunc(
         module, "__arcilator_sig_store_u64",
         rewriter.getFunctionType(
             {rewriter.getI32Type(), rewriter.getI64Type(), rewriter.getI32Type()},
             {}));
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_store_nba_u64",
+        rewriter.getFunctionType(
+            {rewriter.getI32Type(), rewriter.getI64Type(), rewriter.getI32Type()},
+            {}));
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_store_nba_masked_u64",
+        rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI64Type(),
+                                  rewriter.getI64Type(), rewriter.getI32Type()},
+                                 {}));
+
+    const StringRef loadCallee =
+        isNbaDrive ? "__arcilator_sig_load_nba_u64" : "__arcilator_sig_load_u64";
+    const StringRef storeCallee =
+        isNbaDrive ? "__arcilator_sig_store_nba_u64" : "__arcilator_sig_store_u64";
 
     uint32_t procId = 0xFFFFFFFFu;
     if (auto exec = op->getParentOfType<arc::ExecuteOp>()) {
@@ -3532,9 +3785,30 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
       Value clearMask =
           rewriter.createOrFold<comb::XorOp>(loc, totalMaskCst, sliceMask, true);
 
+      if (isNbaDrive) {
+        Value shiftedVal =
+            rewriter.createOrFold<comb::ShlOp>(loc, value64, offsetVal);
+        Value inserted =
+            rewriter.createOrFold<comb::AndOp>(loc, shiftedVal, sliceMask);
+        Value mask = sliceMask;
+        if (!constEnable || !*constEnable) {
+          Value zero = buildI64Constant(rewriter, loc, 0);
+          mask = rewriter.createOrFold<comb::MuxOp>(loc, enable, mask, zero);
+        }
+        rewriter.create<mlir::func::CallOp>(
+            loc, "__arcilator_sig_store_nba_masked_u64", TypeRange{},
+            ValueRange{sigIdVal, mask, inserted, procIdVal});
+        rewriter.eraseOp(op);
+        if (resolved.dynamicOffsetOp &&
+            llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                         [](Value v) { return v.use_empty(); }))
+          rewriter.eraseOp(resolved.dynamicOffsetOp);
+        return success();
+      }
+
       Value cur =
           rewriter
-              .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+              .create<mlir::func::CallOp>(loc, loadCallee,
                                           rewriter.getI64Type(),
                                           ValueRange{sigIdVal, procIdVal})
               .getResult(0);
@@ -3579,11 +3853,27 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
     Value storeVal;
     if (isFullWrite) {
       Value newVal = rewriter.createOrFold<comb::AndOp>(loc, value64, totalMaskCst);
+      if (isNbaDrive) {
+        Value mask = totalMaskCst;
+        if (!constEnable || !*constEnable) {
+          Value zero = buildI64Constant(rewriter, loc, 0);
+          mask = rewriter.createOrFold<comb::MuxOp>(loc, enable, mask, zero);
+        }
+        rewriter.create<mlir::func::CallOp>(
+            loc, "__arcilator_sig_store_nba_masked_u64", TypeRange{},
+            ValueRange{sigIdVal, mask, newVal, procIdVal});
+        rewriter.eraseOp(op);
+        if (resolved.dynamicOffsetOp &&
+            llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                         [](Value v) { return v.use_empty(); }))
+          rewriter.eraseOp(resolved.dynamicOffsetOp);
+        return success();
+      }
       storeVal = newVal;
       if (!constEnable || !*constEnable) {
         Value cur =
             rewriter
-                .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+                .create<mlir::func::CallOp>(loc, loadCallee,
                                             rewriter.getI64Type(),
                                             ValueRange{sigIdVal, procIdVal})
                 .getResult(0);
@@ -3594,7 +3884,7 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
     } else {
       Value cur =
           rewriter
-              .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+              .create<mlir::func::CallOp>(loc, loadCallee,
                                           rewriter.getI64Type(),
                                           ValueRange{sigIdVal, procIdVal})
               .getResult(0);
@@ -3604,6 +3894,24 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
       Value sliceMaskCst = hw::ConstantOp::create(
           rewriter, loc,
           rewriter.getIntegerAttr(rewriter.getI64Type(), sliceMask));
+      if (isNbaDrive) {
+        Value mask = sliceMaskCst;
+        if (!constEnable || !*constEnable) {
+          Value zero = buildI64Constant(rewriter, loc, 0);
+          mask = rewriter.createOrFold<comb::MuxOp>(loc, enable, mask, zero);
+        }
+        Value inserted =
+            rewriter.createOrFold<comb::AndOp>(loc, value64, sliceMaskCst);
+        rewriter.create<mlir::func::CallOp>(
+            loc, "__arcilator_sig_store_nba_masked_u64", TypeRange{},
+            ValueRange{sigIdVal, mask, inserted, procIdVal});
+        rewriter.eraseOp(op);
+        if (resolved.dynamicOffsetOp &&
+            llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                         [](Value v) { return v.use_empty(); }))
+          rewriter.eraseOp(resolved.dynamicOffsetOp);
+        return success();
+      }
       APInt clearMask = APInt::getAllOnes(64) ^ sliceMask;
       Value clearMaskCst = hw::ConstantOp::create(
           rewriter, loc,
@@ -3621,7 +3929,7 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
       storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, totalMaskCst);
     }
 
-    rewriter.create<mlir::func::CallOp>(loc, "__arcilator_sig_store_u64",
+    rewriter.create<mlir::func::CallOp>(loc, storeCallee,
                                         TypeRange{},
                                         ValueRange{sigIdVal, storeVal, procIdVal});
     rewriter.eraseOp(op);
@@ -4266,6 +4574,7 @@ void ConvertToArcsPass::runOnOperation() {
   // simplify away LLHD signal storage for common "single-shot" processes such
   // as `initial` blocks without waits or delays.
   getOperation().walk([&](hw::HWModuleOp module) {
+    (void)lowerModuleLevelInitDrives(module);
     for (auto fin :
          llvm::make_early_inc_range(module.getOps<llhd::FinalOp>()))
       (void)lowerSimpleFinalSignals(fin);
@@ -4274,7 +4583,14 @@ void ConvertToArcsPass::runOnOperation() {
       (void)lowerSimpleProcessSignals(proc);
       if (succeeded(sinkProcessResultDrives(proc)))
         continue;
-      (void)convertOneShotProcessToInitial(proc);
+      // Keep one-shot `llhd.process` ops (no waits/delays) in the scheduled
+      // process pipeline. The cycle scheduler models their "run once then stop"
+      // semantics via the runtime PC state. Converting them to `seq.initial`
+      // causes the body to execute on every evaluation, clobbering procedural
+      // state (e.g. counters in `always @(posedge ...)` blocks) and leading to
+      // waveform mismatches vs Questa.
+      if (!needsCycleScheduler(proc))
+        (void)convertOneShotProcessToInitial(proc);
     }
   });
 
@@ -4714,8 +5030,9 @@ void ConvertToArcsPass::runOnOperation() {
     if (auto arrTy = dyn_cast<hw::ArrayType>(ty)) {
       SmallVector<Value> parts;
       parts.reserve(arrTy.getNumElements());
+      unsigned idxWidth = llvm::Log2_64_Ceil(arrTy.getNumElements());
       for (uint64_t idx = 0, e = arrTy.getNumElements(); idx < e; ++idx) {
-        Value i = hw::ConstantOp::create(b, loc, b.getI64Type(), idx);
+        Value i = hw::ConstantOp::create(b, loc, b.getIntegerType(idxWidth), idx);
         Value elem = hw::ArrayGetOp::create(b, loc, v, i);
         Value packedElem = packStable(b, loc, elem, arrTy.getElementType());
         if (!packedElem)
