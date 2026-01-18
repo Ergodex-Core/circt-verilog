@@ -79,6 +79,14 @@ bool Lowering::matchControlFlow() {
   // Ensure that there is only a single wait op in the process and that it has
   // no destination operands.
   for (auto &block : processOp.getBody()) {
+    // Processes that can terminate (`llhd.halt`) are not combinational and must
+    // not be lowered to `llhd.combinational`. Otherwise the terminator would
+    // become illegal in the new region and violate LLHD invariants.
+    if (isa<HaltOp>(block.getTerminator())) {
+      LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
+                              << ": contains halt terminator\n");
+      return false;
+    }
     if (auto op = dyn_cast<WaitOp>(block.getTerminator())) {
       if (waitOp) {
         LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
@@ -91,6 +99,12 @@ bool Lowering::matchControlFlow() {
   if (!waitOp) {
     LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
                             << ": no wait op\n");
+    return false;
+  }
+  // A process that waits for time (even zero-delay) is not combinational.
+  if (waitOp.getDelay()) {
+    LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
+                            << ": wait op has delay\n");
     return false;
   }
   if (!waitOp.getDestOperands().empty()) {

@@ -2493,10 +2493,10 @@ struct RvalueExprVisitor : public ExprVisitor {
   }
 
   /// Handle class object construction.
-  Value visit(const slang::ast::NewClassExpression &expr) {
-    auto type = context.convertType(*expr.type);
-    if (!type)
-      return {};
+	  Value visit(const slang::ast::NewClassExpression &expr) {
+	    auto type = context.convertType(*expr.type);
+	    if (!type)
+	      return {};
 
     auto makeVoidValue = [&]() -> Value {
       return mlir::UnrealizedConversionCastOp::create(
@@ -2634,6 +2634,76 @@ struct RvalueExprVisitor : public ExprVisitor {
 	                    loc, fn, ValueRange{selfI32, parentI32});
 	              }
 
+	              // Minimal UVM port/export bring-up:
+	              // - `uvm_driver::new` initializes `seq_item_port` (and alias).
+	              // - `uvm_sequencer::new` initializes `seq_item_export`.
+	              // This enables deterministic sequencer/driver interactions
+	              // without lowering full TLM semantics.
+	              {
+	                auto i32Ty = moore::IntType::get(context.getContext(),
+	                                                 /*width=*/32,
+	                                                 moore::Domain::TwoValued);
+	                Value selfI32 = context.materializeConversion(
+	                    i32Ty, self, /*isSigned=*/false, loc);
+	                if (!selfI32)
+	                  return {};
+
+	                auto allocTy =
+	                    FunctionType::get(context.getContext(), {}, {i32Ty});
+	                auto allocFn =
+	                    getOrCreateExternFunc("circt_sv_class_new", allocTy);
+	                if (!allocFn)
+	                  return {};
+
+	                auto setTy = FunctionType::get(context.getContext(),
+	                                               {i32Ty, i32Ty, i32Ty}, {});
+	                auto setFn =
+	                    getOrCreateExternFunc("circt_sv_class_set_i32", setTy);
+	                if (!setFn)
+	                  return {};
+
+	                auto findProp = [&](llvm::StringRef propName)
+	                    -> const slang::ast::ClassPropertySymbol * {
+	                  for (auto &prop :
+	                       parentScope
+	                           ->membersOfType<slang::ast::ClassPropertySymbol>()) {
+	                    if (llvm::StringRef(prop.name.data(), prop.name.size()) ==
+	                        propName)
+	                      return &prop;
+	                  }
+	                  return nullptr;
+	                };
+
+	                auto setFieldHandle =
+	                    [&](llvm::StringRef propName, Value fieldHandle) {
+	                      const auto *prop = findProp(propName);
+	                      if (!prop)
+	                        return;
+	                      int32_t fieldId =
+	                          context.getOrAssignClassFieldId(*prop);
+	                      Value fieldIdVal = moore::ConstantOp::create(
+	                          builder, loc, i32Ty, fieldId, /*isSigned=*/true);
+	                      builder.create<mlir::func::CallOp>(
+	                          loc, setFn,
+	                          ValueRange{selfI32, fieldIdVal, fieldHandle});
+	                    };
+
+	                if (parentSym.name == "uvm_driver") {
+	                  Value portHandle =
+	                      mlir::func::CallOp::create(builder, loc, allocFn, ValueRange{})
+	                          .getResult(0);
+	                  setFieldHandle("seq_item_port", portHandle);
+	                  setFieldHandle("seq_item_prod_if", portHandle);
+	                }
+
+	                if (parentSym.name == "uvm_sequencer") {
+	                  Value exportHandle =
+	                      mlir::func::CallOp::create(builder, loc, allocFn, ValueRange{})
+	                          .getResult(0);
+	                  setFieldHandle("seq_item_export", exportHandle);
+	                }
+	              }
+
 	              return makeVoidValue();
             }
           }
@@ -2679,16 +2749,16 @@ struct RvalueExprVisitor : public ExprVisitor {
       return makeVoidValue();
     }
 
-	    if (auto intType = dyn_cast<moore::IntType>(type)) {
-	      auto *cls = expr.type
-	                      ? expr.type->getCanonicalType()
-	                            .as_if<slang::ast::ClassType>()
-	                      : nullptr;
-	      if (!cls) {
-	        mlir::emitError(loc, "unsupported new-expression type: ")
-	            << expr.type->toString();
-	        return {};
-	      }
+		    if (auto intType = dyn_cast<moore::IntType>(type)) {
+		      auto *cls = expr.type
+		                      ? expr.type->getCanonicalType()
+		                            .as_if<slang::ast::ClassType>()
+		                      : nullptr;
+		      if (!cls) {
+		        mlir::emitError(loc, "unsupported new-expression type: ")
+		            << expr.type->toString();
+		        return {};
+		      }
 
       auto getOrCreateExternFunc = [&](StringRef name, FunctionType fnType) {
         if (auto existing =
@@ -2703,6 +2773,52 @@ struct RvalueExprVisitor : public ExprVisitor {
         return fn;
       };
 
+      // Built-in mailbox support.
+      //
+      // SystemVerilog mailboxes are class-like objects with task/function
+      // methods (`put`, `get`, `peek`, `try_*`, `num`, ...). Model them as
+      // runtime-backed FIFO containers rather than generic class instances.
+      if (cls->name == "mailbox") {
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        Value sizeVal = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                  /*value=*/0,
+                                                  /*isSigned=*/true);
+        if (const auto *ctor = expr.constructorCall()) {
+          const auto *call = ctor->as_if<slang::ast::CallExpression>();
+          if (!call) {
+            mlir::emitError(loc, "unsupported mailbox constructor expression kind");
+            return {};
+          }
+          auto args = call->arguments();
+          if (args.size() > 1) {
+            mlir::emitError(loc, "unsupported mailbox constructor arity: expected 0 or 1 argument(s)");
+            return {};
+          }
+          if (args.size() == 1) {
+            sizeVal = context.convertRvalueExpression(*args[0]);
+            if (!sizeVal)
+              return {};
+            sizeVal = context.materializeConversion(i32Ty, sizeVal,
+                                                    /*isSigned=*/true, loc);
+            if (!sizeVal)
+              return {};
+          }
+        }
+
+        auto allocType = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto allocFn = getOrCreateExternFunc("circt_sv_mailbox_alloc_i32", allocType);
+        if (!allocFn)
+          return {};
+        Value handle =
+            mlir::func::CallOp::create(builder, loc, allocFn, {sizeVal}).getResult(0);
+        handle = context.materializeConversion(intType, handle,
+                                               /*isSigned=*/false, loc);
+        if (!handle)
+          return {};
+        return handle;
+      }
+
       // Allocate a fresh non-zero handle for the class instance and tag it
       // with its dynamic type ID.
       int32_t classId = context.getOrAssignClassId(*cls);
@@ -2715,16 +2831,52 @@ struct RvalueExprVisitor : public ExprVisitor {
       auto allocFn = getOrCreateExternFunc("circt_sv_class_alloc", allocType);
       auto allocCall =
           mlir::func::CallOp::create(builder, loc, allocFn, {classIdVal});
-      Value handle = allocCall.getResult(0);
-      handle =
-          context.materializeConversion(intType, handle, /*isSigned=*/false, loc);
-      if (!handle)
-        return {};
+	      Value handle = allocCall.getResult(0);
+	      handle =
+	          context.materializeConversion(intType, handle, /*isSigned=*/false, loc);
+	      if (!handle)
+	        return {};
 
-      // Invoke the constructor (if any) when class stubs are disabled.
-      if (const auto *ctor = expr.constructorCall()) {
-        if (context.options.allowClassStubs) {
-          if (!context.convertRvalueExpression(*ctor))
+	      // UVM bring-up: `uvm_analysis_imp` constructors rely on `super.new(...)`
+	      // to persist the `imp` implementation handle. Since we treat UVM base
+	      // constructors as no-ops, capture the implementation argument here and
+	      // register it with the runtime-backed analysis-port shims so analysis
+	      // traffic reaches the subscriber.
+	      if (cls->name == "uvm_analysis_imp") {
+	        if (const auto *ctor = expr.constructorCall()) {
+	          if (const auto *call = ctor->as_if<slang::ast::CallExpression>()) {
+	            auto args = call->arguments();
+	            if (args.size() >= 2) {
+	              const auto *implExpr = args[1];
+	              if (const auto *assign =
+	                      implExpr->as_if<slang::ast::AssignmentExpression>())
+	                implExpr = &assign->left();
+	              Value implVal = context.convertRvalueExpression(*implExpr);
+	              if (!implVal)
+	                return {};
+	              Value selfI32 = context.materializeConversion(
+	                  i32Ty, handle, /*isSigned=*/false, loc);
+	              implVal = context.materializeConversion(
+	                  i32Ty, implVal, /*isSigned=*/false, loc);
+	              if (!selfI32 || !implVal)
+	                return {};
+	              auto fnType =
+	                  FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+	              auto fn =
+	                  getOrCreateExternFunc("circt_uvm_analysis_imp_set_impl", fnType);
+	              if (!fn)
+	                return {};
+	              builder.create<mlir::func::CallOp>(loc, fn,
+	                                                 ValueRange{selfI32, implVal});
+	            }
+	          }
+	        }
+	      }
+
+	      // Invoke the constructor (if any) when class stubs are disabled.
+	      if (const auto *ctor = expr.constructorCall()) {
+	        if (context.options.allowClassStubs) {
+	          if (!context.convertRvalueExpression(*ctor))
             return {};
         } else {
           const auto *call = ctor->as_if<slang::ast::CallExpression>();
@@ -2964,6 +3116,349 @@ struct RvalueExprVisitor : public ExprVisitor {
         return call.getResult(0);
       }
 
+      moore::SVModuleOp callerSvModule;
+      if (auto *insBlock = builder.getInsertionBlock())
+        if (auto *parentOp = insBlock->getParentOp())
+          callerSvModule = parentOp->getParentOfType<moore::SVModuleOp>();
+
+      // Minimal UVM scheduler shim:
+      // - run build_phase + connect_phase for all registered components,
+      // - start run_phase in parallel processes.
+	      auto ensureRunAllPhases = [&]() -> mlir::func::FuncOp {
+	        StringRef shimName = "circt_uvm_run_all_phases";
+	        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+	                                         moore::Domain::TwoValued);
+
+	        auto buildPhaseDispatch = [&](StringRef methodName, StringRef fnName)
+	            -> mlir::func::FuncOp {
+	          if (auto existing =
+	                  context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
+	            return existing;
+
+	          SmallVector<std::pair<const slang::ast::ClassType *, int32_t>>
+	              classIdSnapshot;
+	          classIdSnapshot.reserve(context.classIds.size());
+	          for (auto &entry : context.classIds)
+	            classIdSnapshot.push_back({entry.first, entry.second});
+
+	          SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+	          for (auto [cls, classId] : classIdSnapshot) {
+	            if (!cls)
+	              continue;
+	            llvm::StringRef clsName(cls->name.data(), cls->name.size());
+	            if (clsName.starts_with("uvm_"))
+	              continue;
+            const slang::ast::SubroutineSymbol *impl = nullptr;
+            for (auto &method : cls->membersOfType<slang::ast::SubroutineSymbol>()) {
+              if (llvm::StringRef(method.name.data(), method.name.size()) ==
+                  methodName) {
+                impl = &method;
+                break;
+              }
+            }
+            if (!impl)
+              continue;
+            if (failed(context.convertFunction(*impl)))
+              continue;
+            auto *implLowering = context.declareFunction(*impl);
+            if (!implLowering || !implLowering->op)
+              continue;
+            impls.push_back({classId, implLowering->op});
+          }
+
+          auto fnTy = FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+
+          OpBuilder::InsertionGuard g(context.builder);
+          context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+          context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+          auto dispatchFn =
+              mlir::func::FuncOp::create(context.builder, loc, fnName, fnTy);
+          dispatchFn.setPrivate();
+          context.symbolTable.insert(dispatchFn);
+
+          auto &entry = dispatchFn.getBody().emplaceBlock();
+          for (auto ty : fnTy.getInputs())
+            entry.addArgument(ty, loc);
+
+          OpBuilder b(context.getContext());
+          b.setInsertionPointToStart(&entry);
+          if (impls.empty()) {
+            mlir::func::ReturnOp::create(b, loc);
+            return dispatchFn;
+          }
+
+          Value thisArg = entry.getArgument(0);
+          auto getTypeFnTy = FunctionType::get(context.getContext(),
+                                               {thisArg.getType()},
+                                               {thisArg.getType()});
+          auto getTypeFn =
+              getOrCreateExternFunc("circt_sv_class_get_type", getTypeFnTy);
+          if (!getTypeFn)
+            return mlir::func::FuncOp();
+          Value dynType =
+              mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg}).getResult(0);
+
+          Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
+          SmallVector<Block *> checkBlocks;
+          SmallVector<Block *> caseBlocks;
+          checkBlocks.reserve(impls.size());
+          caseBlocks.reserve(impls.size());
+          for (size_t i = 0, e = impls.size(); i < e; ++i) {
+            checkBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+            caseBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+          }
+
+          b.setInsertionPointToEnd(&entry);
+          mlir::cf::BranchOp::create(b, loc,
+                                     checkBlocks.empty() ? defaultBlock
+                                                         : checkBlocks.front());
+
+          b.setInsertionPointToStart(defaultBlock);
+          mlir::func::ReturnOp::create(b, loc);
+
+          auto cmpTy = moore::IntType::get(
+              context.getContext(), /*width=*/32,
+              cast<moore::IntType>(thisArg.getType()).getDomain());
+          for (size_t i = 0, e = impls.size(); i < e; ++i) {
+            auto [classId, implFn] = impls[i];
+            Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
+
+            b.setInsertionPointToStart(checkBlocks[i]);
+            Value classIdVal = moore::ConstantOp::create(b, loc, cmpTy, classId,
+                                                        /*isSigned=*/true);
+            Value eq = b.createOrFold<moore::EqOp>(loc, dynType, classIdVal);
+            eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+            Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+            mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i], next);
+
+            b.setInsertionPointToStart(caseBlocks[i]);
+            mlir::func::CallOp::create(b, loc, implFn, entry.getArguments());
+            mlir::func::ReturnOp::create(b, loc);
+          }
+
+          return dispatchFn;
+        };
+
+        mlir::func::FuncOp buildFn =
+            buildPhaseDispatch("build_phase", "__circt_uvm_dispatch_build_phase");
+        mlir::func::FuncOp connectFn = buildPhaseDispatch(
+            "connect_phase", "__circt_uvm_dispatch_connect_phase");
+        mlir::func::FuncOp runFn =
+            buildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase");
+
+        auto countFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
+        auto countFn =
+            getOrCreateExternFunc("circt_uvm_component_count", countFnTy);
+        if (!countFn)
+          return mlir::func::FuncOp();
+
+        auto getFnTy = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto getFn = getOrCreateExternFunc("circt_uvm_component_get", getFnTy);
+        if (!getFn)
+          return mlir::func::FuncOp();
+
+        auto setReadyFnTy = FunctionType::get(context.getContext(), {i32Ty}, {});
+        auto setReadyFn =
+            getOrCreateExternFunc("circt_uvm_set_phases_ready", setReadyFnTy);
+        if (!setReadyFn)
+          return mlir::func::FuncOp();
+
+        auto readyFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
+        auto readyFn =
+            getOrCreateExternFunc("circt_uvm_phases_ready", readyFnTy);
+        if (!readyFn)
+          return mlir::func::FuncOp();
+
+        auto ensureRunPhaseWorkers = [&]() {
+          if (!callerSvModule || !runFn)
+            return;
+          Block &modBody = callerSvModule.getBodyRegion().front();
+          for (auto proc : modBody.getOps<moore::ProcedureOp>()) {
+            if (proc->hasAttr("circt_uvm_run_phase_worker"))
+              return;
+          }
+
+          constexpr int32_t kMaxRunPhaseWorkers = 256;
+
+          OpBuilder::InsertionGuard guard(context.builder);
+          context.builder.setInsertionPoint(modBody.getTerminator());
+
+          for (int32_t idx = 0; idx < kMaxRunPhaseWorkers; ++idx) {
+            auto procOp = moore::ProcedureOp::create(context.builder, loc,
+                                                     moore::ProcedureKind::Initial);
+            procOp->setAttr("circt_uvm_run_phase_worker",
+                            context.builder.getI32IntegerAttr(idx));
+
+            auto &entry = procOp.getBody().emplaceBlock();
+            auto &readyCond = procOp.getBody().emplaceBlock();
+            auto &waitBlock = procOp.getBody().emplaceBlock();
+            auto &idxCond = procOp.getBody().emplaceBlock();
+            auto &runBlock = procOp.getBody().emplaceBlock();
+            auto &done = procOp.getBody().emplaceBlock();
+
+            OpBuilder b(context.getContext());
+            b.setInsertionPointToStart(&entry);
+            Value idxVal = moore::ConstantOp::create(b, loc, i32Ty, idx,
+                                                    /*isSigned=*/true);
+            Value zero =
+                moore::ConstantOp::create(b, loc, i32Ty, /*value=*/0, /*isSigned=*/true);
+            mlir::cf::BranchOp::create(b, loc, &readyCond, ValueRange{});
+
+            b.setInsertionPointToStart(&readyCond);
+            Value ready =
+                mlir::func::CallOp::create(b, loc, readyFn, ValueRange{}).getResult(0);
+            Value isReady = b.createOrFold<moore::NeOp>(loc, ready, zero);
+            isReady = b.createOrFold<moore::BoolCastOp>(loc, isReady);
+            Value readyCondVal = moore::ToBuiltinBoolOp::create(b, loc, isReady);
+            mlir::cf::CondBranchOp::create(b, loc, readyCondVal, &idxCond,
+                                           ValueRange{}, &waitBlock, ValueRange{});
+
+            b.setInsertionPointToStart(&waitBlock);
+            Value zeroDelay = moore::ConstantTimeOp::create(b, loc, 0);
+            moore::WaitDelayOp::create(b, loc, zeroDelay);
+            mlir::cf::BranchOp::create(b, loc, &readyCond, ValueRange{});
+
+            b.setInsertionPointToStart(&idxCond);
+            Value count =
+                mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+            Value lt = moore::UltOp::create(b, loc, idxVal, count);
+            Value ltCond = moore::ToBuiltinBoolOp::create(b, loc, lt);
+            mlir::cf::CondBranchOp::create(b, loc, ltCond, &runBlock, ValueRange{},
+                                           &done, ValueRange{});
+
+            b.setInsertionPointToStart(&runBlock);
+            Value comp =
+                mlir::func::CallOp::create(b, loc, getFn, ValueRange{idxVal}).getResult(0);
+            mlir::func::CallOp::create(b, loc, runFn, ValueRange{comp, zero});
+            mlir::cf::BranchOp::create(b, loc, &done, ValueRange{});
+
+            b.setInsertionPointToStart(&done);
+            moore::ReturnOp::create(b, loc);
+          }
+        };
+
+        if (auto shimFn =
+                context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(shimName)) {
+          ensureRunPhaseWorkers();
+          return shimFn;
+        }
+
+        OpBuilder::InsertionGuard g(context.builder);
+        context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+        context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+        auto fnType = FunctionType::get(context.getContext(), {}, {});
+        auto shimFn =
+            mlir::func::FuncOp::create(context.builder, loc, shimName, fnType);
+        shimFn.setPrivate();
+        context.symbolTable.insert(shimFn);
+
+        auto &entry = shimFn.getBody().emplaceBlock();
+        auto &buildCond = shimFn.getBody().emplaceBlock();
+        buildCond.addArgument(i32Ty, loc);
+        auto &buildBody = shimFn.getBody().emplaceBlock();
+        buildBody.addArgument(i32Ty, loc);
+        auto &connectCond = shimFn.getBody().emplaceBlock();
+        connectCond.addArgument(i32Ty, loc);
+        auto &connectBody = shimFn.getBody().emplaceBlock();
+        connectBody.addArgument(i32Ty, loc);
+        auto &finish = shimFn.getBody().emplaceBlock();
+
+        OpBuilder b(context.getContext());
+        b.setInsertionPointToStart(&entry);
+
+        Value zero =
+            moore::ConstantOp::create(b, loc, i32Ty, /*value=*/0, /*isSigned=*/true);
+        Value one =
+            moore::ConstantOp::create(b, loc, i32Ty, /*value=*/1, /*isSigned=*/true);
+
+        mlir::func::CallOp::create(b, loc, setReadyFn, ValueRange{zero});
+        mlir::cf::BranchOp::create(b, loc, &buildCond, ValueRange{zero});
+
+        // build_phase loop (recompute component_count each iteration so
+        // components created during build are visited too).
+        b.setInsertionPointToStart(&buildCond);
+        Value bIdx = buildCond.getArgument(0);
+        Value bCount =
+            mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+        Value bLt = moore::UltOp::create(b, loc, bIdx, bCount);
+        Value bCond = moore::ToBuiltinBoolOp::create(b, loc, bLt);
+        mlir::cf::CondBranchOp::create(b, loc, bCond, &buildBody, ValueRange{bIdx},
+                                       &connectCond, ValueRange{zero});
+
+        b.setInsertionPointToStart(&buildBody);
+        Value bBodyIdx = buildBody.getArgument(0);
+        Value bComp =
+            mlir::func::CallOp::create(b, loc, getFn, ValueRange{bBodyIdx}).getResult(0);
+        if (buildFn)
+          mlir::func::CallOp::create(b, loc, buildFn, ValueRange{bComp, zero});
+        Value bNext = moore::AddOp::create(b, loc, bBodyIdx, one);
+        mlir::cf::BranchOp::create(b, loc, &buildCond, ValueRange{bNext});
+
+        // connect_phase loop
+        b.setInsertionPointToStart(&connectCond);
+        Value cIdx = connectCond.getArgument(0);
+        Value cCount =
+            mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+        Value cLt = moore::UltOp::create(b, loc, cIdx, cCount);
+        Value cCond = moore::ToBuiltinBoolOp::create(b, loc, cLt);
+        mlir::cf::CondBranchOp::create(b, loc, cCond, &connectBody, ValueRange{cIdx},
+                                       &finish, ValueRange{});
+
+        b.setInsertionPointToStart(&connectBody);
+        Value cBodyIdx = connectBody.getArgument(0);
+        Value comp =
+            mlir::func::CallOp::create(b, loc, getFn, ValueRange{cBodyIdx}).getResult(0);
+        if (connectFn)
+          mlir::func::CallOp::create(b, loc, connectFn, ValueRange{comp, zero});
+        Value cNext = moore::AddOp::create(b, loc, cBodyIdx, one);
+        mlir::cf::BranchOp::create(b, loc, &connectCond, ValueRange{cNext});
+
+        b.setInsertionPointToStart(&finish);
+        mlir::func::CallOp::create(b, loc, setReadyFn, ValueRange{one});
+        mlir::func::ReturnOp::create(b, loc);
+
+        ensureRunPhaseWorkers();
+        return shimFn;
+      };
+
+      // uvm_pkg::run_test([string test_name])
+      if (parentSym.kind == slang::ast::SymbolKind::Package &&
+          parentSym.name == "uvm_pkg" && subroutine->name == "run_test") {
+        if (expr.arguments().size() > 1) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_pkg::run_test`: expected 0 "
+                          "or 1 argument(s), got ")
+              << expr.arguments().size();
+          return {};
+        }
+
+        Value nameArg;
+        if (expr.arguments().empty()) {
+          auto strType = moore::StringType::get(context.getContext());
+          auto i8Ty =
+              moore::IntType::get(context.getContext(), /*width=*/8, moore::Domain::TwoValued);
+          Value raw =
+              moore::StringConstantOp::create(builder, loc, i8Ty, "").getResult();
+          nameArg = moore::ConversionOp::create(builder, loc, strType, raw);
+        } else {
+          nameArg = context.convertRvalueExpression(*expr.arguments().front());
+          if (!nameArg)
+            return {};
+        }
+
+        auto fnType =
+            FunctionType::get(context.getContext(), {nameArg.getType()}, {});
+        auto fn = getOrCreateExternFunc("circt_uvm_run_test", fnType);
+        if (!fn)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, fn, ValueRange{nameArg});
+
+        auto phasesFn = ensureRunAllPhases();
+        if (phasesFn)
+          mlir::func::CallOp::create(builder, loc, phasesFn, ValueRange{});
+        return makeVoidValue();
+      }
+
       // uvm_root::run_test([string test_name])
       if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
           parentSym.name == "uvm_root" && subroutine->name == "run_test") {
@@ -2997,14 +3492,16 @@ struct RvalueExprVisitor : public ExprVisitor {
             return {};
         }
 
-        // Minimal UVM scheduler shim: run build_phase + connect_phase +
-        // run_phase for all registered components, then mark phases done.
-        auto ensureRunAllPhases = [&]() -> mlir::func::FuncOp {
-          StringRef shimName = "circt_uvm_run_all_phases";
-          if (auto existing =
-                  context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(shimName))
-            return existing;
+        moore::SVModuleOp callerSvModule;
+        if (auto *insBlock = builder.getInsertionBlock())
+          if (auto *parentOp = insBlock->getParentOp())
+            callerSvModule = parentOp->getParentOfType<moore::SVModuleOp>();
 
+        // Minimal UVM scheduler shim: run build_phase + connect_phase +
+        // connect_phase for all registered components, then start run_phase in
+        // parallel processes.
+	        auto ensureRunAllPhases = [&]() -> mlir::func::FuncOp {
+	          StringRef shimName = "circt_uvm_run_all_phases";
 	          auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
 	                                           moore::Domain::TwoValued);
 
@@ -3015,118 +3512,227 @@ struct RvalueExprVisitor : public ExprVisitor {
 	                    context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
 	              return existing;
 
+	            SmallVector<std::pair<const slang::ast::ClassType *, int32_t>>
+	                classIdSnapshot;
+	            classIdSnapshot.reserve(context.classIds.size());
+	            for (auto &entry : context.classIds)
+	              classIdSnapshot.push_back({entry.first, entry.second});
+
 	            SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
-	            for (auto [cls, classId] : context.classIds) {
+	            for (auto [cls, classId] : classIdSnapshot) {
 	              if (!cls)
 	                continue;
 	              llvm::StringRef clsName(cls->name.data(), cls->name.size());
 	              if (clsName.starts_with("uvm_"))
-	                continue;
-		              const slang::ast::SubroutineSymbol *impl = nullptr;
-		              for (auto &method :
-		                   cls->membersOfType<slang::ast::SubroutineSymbol>()) {
-		                if (llvm::StringRef(method.name.data(), method.name.size()) ==
-		                    methodName) {
-		                  impl = &method;
-		                  break;
-		                }
-		              }
-	              if (!impl)
-	                continue;
-	              if (failed(context.convertFunction(*impl)))
-	                continue;
-	              auto *implLowering = context.declareFunction(*impl);
-	              if (!implLowering || !implLowering->op)
-	                continue;
-	              impls.push_back({classId, implLowering->op});
-	            }
+                continue;
+              const slang::ast::SubroutineSymbol *impl = nullptr;
+              for (auto &method :
+                   cls->membersOfType<slang::ast::SubroutineSymbol>()) {
+                if (llvm::StringRef(method.name.data(), method.name.size()) ==
+                    methodName) {
+                  impl = &method;
+                  break;
+                }
+              }
+              if (!impl)
+                continue;
+              if (failed(context.convertFunction(*impl)))
+                continue;
+              auto *implLowering = context.declareFunction(*impl);
+              if (!implLowering || !implLowering->op)
+                continue;
+              impls.push_back({classId, implLowering->op});
+            }
 
-	            auto fnTy =
-	                FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+            auto fnTy =
+                FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
 
-	            OpBuilder::InsertionGuard g(context.builder);
-	            context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
-	            context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
-	            auto dispatchFn =
-	                mlir::func::FuncOp::create(context.builder, loc, fnName, fnTy);
-	            dispatchFn.setPrivate();
-	            context.symbolTable.insert(dispatchFn);
+            OpBuilder::InsertionGuard g(context.builder);
+            context.builder.setInsertionPointToStart(
+                context.intoModuleOp.getBody());
+            context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+            auto dispatchFn =
+                mlir::func::FuncOp::create(context.builder, loc, fnName, fnTy);
+            dispatchFn.setPrivate();
+            context.symbolTable.insert(dispatchFn);
 
-	            auto &entry = dispatchFn.getBody().emplaceBlock();
-	            for (auto ty : fnTy.getInputs())
-	              entry.addArgument(ty, loc);
+            auto &entry = dispatchFn.getBody().emplaceBlock();
+            for (auto ty : fnTy.getInputs())
+              entry.addArgument(ty, loc);
 
-	            OpBuilder b(context.getContext());
-	            b.setInsertionPointToStart(&entry);
-	            if (impls.empty()) {
-	              mlir::func::ReturnOp::create(b, loc);
-	              return dispatchFn;
-	            }
+            OpBuilder b(context.getContext());
+            b.setInsertionPointToStart(&entry);
+            if (impls.empty()) {
+              mlir::func::ReturnOp::create(b, loc);
+              return dispatchFn;
+            }
 
-	            Value thisArg = entry.getArgument(0);
-	            auto getTypeFnTy = FunctionType::get(context.getContext(),
-	                                                 {thisArg.getType()},
-	                                                 {thisArg.getType()});
-	            auto getTypeFn =
-	                getOrCreateExternFunc("circt_sv_class_get_type", getTypeFnTy);
-	            if (!getTypeFn)
-	              return mlir::func::FuncOp();
-	            Value dynType =
-	                mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg})
-	                    .getResult(0);
+            Value thisArg = entry.getArgument(0);
+            auto getTypeFnTy =
+                FunctionType::get(context.getContext(), {thisArg.getType()},
+                                  {thisArg.getType()});
+            auto getTypeFn =
+                getOrCreateExternFunc("circt_sv_class_get_type", getTypeFnTy);
+            if (!getTypeFn)
+              return mlir::func::FuncOp();
+            Value dynType =
+                mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg})
+                    .getResult(0);
 
-	            Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
-	            SmallVector<Block *> checkBlocks;
-	            SmallVector<Block *> caseBlocks;
-	            checkBlocks.reserve(impls.size());
-	            caseBlocks.reserve(impls.size());
-	            for (size_t i = 0, e = impls.size(); i < e; ++i) {
-	              checkBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
-	              caseBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
-	            }
+            Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
+            SmallVector<Block *> checkBlocks;
+            SmallVector<Block *> caseBlocks;
+            checkBlocks.reserve(impls.size());
+            caseBlocks.reserve(impls.size());
+            for (size_t i = 0, e = impls.size(); i < e; ++i) {
+              checkBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+              caseBlocks.push_back(&dispatchFn.getBody().emplaceBlock());
+            }
 
-	            b.setInsertionPointToEnd(&entry);
-	            mlir::cf::BranchOp::create(b, loc,
-	                                       checkBlocks.empty() ? defaultBlock
-	                                                           : checkBlocks.front());
+            b.setInsertionPointToEnd(&entry);
+            mlir::cf::BranchOp::create(
+                b, loc,
+                checkBlocks.empty() ? defaultBlock : checkBlocks.front());
 
-	            b.setInsertionPointToStart(defaultBlock);
-	            mlir::func::ReturnOp::create(b, loc);
+            b.setInsertionPointToStart(defaultBlock);
+            mlir::func::ReturnOp::create(b, loc);
 
-	            auto cmpTy = moore::IntType::get(
-	                context.getContext(), /*width=*/32,
-	                cast<moore::IntType>(thisArg.getType()).getDomain());
-	            for (size_t i = 0, e = impls.size(); i < e; ++i) {
-	              auto [classId, implFn] = impls[i];
-	              Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
+            auto cmpTy = moore::IntType::get(
+                context.getContext(), /*width=*/32,
+                cast<moore::IntType>(thisArg.getType()).getDomain());
+            for (size_t i = 0, e = impls.size(); i < e; ++i) {
+              auto [classId, implFn] = impls[i];
+              Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
 
-	              b.setInsertionPointToStart(checkBlocks[i]);
-	              Value classIdVal = moore::ConstantOp::create(
-	                  b, loc, cmpTy, classId, /*isSigned=*/true);
-	              Value eq = b.createOrFold<moore::EqOp>(loc, dynType, classIdVal);
-	              eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
-	              Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
-	              mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i], next);
+              b.setInsertionPointToStart(checkBlocks[i]);
+              Value classIdVal = moore::ConstantOp::create(
+                  b, loc, cmpTy, classId, /*isSigned=*/true);
+              Value eq = b.createOrFold<moore::EqOp>(loc, dynType, classIdVal);
+              eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+              Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+              mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i], next);
 
-	              b.setInsertionPointToStart(caseBlocks[i]);
-	              mlir::func::CallOp::create(b, loc, implFn, entry.getArguments());
-	              mlir::func::ReturnOp::create(b, loc);
-	            }
+              b.setInsertionPointToStart(caseBlocks[i]);
+              mlir::func::CallOp::create(b, loc, implFn, entry.getArguments());
+              mlir::func::ReturnOp::create(b, loc);
+            }
 
-	            return dispatchFn;
-	          };
+            return dispatchFn;
+          };
 
-	          mlir::func::FuncOp buildFn =
-	              buildPhaseDispatch("build_phase",
-	                                 "__circt_uvm_dispatch_build_phase");
-	          mlir::func::FuncOp connectFn =
-	              buildPhaseDispatch("connect_phase",
-	                                 "__circt_uvm_dispatch_connect_phase");
-	          mlir::func::FuncOp runFn =
-	              buildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase");
+          mlir::func::FuncOp buildFn =
+              buildPhaseDispatch("build_phase", "__circt_uvm_dispatch_build_phase");
+          mlir::func::FuncOp connectFn = buildPhaseDispatch(
+              "connect_phase", "__circt_uvm_dispatch_connect_phase");
+          mlir::func::FuncOp runFn =
+              buildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase");
 
-	          OpBuilder::InsertionGuard g(context.builder);
-	          context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
+          auto countFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
+          auto countFn =
+              getOrCreateExternFunc("circt_uvm_component_count", countFnTy);
+          if (!countFn)
+            return mlir::func::FuncOp();
+
+          auto getFnTy = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+          auto getFn = getOrCreateExternFunc("circt_uvm_component_get", getFnTy);
+          if (!getFn)
+            return mlir::func::FuncOp();
+
+          auto setReadyFnTy =
+              FunctionType::get(context.getContext(), {i32Ty}, {});
+          auto setReadyFn =
+              getOrCreateExternFunc("circt_uvm_set_phases_ready", setReadyFnTy);
+          if (!setReadyFn)
+            return mlir::func::FuncOp();
+
+          auto readyFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
+          auto readyFn =
+              getOrCreateExternFunc("circt_uvm_phases_ready", readyFnTy);
+          if (!readyFn)
+            return mlir::func::FuncOp();
+
+          auto ensureRunPhaseWorkers = [&]() {
+            if (!callerSvModule || !runFn)
+              return;
+            Block &modBody = callerSvModule.getBodyRegion().front();
+            for (auto proc : modBody.getOps<moore::ProcedureOp>()) {
+              if (proc->hasAttr("circt_uvm_run_phase_worker"))
+                return;
+            }
+
+            constexpr int32_t kMaxRunPhaseWorkers = 256;
+
+            OpBuilder::InsertionGuard guard(context.builder);
+            context.builder.setInsertionPoint(modBody.getTerminator());
+
+            for (int32_t idx = 0; idx < kMaxRunPhaseWorkers; ++idx) {
+              auto procOp =
+                  moore::ProcedureOp::create(context.builder, loc,
+                                             moore::ProcedureKind::Initial);
+              procOp->setAttr("circt_uvm_run_phase_worker",
+                              context.builder.getI32IntegerAttr(idx));
+
+              auto &entry = procOp.getBody().emplaceBlock();
+              auto &readyCond = procOp.getBody().emplaceBlock();
+              auto &waitBlock = procOp.getBody().emplaceBlock();
+              auto &idxCond = procOp.getBody().emplaceBlock();
+              auto &runBlock = procOp.getBody().emplaceBlock();
+              auto &done = procOp.getBody().emplaceBlock();
+
+              OpBuilder b(context.getContext());
+              b.setInsertionPointToStart(&entry);
+              Value idxVal = moore::ConstantOp::create(b, loc, i32Ty, idx,
+                                                      /*isSigned=*/true);
+              Value zero = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/0,
+                                                    /*isSigned=*/true);
+              mlir::cf::BranchOp::create(b, loc, &readyCond, ValueRange{});
+
+              b.setInsertionPointToStart(&readyCond);
+              Value ready =
+                  mlir::func::CallOp::create(b, loc, readyFn, ValueRange{})
+                      .getResult(0);
+              Value isReady = b.createOrFold<moore::NeOp>(loc, ready, zero);
+              isReady = b.createOrFold<moore::BoolCastOp>(loc, isReady);
+              Value readyCondVal =
+                  moore::ToBuiltinBoolOp::create(b, loc, isReady);
+              mlir::cf::CondBranchOp::create(b, loc, readyCondVal, &idxCond,
+                                             ValueRange{}, &waitBlock,
+                                             ValueRange{});
+
+              b.setInsertionPointToStart(&waitBlock);
+              Value zeroDelay = moore::ConstantTimeOp::create(b, loc, 0);
+              moore::WaitDelayOp::create(b, loc, zeroDelay);
+              mlir::cf::BranchOp::create(b, loc, &readyCond, ValueRange{});
+
+              b.setInsertionPointToStart(&idxCond);
+              Value count =
+                  mlir::func::CallOp::create(b, loc, countFn, ValueRange{})
+                      .getResult(0);
+              Value lt = moore::UltOp::create(b, loc, idxVal, count);
+              Value ltCond = moore::ToBuiltinBoolOp::create(b, loc, lt);
+              mlir::cf::CondBranchOp::create(b, loc, ltCond, &runBlock,
+                                             ValueRange{}, &done, ValueRange{});
+
+              b.setInsertionPointToStart(&runBlock);
+              Value comp =
+                  mlir::func::CallOp::create(b, loc, getFn, ValueRange{idxVal})
+                      .getResult(0);
+              mlir::func::CallOp::create(b, loc, runFn, ValueRange{comp, zero});
+              mlir::cf::BranchOp::create(b, loc, &done, ValueRange{});
+
+              b.setInsertionPointToStart(&done);
+              moore::ReturnOp::create(b, loc);
+            }
+          };
+
+          if (auto shimFn =
+                  context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(shimName)) {
+            ensureRunPhaseWorkers();
+            return shimFn;
+          }
+
+          OpBuilder::InsertionGuard g(context.builder);
+          context.builder.setInsertionPointToStart(context.intoModuleOp.getBody());
           context.getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
           auto fnType = FunctionType::get(context.getContext(), {}, {});
           auto shimFn =
@@ -3143,10 +3749,6 @@ struct RvalueExprVisitor : public ExprVisitor {
           connectCond.addArgument(i32Ty, loc);
           auto &connectBody = shimFn.getBody().emplaceBlock();
           connectBody.addArgument(i32Ty, loc);
-          auto &runCond = shimFn.getBody().emplaceBlock();
-          runCond.addArgument(i32Ty, loc);
-          auto &runBody = shimFn.getBody().emplaceBlock();
-          runBody.addArgument(i32Ty, loc);
           auto &finish = shimFn.getBody().emplaceBlock();
 
           OpBuilder b(context.getContext());
@@ -3157,19 +3759,7 @@ struct RvalueExprVisitor : public ExprVisitor {
           Value one = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/1,
                                                /*isSigned=*/true);
 
-          auto countFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
-          auto countFn =
-              getOrCreateExternFunc("circt_uvm_component_count", countFnTy);
-          if (!countFn)
-            return mlir::func::FuncOp();
-
-          auto getFnTy =
-              FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
-          auto getFn =
-              getOrCreateExternFunc("circt_uvm_component_get", getFnTy);
-          if (!getFn)
-            return mlir::func::FuncOp();
-
+          mlir::func::CallOp::create(b, loc, setReadyFn, ValueRange{zero});
           mlir::cf::BranchOp::create(b, loc, &buildCond, ValueRange{zero});
 
           // build_phase loop (recompute component_count each iteration so
@@ -3177,7 +3767,8 @@ struct RvalueExprVisitor : public ExprVisitor {
           b.setInsertionPointToStart(&buildCond);
           Value bIdx = buildCond.getArgument(0);
           Value bCount =
-              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+              mlir::func::CallOp::create(b, loc, countFn, ValueRange{})
+                  .getResult(0);
           Value bLt = moore::UltOp::create(b, loc, bIdx, bCount);
           Value bCond = moore::ToBuiltinBoolOp::create(b, loc, bLt);
           mlir::cf::CondBranchOp::create(b, loc, bCond, &buildBody,
@@ -3198,46 +3789,29 @@ struct RvalueExprVisitor : public ExprVisitor {
           b.setInsertionPointToStart(&connectCond);
           Value cIdx = connectCond.getArgument(0);
           Value cCount =
-              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+              mlir::func::CallOp::create(b, loc, countFn, ValueRange{})
+                  .getResult(0);
           Value cLt = moore::UltOp::create(b, loc, cIdx, cCount);
           Value cCond = moore::ToBuiltinBoolOp::create(b, loc, cLt);
           mlir::cf::CondBranchOp::create(b, loc, cCond, &connectBody,
-                                         ValueRange{cIdx}, &runCond,
-                                         ValueRange{zero});
+                                         ValueRange{cIdx}, &finish,
+                                         ValueRange{});
 
           b.setInsertionPointToStart(&connectBody);
           Value cBodyIdx = connectBody.getArgument(0);
-          Value comp = mlir::func::CallOp::create(b, loc, getFn,
-                                                  ValueRange{cBodyIdx})
-                           .getResult(0);
+          Value comp =
+              mlir::func::CallOp::create(b, loc, getFn, ValueRange{cBodyIdx})
+                  .getResult(0);
           if (connectFn)
             mlir::func::CallOp::create(b, loc, connectFn, ValueRange{comp, zero});
           Value cNext = moore::AddOp::create(b, loc, cBodyIdx, one);
           mlir::cf::BranchOp::create(b, loc, &connectCond, ValueRange{cNext});
 
-          // run_phase loop
-          b.setInsertionPointToStart(&runCond);
-          Value rIdx = runCond.getArgument(0);
-          Value rCount =
-              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
-          Value rLt = moore::UltOp::create(b, loc, rIdx, rCount);
-          Value rCond = moore::ToBuiltinBoolOp::create(b, loc, rLt);
-          mlir::cf::CondBranchOp::create(b, loc, rCond, &runBody,
-                                         ValueRange{rIdx}, &finish, ValueRange{});
-
-          b.setInsertionPointToStart(&runBody);
-          Value rBodyIdx = runBody.getArgument(0);
-          Value rComp = mlir::func::CallOp::create(b, loc, getFn,
-                                                   ValueRange{rBodyIdx})
-                            .getResult(0);
-          if (runFn)
-            mlir::func::CallOp::create(b, loc, runFn, ValueRange{rComp, zero});
-          Value rNext = moore::AddOp::create(b, loc, rBodyIdx, one);
-          mlir::cf::BranchOp::create(b, loc, &runCond, ValueRange{rNext});
-
           b.setInsertionPointToStart(&finish);
+          mlir::func::CallOp::create(b, loc, setReadyFn, ValueRange{one});
           mlir::func::ReturnOp::create(b, loc);
 
+          ensureRunPhaseWorkers();
           return shimFn;
         };
 
@@ -3450,6 +4024,46 @@ struct RvalueExprVisitor : public ExprVisitor {
         if (!fn)
           return {};
         builder.create<mlir::func::CallOp>(loc, fn, ValueRange{self, other});
+
+        // If we're connecting a sequencer's `seq_item_export`, capture a direct
+        // mapping from the sequencer component handle to its export handle.
+        // This enables minimal sequence/driver shims to route sequence items
+        // without lowering the full TLM layer.
+        const slang::ast::Expression *otherExpr = expr.arguments().front();
+        while (true) {
+          if (const auto *assign =
+                  otherExpr->as_if<slang::ast::AssignmentExpression>()) {
+            otherExpr = &assign->left();
+            continue;
+          }
+          if (const auto *conv =
+                  otherExpr->as_if<slang::ast::ConversionExpression>()) {
+            otherExpr = &conv->operand();
+            continue;
+          }
+          break;
+        }
+        if (const auto *mem =
+                otherExpr->as_if<slang::ast::MemberAccessExpression>()) {
+          if (mem->member.name == "seq_item_export") {
+            Value sequencerVal = context.convertRvalueExpression(mem->value());
+            if (sequencerVal) {
+              sequencerVal = context.materializeConversion(i32Ty, sequencerVal,
+                                                           /*isSigned=*/false,
+                                                           loc);
+              if (sequencerVal) {
+                auto bindTy = FunctionType::get(context.getContext(),
+                                                {i32Ty, i32Ty}, {});
+                auto bindFn =
+                    getOrCreateExternFunc("circt_uvm_bind_sequencer_export",
+                                          bindTy);
+                if (bindFn)
+                  builder.create<mlir::func::CallOp>(
+                      loc, bindFn, ValueRange{sequencerVal, other});
+              }
+            }
+          }
+        }
         return makeVoidValue();
       }
 
@@ -3553,18 +4167,24 @@ struct RvalueExprVisitor : public ExprVisitor {
           int32_t analysisPortId = getClassId("uvm_analysis_port");
           int32_t analysisImpId = getClassId("uvm_analysis_imp");
 
-          auto buildWriteDispatch = [&]() -> mlir::func::FuncOp {
-            StringRef fnName = "__circt_uvm_dispatch_analysis_write";
-            if (auto existing =
-                    context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
-              return existing;
+	          auto buildWriteDispatch = [&]() -> mlir::func::FuncOp {
+	            StringRef fnName = "__circt_uvm_dispatch_analysis_write";
+	            if (auto existing =
+	                    context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName))
+	              return existing;
 
-            SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
-            for (auto [cls, classId] : context.classIds) {
-              if (!cls)
-                continue;
-              llvm::StringRef clsName(cls->name.data(), cls->name.size());
-              if (clsName.starts_with("uvm_"))
+	            SmallVector<std::pair<const slang::ast::ClassType *, int32_t>>
+	                classIdSnapshot;
+	            classIdSnapshot.reserve(context.classIds.size());
+	            for (auto &entry : context.classIds)
+	              classIdSnapshot.push_back({entry.first, entry.second});
+
+	            SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+	            for (auto [cls, classId] : classIdSnapshot) {
+	              if (!cls)
+	                continue;
+	              llvm::StringRef clsName(cls->name.data(), cls->name.size());
+	              if (clsName.starts_with("uvm_"))
                 continue;
               const slang::ast::SubroutineSymbol *impl = nullptr;
               for (auto &method :
@@ -4050,19 +4670,439 @@ struct RvalueExprVisitor : public ExprVisitor {
         return makeVoidValue();
       }
 
+      // uvm_sequence_base::start(uvm_sequencer_base sequencer, ...)
+      //
+      // Lower to:
+      // - bind the sequence to a mailbox associated with the sequencer's
+      //   `seq_item_export` (captured during connect),
+      // - run the user-defined `body()` task for the concrete sequence type.
+      auto isUvmPkgMember = [&]() -> bool {
+        if (const auto *grandScope = parentSym.getParentScope()) {
+          const auto &grandSym = grandScope->asSymbol();
+          return grandSym.kind == slang::ast::SymbolKind::Package &&
+                 grandSym.name == "uvm_pkg";
+        }
+        return false;
+      };
+
+      if ((parentSym.kind == slang::ast::SymbolKind::ClassType ||
+           parentSym.kind == slang::ast::SymbolKind::GenericClassDef) &&
+          parentSym.name == "uvm_sequence_base" && subroutine->name == "start" &&
+          isUvmPkgMember()) {
+        auto *thisExpr = expr.thisClass();
+        if (!thisExpr) {
+          mlir::emitError(loc, "missing `this` for `uvm_sequence_base::start`");
+          return {};
+        }
+
+        if (expr.arguments().empty()) {
+          mlir::emitError(
+              loc,
+              "unsupported call to `uvm_sequence_base::start`: expected at least "
+              "1 argument (sequencer)");
+          return {};
+        }
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        Value seqVal = context.convertRvalueExpression(*thisExpr);
+        if (!seqVal)
+          return {};
+        seqVal = context.materializeConversion(i32Ty, seqVal,
+                                               /*isSigned=*/false, loc);
+        if (!seqVal)
+          return {};
+
+        Value sequencerVal =
+            context.convertRvalueExpression(*expr.arguments().front());
+        if (!sequencerVal)
+          return {};
+        sequencerVal = context.materializeConversion(i32Ty, sequencerVal,
+                                                     /*isSigned=*/false, loc);
+        if (!sequencerVal)
+          return {};
+
+        // Evaluate remaining arguments for side effects only.
+        for (size_t i = 1, e = expr.arguments().size(); i < e; ++i)
+          if (!context.convertRvalueExpression(*expr.arguments()[i]))
+            return {};
+
+        auto getMboxTy =
+            FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto getMboxFn = getOrCreateExternFunc(
+            "circt_uvm_sequencer_get_seq_item_mbox", getMboxTy);
+        if (!getMboxFn)
+          return {};
+        Value mbox =
+            mlir::func::CallOp::create(builder, loc, getMboxFn, {sequencerVal})
+                .getResult(0);
+
+        auto setMboxTy =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+        auto setMboxFn = getOrCreateExternFunc(
+            "circt_uvm_sequence_set_seq_item_mbox", setMboxTy);
+        if (!setMboxFn)
+          return {};
+        builder.create<mlir::func::CallOp>(loc, setMboxFn,
+                                           ValueRange{seqVal, mbox});
+
+        // Locate and call the concrete sequence `body()` implementation.
+        const slang::ast::ClassType *recvCls =
+            thisExpr->type
+                ? thisExpr->type->getCanonicalType()
+                      .as_if<slang::ast::ClassType>()
+                : nullptr;
+        const slang::ast::SubroutineSymbol *bodyMethod = nullptr;
+        if (recvCls) {
+          for (auto &method :
+               recvCls->membersOfType<slang::ast::SubroutineSymbol>()) {
+            if (method.name == "body") {
+              bodyMethod = &method;
+              break;
+            }
+          }
+        }
+
+        if (!bodyMethod)
+          return makeVoidValue();
+        if (failed(context.convertFunction(*bodyMethod)))
+          return makeVoidValue();
+        auto *bodyLowering = context.declareFunction(*bodyMethod);
+        if (!bodyLowering || !bodyLowering->op)
+          return makeVoidValue();
+
+        auto bodyTy = bodyLowering->op.getFunctionType();
+        if (bodyTy.getNumInputs() != 1)
+          return makeVoidValue();
+        Value bodyThis = context.materializeConversion(bodyTy.getInput(0), seqVal,
+                                                       /*isSigned=*/false, loc);
+        if (!bodyThis)
+          return makeVoidValue();
+        mlir::func::CallOp::create(builder, loc, bodyLowering->op, {bodyThis});
+        return makeVoidValue();
+      }
+
+      // uvm_sequence_base::start_item / finish_item
+      //
+      // For this minimal sequence shim, `finish_item(item)` enqueues `item` in
+      // the bound sequencer mailbox so `uvm_seq_item_pull_port::get` can
+      // dequeue it.
+      if ((parentSym.kind == slang::ast::SymbolKind::ClassType ||
+           parentSym.kind == slang::ast::SymbolKind::GenericClassDef) &&
+          parentSym.name == "uvm_sequence_base" &&
+          (subroutine->name == "start_item" ||
+           subroutine->name == "finish_item") &&
+          isUvmPkgMember()) {
+        if (expr.arguments().empty()) {
+          mlir::emitError(loc, "unsupported call to `uvm_sequence_base::")
+              << subroutine->name << "`: expected 1 item argument";
+          return {};
+        }
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        Value seqVal;
+        if (auto *thisExpr = expr.thisClass()) {
+          seqVal = context.convertRvalueExpression(*thisExpr);
+          if (!seqVal)
+            return {};
+        } else if (!context.thisStack.empty()) {
+          // Implicit receiver within a derived sequence task.
+          seqVal = context.thisStack.back();
+        } else {
+          mlir::emitError(loc, "missing `this` for `uvm_sequence_base::")
+              << subroutine->name << "`";
+          return {};
+        }
+        seqVal = context.materializeConversion(i32Ty, seqVal,
+                                               /*isSigned=*/false, loc);
+        if (!seqVal)
+          return {};
+
+        Value itemVal = context.convertRvalueExpression(*expr.arguments().front());
+        if (!itemVal)
+          return {};
+        itemVal = context.materializeConversion(i32Ty, itemVal,
+                                                /*isSigned=*/false, loc);
+        if (!itemVal)
+          return {};
+
+        // Evaluate remaining arguments for side effects only.
+        for (size_t i = 1, e = expr.arguments().size(); i < e; ++i)
+          if (!context.convertRvalueExpression(*expr.arguments()[i]))
+            return {};
+
+        if (subroutine->name == "start_item")
+          return makeVoidValue();
+
+        auto getTy = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto getFn = getOrCreateExternFunc("circt_uvm_sequence_get_seq_item_mbox",
+                                           getTy);
+        if (!getFn)
+          return {};
+        Value mbox =
+            mlir::func::CallOp::create(builder, loc, getFn, {seqVal}).getResult(0);
+
+        auto putTy =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+        auto putFn = getOrCreateExternFunc("circt_sv_mailbox_try_put_i32", putTy);
+        if (!putFn)
+          return {};
+        (void)mlir::func::CallOp::create(builder, loc, putFn, {mbox, itemVal});
+        return makeVoidValue();
+      }
+
       // uvm_seq_item_pull_port#(REQ)::get(output REQ item)
       //
-      // Sequencer/driver interaction requires full scheduler and class
-      // semantics. For bring-up (and for VCD-parity benches that primarily
-      // validate HW behavior), accept this call as a no-op without attempting
-      // to lower the output argument.
-      if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
+      // Provide a minimal, deterministic sequence-item transport:
+      // - `uvm_sequence_base::finish_item(item)` enqueues `item` in a mailbox
+      //   associated with the connected `seq_item_export`.
+      // - `uvm_seq_item_pull_port::get(output item)` blocks until an item is
+      //   available and assigns it to the output argument.
+      if ((parentSym.kind == slang::ast::SymbolKind::ClassType ||
+           parentSym.kind == slang::ast::SymbolKind::GenericClassDef) &&
           parentSym.name == "uvm_seq_item_pull_port" &&
-          subroutine->name == "get") {
-        if (auto *thisExpr = expr.thisClass()) {
-          if (!context.convertRvalueExpression(*thisExpr))
-            return {};
+          subroutine->name == "get" && isUvmPkgMember()) {
+        if (expr.arguments().size() != 1) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_seq_item_pull_port::get`: "
+                          "expected 1 output argument, got ")
+              << expr.arguments().size();
+          return {};
         }
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        auto i64Ty = moore::IntType::get(context.getContext(), /*width=*/64,
+                                         moore::Domain::TwoValued);
+        auto i1Ty = moore::IntType::get(context.getContext(), /*width=*/1,
+                                        moore::Domain::TwoValued);
+
+        auto *thisExpr = expr.thisClass();
+        if (!thisExpr) {
+          mlir::emitError(loc, "missing `this` for `uvm_seq_item_pull_port::get`");
+          return {};
+        }
+        Value portVal = context.convertRvalueExpression(*thisExpr);
+        if (!portVal)
+          return {};
+        portVal = context.materializeConversion(i32Ty, portVal,
+                                                /*isSigned=*/false, loc);
+        if (!portVal)
+          return {};
+
+        // Resolve the connected provider (export) and its mailbox.
+        Value zero = moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0,
+                                               /*isSigned=*/true);
+        auto getConnTy =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+        auto getConnFn =
+            getOrCreateExternFunc("circt_uvm_port_conn_get", getConnTy);
+        if (!getConnFn)
+          return {};
+        Value provider =
+            mlir::func::CallOp::create(builder, loc, getConnFn, {portVal, zero})
+                .getResult(0);
+
+        auto mboxTy = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto mboxFn =
+            getOrCreateExternFunc("circt_uvm_export_get_seq_item_mbox", mboxTy);
+        if (!mboxFn)
+          return {};
+        Value mbox =
+            mlir::func::CallOp::create(builder, loc, mboxFn, {provider})
+                .getResult(0);
+
+        // Lower the output argument.
+        const slang::ast::Expression *outExpr = expr.arguments()[0];
+        if (const auto *assign =
+                outExpr->as_if<slang::ast::AssignmentExpression>())
+          outExpr = &assign->left();
+        bool outIsRef = false;
+        Value outRef;
+        Value outClassHandle;
+        Value outClassFieldId;
+        bool outClassFieldSigned = false;
+        Type outElemTy;
+
+        const slang::ast::ClassPropertySymbol *outProp = nullptr;
+        const slang::ast::Expression *outPropBase = nullptr;
+        if (const auto *named =
+                outExpr->as_if<slang::ast::NamedValueExpression>()) {
+          outProp = named->symbol.as_if<slang::ast::ClassPropertySymbol>();
+        } else if (const auto *mem =
+                       outExpr->as_if<slang::ast::MemberAccessExpression>()) {
+          outProp = mem->member.as_if<slang::ast::ClassPropertySymbol>();
+          if (outProp)
+            outPropBase = &mem->value();
+        }
+
+        if (!outProp) {
+          outRef = context.convertLvalueExpression(*outExpr);
+          if (!outRef)
+            return {};
+          auto outRefTy = dyn_cast<moore::RefType>(outRef.getType());
+          if (!outRefTy) {
+            mlir::emitError(
+                loc,
+                "unsupported `uvm_seq_item_pull_port::get` output argument type: ")
+                << outRef.getType();
+            return {};
+          }
+          outIsRef = true;
+          outElemTy = outRefTy.getNestedType();
+        } else {
+          outElemTy = context.convertType(outProp->getType());
+          if (!outElemTy)
+            return {};
+          if (!isa<moore::IntType>(outElemTy)) {
+            mlir::emitError(loc, "unsupported `uvm_seq_item_pull_port::get` "
+                                 "output class property type: ")
+                << outElemTy;
+            return {};
+          }
+
+          int32_t fieldId = context.getOrAssignClassFieldId(*outProp);
+          outClassFieldId = moore::ConstantOp::create(builder, loc, i32Ty, fieldId,
+                                                      /*isSigned=*/true);
+          outClassFieldSigned = outProp->getType().isSigned();
+
+          if (outProp->lifetime == slang::ast::VariableLifetime::Static) {
+            outClassHandle = moore::ConstantOp::create(builder, loc, i32Ty,
+                                                       /*value=*/0,
+                                                       /*isSigned=*/true);
+          } else if (outPropBase) {
+            outClassHandle = context.convertRvalueExpression(*outPropBase);
+            if (!outClassHandle)
+              return {};
+            outClassHandle =
+                context.materializeConversion(i32Ty, outClassHandle,
+                                              /*isSigned=*/false, loc);
+            if (!outClassHandle)
+              return {};
+          } else {
+            if (context.thisStack.empty()) {
+              mlir::emitError(loc,
+                              "missing `this` for `uvm_seq_item_pull_port::get` "
+                              "output class property");
+              return {};
+            }
+            outClassHandle = context.thisStack.back();
+            outClassHandle = context.materializeConversion(i32Ty, outClassHandle,
+                                                           /*isSigned=*/false,
+                                                           loc);
+            if (!outClassHandle)
+              return {};
+          }
+        }
+
+        Region *region = builder.getBlock()->getParent();
+        if (!region) {
+          mlir::emitError(loc, "missing region for `uvm_seq_item_pull_port::get`");
+          return {};
+        }
+
+        Block &condBlock = region->emplaceBlock();
+        Block &waitBlock = region->emplaceBlock();
+        Block &contBlock = region->emplaceBlock();
+
+        // If there's no mailbox (no connection), treat as a no-op.
+        Value hasMbox = moore::NeOp::create(builder, loc, mbox, zero);
+        Value hasMboxCond = moore::ToBuiltinBoolOp::create(builder, loc, hasMbox);
+        mlir::cf::CondBranchOp::create(builder, loc, hasMboxCond, &condBlock,
+                                       ValueRange{}, &contBlock, ValueRange{});
+
+        auto tryGetTy =
+            FunctionType::get(context.getContext(), {i32Ty}, {i64Ty});
+        auto tryGetFn =
+            getOrCreateExternFunc("circt_sv_mailbox_try_get_i32", tryGetTy);
+        if (!tryGetFn)
+          return {};
+
+        builder.setInsertionPointToStart(&condBlock);
+        Value packed =
+            mlir::func::CallOp::create(builder, loc, tryGetFn, {mbox}).getResult(0);
+        Value value32 = moore::ExtractOp::create(builder, loc, i32Ty, packed, 0);
+        Value okBit = moore::ExtractOp::create(builder, loc, i1Ty, packed, 32);
+
+        // Only update the output argument if an item was actually dequeued.
+        if (outIsRef) {
+          Value oldVal = moore::ReadOp::create(builder, loc, outRef);
+          oldVal = context.materializeConversion(outElemTy, oldVal,
+                                                 /*isSigned=*/false, loc);
+          if (!oldVal)
+            return {};
+          Value newVal = context.materializeConversion(outElemTy, value32,
+                                                       /*isSigned=*/false, loc);
+          if (!newVal)
+            return {};
+          auto selOp =
+              moore::ConditionalOp::create(builder, loc, outElemTy, okBit);
+          Block &trueBlock = selOp.getTrueRegion().emplaceBlock();
+          Block &falseBlock = selOp.getFalseRegion().emplaceBlock();
+          {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(&trueBlock);
+            moore::YieldOp::create(builder, loc, newVal);
+            builder.setInsertionPointToStart(&falseBlock);
+            moore::YieldOp::create(builder, loc, oldVal);
+          }
+          moore::BlockingAssignOp::create(builder, loc, outRef,
+                                          selOp.getResult());
+        } else {
+          auto getFnTy =
+              FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+          auto getFn = getOrCreateExternFunc("circt_sv_class_get_i32", getFnTy);
+          if (!getFn)
+            return {};
+          auto setFnTy = FunctionType::get(context.getContext(),
+                                           {i32Ty, i32Ty, i32Ty}, {});
+          auto setFn = getOrCreateExternFunc("circt_sv_class_set_i32", setFnTy);
+          if (!setFn)
+            return {};
+
+          Value oldVal = mlir::func::CallOp::create(
+                             builder, loc, getFn,
+                             ValueRange{outClassHandle, outClassFieldId})
+                             .getResult(0);
+          oldVal = context.materializeConversion(outElemTy, oldVal,
+                                                 outClassFieldSigned, loc);
+          if (!oldVal)
+            return {};
+          Value newVal = context.materializeConversion(outElemTy, value32,
+                                                       /*isSigned=*/false, loc);
+          if (!newVal)
+            return {};
+          auto selOp =
+              moore::ConditionalOp::create(builder, loc, outElemTy, okBit);
+          Block &trueBlock = selOp.getTrueRegion().emplaceBlock();
+          Block &falseBlock = selOp.getFalseRegion().emplaceBlock();
+          {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(&trueBlock);
+            moore::YieldOp::create(builder, loc, newVal);
+            builder.setInsertionPointToStart(&falseBlock);
+            moore::YieldOp::create(builder, loc, oldVal);
+          }
+          Value selected = context.materializeConversion(
+              i32Ty, selOp.getResult(), outClassFieldSigned, loc);
+          if (!selected)
+            return {};
+          builder.create<mlir::func::CallOp>(
+              loc, setFn,
+              ValueRange{outClassHandle, outClassFieldId, selected});
+        }
+
+        Value okCond = moore::ToBuiltinBoolOp::create(builder, loc, okBit);
+        mlir::cf::CondBranchOp::create(builder, loc, okCond, &contBlock,
+                                       ValueRange{}, &waitBlock, ValueRange{});
+
+        builder.setInsertionPointToStart(&waitBlock);
+        Value zeroDelay = moore::ConstantTimeOp::create(builder, loc, 0);
+        moore::WaitDelayOp::create(builder, loc, zeroDelay);
+        mlir::cf::BranchOp::create(builder, loc, &condBlock);
+
+        builder.setInsertionPointToStart(&contBlock);
         return makeVoidValue();
       }
 
@@ -4574,6 +5614,288 @@ struct RvalueExprVisitor : public ExprVisitor {
     if (auto lowered = maybeLowerUvmShim())
       return lowered;
 
+    // SystemVerilog mailbox support.
+    auto maybeLowerMailboxBuiltin = [&]() -> Value {
+      const auto *parentScope = subroutine->getParentScope();
+      if (!parentScope)
+        return {};
+      const auto *parentClass = parentScope->asSymbol().as_if<slang::ast::ClassType>();
+      if (!parentClass || parentClass->name != "mailbox")
+        return {};
+
+      auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                       moore::Domain::TwoValued);
+      Value handle;
+      if (auto *thisExpr = expr.thisClass()) {
+        handle = context.convertRvalueExpression(*thisExpr);
+        if (!handle)
+          return {};
+        handle = context.materializeConversion(i32Ty, handle, /*isSigned=*/false,
+                                               loc);
+        if (!handle)
+          return {};
+      } else {
+        mlir::emitError(loc, "unsupported mailbox call without explicit receiver");
+        return {};
+      }
+
+      auto args = expr.arguments();
+
+      if (subroutine->name == "num") {
+        if (!args.empty()) {
+          mlir::emitError(loc, "unsupported mailbox.num arity: expected 0 argument(s)");
+          return {};
+        }
+        auto resultType = context.convertType(*expr.type);
+        if (!resultType)
+          return {};
+        auto fnType = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto fn = getOrCreateExternFunc("circt_sv_mailbox_num_i32", fnType);
+        if (!fn)
+          return {};
+        Value res =
+            mlir::func::CallOp::create(builder, loc, fn, {handle}).getResult(0);
+        if (res.getType() != resultType) {
+          res = context.materializeConversion(resultType, res,
+                                              expr.type->isSigned(), loc);
+          if (!res)
+            return {};
+        }
+        return res;
+      }
+
+      if (subroutine->name == "try_put") {
+        if (args.size() != 1) {
+          mlir::emitError(loc, "unsupported mailbox.try_put arity: expected 1 argument(s)");
+          return {};
+        }
+        Value value = context.convertRvalueExpression(*args[0]);
+        if (!value)
+          return {};
+        value =
+            context.materializeConversion(i32Ty, value, /*isSigned=*/false, loc);
+        if (!value)
+          return {};
+        auto fnType =
+            FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+        auto fn = getOrCreateExternFunc("circt_sv_mailbox_try_put_i32", fnType);
+        if (!fn)
+          return {};
+        Value ok =
+            mlir::func::CallOp::create(builder, loc, fn, {handle, value})
+                .getResult(0);
+        auto resultType = context.convertType(*expr.type);
+        if (!resultType)
+          return {};
+        if (ok.getType() != resultType) {
+          ok = context.materializeConversion(resultType, ok,
+                                             expr.type->isSigned(), loc);
+          if (!ok)
+            return {};
+        }
+        return ok;
+      }
+
+      auto i64Ty = moore::IntType::get(context.getContext(), /*width=*/64,
+                                       moore::Domain::TwoValued);
+      auto i1Ty = moore::IntType::get(context.getContext(), /*width=*/1,
+                                      moore::Domain::TwoValued);
+
+      auto lowerMailboxTryGetLike =
+          [&](StringRef fnName) -> std::pair<Value, Value> {
+        auto fnType = FunctionType::get(context.getContext(), {i32Ty}, {i64Ty});
+        auto fn = getOrCreateExternFunc(fnName, fnType);
+        if (!fn)
+          return {Value{}, Value{}};
+        Value packed =
+            mlir::func::CallOp::create(builder, loc, fn, {handle}).getResult(0);
+        Value value = moore::ExtractOp::create(builder, loc, i32Ty, packed, 0);
+        Value okBit = moore::ExtractOp::create(builder, loc, i1Ty, packed, 32);
+        return {okBit, value};
+      };
+
+      if (subroutine->name == "try_get" || subroutine->name == "try_peek") {
+        if (args.size() != 1) {
+          mlir::emitError(loc, "unsupported mailbox.") << subroutine->name
+                                                      << " arity: expected 1 argument(s)";
+          return {};
+        }
+
+        Value outRef = context.convertLvalueExpression(*args[0]);
+        if (!outRef)
+          return {};
+        auto outRefTy = dyn_cast<moore::RefType>(outRef.getType());
+        if (!outRefTy) {
+          mlir::emitError(loc, "unsupported mailbox output argument type: ")
+              << outRef.getType();
+          return {};
+        }
+        Type outElemTy = outRefTy.getNestedType();
+
+        Value oldVal = moore::ReadOp::create(builder, loc, outRef);
+        if (oldVal.getType() != outElemTy) {
+          oldVal = context.materializeConversion(outElemTy, oldVal,
+                                                 expr.type->isSigned(), loc);
+          if (!oldVal)
+            return {};
+        }
+
+        auto [okBit, value32] = lowerMailboxTryGetLike(
+            subroutine->name == "try_get" ? "circt_sv_mailbox_try_get_i32"
+                                          : "circt_sv_mailbox_try_peek_i32");
+        if (!okBit || !value32)
+          return {};
+        Value value =
+            context.materializeConversion(outElemTy, value32,
+                                          /*isSigned=*/false, loc);
+        if (!value)
+          return {};
+
+        auto selOp = moore::ConditionalOp::create(builder, loc, outElemTy, okBit);
+        Block &trueBlock = selOp.getTrueRegion().emplaceBlock();
+        Block &falseBlock = selOp.getFalseRegion().emplaceBlock();
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(&trueBlock);
+          moore::YieldOp::create(builder, loc, value);
+          builder.setInsertionPointToStart(&falseBlock);
+          moore::YieldOp::create(builder, loc, oldVal);
+        }
+        moore::BlockingAssignOp::create(builder, loc, outRef, selOp.getResult());
+
+        auto resultType = context.convertType(*expr.type);
+        if (!resultType)
+          return {};
+        Value ok = okBit;
+        if (ok.getType() != resultType) {
+          ok = context.materializeConversion(resultType, ok,
+                                             expr.type->isSigned(), loc);
+          if (!ok)
+            return {};
+        }
+        return ok;
+      }
+
+      auto emitMailboxWaitOnChange = [&]() -> LogicalResult {
+        auto waitOp = moore::WaitEventOp::create(builder, loc);
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
+        auto fnType = FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+        auto fn = getOrCreateExternFunc("circt_sv_mailbox_num_i32", fnType);
+        if (!fn)
+          return failure();
+        Value num =
+            mlir::func::CallOp::create(builder, loc, fn, {handle}).getResult(0);
+        moore::DetectEventOp::create(builder, loc, moore::Edge::AnyChange, num,
+                                     Value{});
+        return success();
+      };
+
+      auto lowerBlockingPutGetPeek = [&](StringRef kind) -> Value {
+        if (args.size() != 1) {
+          mlir::emitError(loc, "unsupported mailbox.") << kind
+                                                      << " arity: expected 1 argument(s)";
+          return {};
+        }
+
+        Region *region = builder.getBlock()->getParent();
+        if (!region) {
+          mlir::emitError(loc, "missing region for mailbox lowering");
+          return {};
+        }
+
+        Block &condBlock = region->emplaceBlock();
+        Block &waitBlock = region->emplaceBlock();
+        Block &contBlock = region->emplaceBlock();
+
+        if (kind == "put") {
+          Value value = context.convertRvalueExpression(*args[0]);
+          if (!value)
+            return {};
+          value = context.materializeConversion(i32Ty, value, /*isSigned=*/false,
+                                                loc);
+          if (!value)
+            return {};
+
+          auto tryPutFnTy =
+              FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+          auto tryPutFn =
+              getOrCreateExternFunc("circt_sv_mailbox_try_put_i32", tryPutFnTy);
+          if (!tryPutFn)
+            return {};
+          Value zero = moore::ConstantOp::create(builder, loc, i32Ty, /*value=*/0,
+                                                /*isSigned=*/true);
+
+          mlir::cf::BranchOp::create(builder, loc, &condBlock);
+
+          builder.setInsertionPointToStart(&condBlock);
+          Value ok =
+              mlir::func::CallOp::create(builder, loc, tryPutFn, {handle, value})
+                  .getResult(0);
+          Value okNe = moore::NeOp::create(builder, loc, ok, zero);
+          Value okCond = moore::ToBuiltinBoolOp::create(builder, loc, okNe);
+          mlir::cf::CondBranchOp::create(builder, loc, okCond, &contBlock,
+                                         ValueRange{}, &waitBlock, ValueRange{});
+
+          builder.setInsertionPointToStart(&waitBlock);
+          if (failed(emitMailboxWaitOnChange()))
+            return {};
+          mlir::cf::BranchOp::create(builder, loc, &condBlock);
+
+          builder.setInsertionPointToStart(&contBlock);
+          return makeVoidValue();
+        }
+
+        Value outRef = context.convertLvalueExpression(*args[0]);
+        if (!outRef)
+          return {};
+        auto outRefTy = dyn_cast<moore::RefType>(outRef.getType());
+        if (!outRefTy) {
+          mlir::emitError(loc, "unsupported mailbox output argument type: ")
+              << outRef.getType();
+          return {};
+        }
+        Type outElemTy = outRefTy.getNestedType();
+
+        mlir::cf::BranchOp::create(builder, loc, &condBlock);
+
+        builder.setInsertionPointToStart(&condBlock);
+        auto [okBit, value32] = lowerMailboxTryGetLike(
+            kind == "get" ? "circt_sv_mailbox_try_get_i32"
+                          : "circt_sv_mailbox_try_peek_i32");
+        if (!okBit || !value32)
+          return {};
+        Value okCond = moore::ToBuiltinBoolOp::create(builder, loc, okBit);
+        Value value = context.materializeConversion(outElemTy, value32,
+                                                    /*isSigned=*/false, loc);
+        if (!value)
+          return {};
+        moore::BlockingAssignOp::create(builder, loc, outRef, value);
+        mlir::cf::CondBranchOp::create(builder, loc, okCond, &contBlock,
+                                       ValueRange{}, &waitBlock, ValueRange{});
+
+        builder.setInsertionPointToStart(&waitBlock);
+        if (failed(emitMailboxWaitOnChange()))
+          return {};
+        mlir::cf::BranchOp::create(builder, loc, &condBlock);
+
+        builder.setInsertionPointToStart(&contBlock);
+        return makeVoidValue();
+      };
+
+      if (subroutine->name == "put")
+        return lowerBlockingPutGetPeek("put");
+      if (subroutine->name == "get")
+        return lowerBlockingPutGetPeek("get");
+      if (subroutine->name == "peek")
+        return lowerBlockingPutGetPeek("peek");
+
+      return {};
+    };
+
+    if (auto lowered = maybeLowerMailboxBuiltin())
+      return lowered;
+
     // Random seed/state controls used by UVM and randomization tests.
     //
     // Depending on how Slang resolves these built-ins, they can appear as
@@ -4633,13 +5955,18 @@ struct RvalueExprVisitor : public ExprVisitor {
       if (!baseClass)
         return baseFn;
 
-      // Collect override implementations for known derived classes.
-      SmallVector<std::pair<int32_t, mlir::func::FuncOp>> overrides;
-      for (auto [cls, classId] : context.classIds) {
-        const slang::ast::ClassType *cur = cls;
-        bool derived = false;
-        while (cur) {
-          if (cur == baseClass) {
+	      // Collect override implementations for known derived classes.
+	      SmallVector<std::pair<int32_t, mlir::func::FuncOp>> overrides;
+	      SmallVector<std::pair<const slang::ast::ClassType *, int32_t>>
+	          classIdSnapshot;
+	      classIdSnapshot.reserve(context.classIds.size());
+	      for (auto &entry : context.classIds)
+	        classIdSnapshot.push_back({entry.first, entry.second});
+	      for (auto [cls, classId] : classIdSnapshot) {
+	        const slang::ast::ClassType *cur = cls;
+	        bool derived = false;
+	        while (cur) {
+	          if (cur == baseClass) {
             derived = true;
             break;
           }

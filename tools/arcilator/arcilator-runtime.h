@@ -1389,6 +1389,32 @@ extern "C" void circt_sv_set_randstate_str(const char *state) {
 }
 
 //===----------------------------------------------------------------------===//
+// SV `process` random-state helpers
+//===----------------------------------------------------------------------===//
+
+// CIRCT's lowering currently emits calls to symbols named
+// `std::process::{self,get_randstate,set_randstate}`.
+//
+// Provide minimal implementations backed by the global RNG state. This is
+// sufficient for sv-tests' random stability suites, which use get/set_randstate
+// to snapshot and restore `$urandom` state.
+extern "C" int32_t circt_sv_process_self() __asm__("std::process::self");
+extern "C" int32_t circt_sv_process_self() { return 1; }
+
+extern "C" const char *
+circt_sv_process_get_randstate() __asm__("std::process::get_randstate");
+extern "C" const char *circt_sv_process_get_randstate() {
+  return circt_sv_get_randstate_str();
+}
+
+extern "C" void
+circt_sv_process_set_randstate(const char *state) __asm__(
+    "std::process::set_randstate");
+extern "C" void circt_sv_process_set_randstate(const char *state) {
+  circt_sv_set_randstate_str(state);
+}
+
+//===----------------------------------------------------------------------===//
 // Minimal SV class runtime shims
 //===----------------------------------------------------------------------===//
 
@@ -1447,9 +1473,31 @@ extern "C" const char *circt_sv_class_get_str(int32_t handle, int32_t fieldId) {
 extern "C" void circt_sv_class_set_i32(int32_t handle, int32_t fieldId,
                                        int32_t value) {
   auto it = circt_sv_class_objects.find(handle);
-  if (it == circt_sv_class_objects.end())
+  int32_t oldValue = 0;
+  if (it == circt_sv_class_objects.end()) {
     it = circt_sv_class_objects.emplace(handle, CirctSvClassObject{}).first;
+  } else {
+    auto jt = it->second.i32Fields.find(fieldId);
+    if (jt != it->second.i32Fields.end())
+      oldValue = jt->second;
+  }
   it->second.i32Fields[fieldId] = value;
+  static bool traceEnabled = []() {
+    const char *val = std::getenv("CIRCT_SV_TRACE_CLASS_SET_I32");
+    if (!val)
+      return false;
+    while (*val == ' ' || *val == '\t')
+      ++val;
+    if (!*val)
+      return false;
+    if ((val[0] == '0' && val[1] == '\0') || (val[0] == 'n' || val[0] == 'N') ||
+        (val[0] == 'f' || val[0] == 'F') || (val[0] == 'o' || val[0] == 'O'))
+      return false;
+    return true;
+  }();
+  if (traceEnabled && oldValue != value)
+    std::fprintf(stderr, "[circt-sv] class_set_i32 h=%d field=%d %d->%d\n",
+                 handle, fieldId, oldValue, value);
 }
 
 extern "C" void circt_sv_class_set_str(int32_t handle, int32_t fieldId,
@@ -1492,6 +1540,11 @@ static int32_t circt_sv_alloc_handle() {
 
 static std::unordered_map<int32_t, std::vector<int32_t>> circt_sv_dynarrays_i32;
 static std::unordered_map<int32_t, std::deque<int32_t>> circt_sv_queues_i32;
+struct CirctSvMailboxI32 {
+  int32_t capacity = 0; // 0 means unbounded.
+  std::deque<int32_t> items;
+};
+static std::unordered_map<int32_t, CirctSvMailboxI32> circt_sv_mailboxes_i32;
 static std::unordered_map<int32_t, std::unordered_map<std::string, int32_t>>
     circt_sv_assoc_str_i32;
 
@@ -1581,6 +1634,56 @@ extern "C" int32_t circt_sv_queue_pop_back_i32(int32_t handle) {
   return value;
 }
 
+extern "C" int32_t circt_sv_mailbox_alloc_i32(int32_t size) {
+  if (size < 0)
+    size = 0;
+  int32_t handle = circt_sv_alloc_handle();
+  circt_sv_mailboxes_i32.emplace(handle, CirctSvMailboxI32{size, {}});
+  return handle;
+}
+
+extern "C" int32_t circt_sv_mailbox_num_i32(int32_t handle) {
+  auto it = circt_sv_mailboxes_i32.find(handle);
+  if (it == circt_sv_mailboxes_i32.end())
+    return 0;
+  return static_cast<int32_t>(it->second.items.size());
+}
+
+extern "C" int32_t circt_sv_mailbox_try_put_i32(int32_t handle, int32_t value) {
+  auto it = circt_sv_mailboxes_i32.find(handle);
+  if (it == circt_sv_mailboxes_i32.end())
+    return 0;
+  if (it->second.capacity != 0 &&
+      static_cast<int32_t>(it->second.items.size()) >= it->second.capacity)
+    return 0;
+  it->second.items.push_back(value);
+  return 1;
+}
+
+static uint64_t circt_sv_mailbox_pack_try_result(bool ok, int32_t value) {
+  uint64_t packed = static_cast<uint32_t>(value);
+  if (ok)
+    packed |= (1ull << 32);
+  return packed;
+}
+
+extern "C" uint64_t circt_sv_mailbox_try_get_i32(int32_t handle) {
+  auto it = circt_sv_mailboxes_i32.find(handle);
+  if (it == circt_sv_mailboxes_i32.end() || it->second.items.empty())
+    return circt_sv_mailbox_pack_try_result(false, 0);
+  int32_t value = it->second.items.front();
+  it->second.items.pop_front();
+  return circt_sv_mailbox_pack_try_result(true, value);
+}
+
+extern "C" uint64_t circt_sv_mailbox_try_peek_i32(int32_t handle) {
+  auto it = circt_sv_mailboxes_i32.find(handle);
+  if (it == circt_sv_mailboxes_i32.end() || it->second.items.empty())
+    return circt_sv_mailbox_pack_try_result(false, 0);
+  int32_t value = it->second.items.front();
+  return circt_sv_mailbox_pack_try_result(true, value);
+}
+
 extern "C" int32_t circt_sv_assoc_alloc_str_i32() {
   int32_t handle = circt_sv_alloc_handle();
   circt_sv_assoc_str_i32.emplace(handle,
@@ -1640,9 +1743,22 @@ static bool circt_uvm_shims_enabled() {
   return enabled;
 }
 
+static bool circt_uvm_trace_objections_enabled() {
+  static bool enabled =
+      circt_env_truthy("CIRCT_UVM_TRACE_OBJECTIONS", /*defaultValue=*/false);
+  return enabled;
+}
+
+static bool circt_uvm_trace_ports_enabled() {
+  static bool enabled =
+      circt_env_truthy("CIRCT_UVM_TRACE_PORTS", /*defaultValue=*/false);
+  return enabled;
+}
+
 static bool circt_uvm_phase_all_done_state = false;
 static bool circt_uvm_test_done_requested = false;
 static int64_t circt_uvm_objection_count = 0;
+static bool circt_uvm_phases_ready_state = false;
 
 static void circt_uvm_update_phase_all_done_state() {
   if (!circt_uvm_shims_enabled())
@@ -1658,7 +1774,13 @@ static std::unordered_set<int32_t> circt_uvm_component_seen;
 static std::unordered_map<int32_t, int32_t> circt_uvm_component_parent;
 static std::unordered_map<int32_t, std::vector<int32_t>>
     circt_uvm_port_connections;
+static std::unordered_map<int32_t, std::vector<int32_t>>
+    circt_uvm_port_connections_flat_cache;
 static std::unordered_map<int32_t, int32_t> circt_uvm_analysis_imp_impl;
+static std::unordered_map<int32_t, int32_t> circt_uvm_sequencer_export;
+static std::unordered_map<int32_t, int32_t> circt_uvm_sequencer_seq_item_mbox;
+static std::unordered_map<int32_t, int32_t> circt_uvm_export_seq_item_mbox;
+static std::unordered_map<int32_t, int32_t> circt_uvm_sequence_seq_item_mbox;
 
 static std::string circt_uvm_resource_db_key(const char *scope, const char *name) {
   std::string key;
@@ -1697,6 +1819,18 @@ extern "C" void circt_uvm_root_run_test(int32_t root, const char *test_name) {
   circt_uvm_update_phase_all_done_state();
 }
 
+extern "C" void circt_uvm_set_phases_ready(int32_t ready) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  circt_uvm_phases_ready_state = ready != 0;
+}
+
+extern "C" int32_t circt_uvm_phases_ready() {
+  if (!circt_uvm_shims_enabled())
+    return 0;
+  return circt_uvm_phases_ready_state ? 1 : 0;
+}
+
 extern "C" void circt_uvm_raise_objection(int32_t comp) {
   (void)comp;
   if (!circt_uvm_shims_enabled())
@@ -1704,6 +1838,9 @@ extern "C" void circt_uvm_raise_objection(int32_t comp) {
   if (circt_uvm_objection_count < INT64_MAX)
     ++circt_uvm_objection_count;
   circt_uvm_update_phase_all_done_state();
+  if (circt_uvm_trace_objections_enabled())
+    std::fprintf(stderr, "[circt-uvm] raise_objection count=%lld\n",
+                 static_cast<long long>(circt_uvm_objection_count));
 }
 
 extern "C" void circt_uvm_drop_objection(int32_t comp) {
@@ -1713,6 +1850,9 @@ extern "C" void circt_uvm_drop_objection(int32_t comp) {
   if (circt_uvm_objection_count > 0)
     --circt_uvm_objection_count;
   circt_uvm_update_phase_all_done_state();
+  if (circt_uvm_trace_objections_enabled())
+    std::fprintf(stderr, "[circt-uvm] drop_objection count=%lld\n",
+                 static_cast<long long>(circt_uvm_objection_count));
 }
 
 extern "C" void circt_uvm_resource_db_set(const char *scope, const char *name,
@@ -1784,25 +1924,145 @@ extern "C" void circt_uvm_port_connect(int32_t port, int32_t provider) {
   if (port == 0 || provider == 0)
     return;
   circt_uvm_port_connections[port].push_back(provider);
+  circt_uvm_port_connections_flat_cache.clear();
+  if (circt_uvm_trace_ports_enabled())
+    std::fprintf(stderr, "[circt-uvm] port_connect port=%d provider=%d\n", port,
+                 provider);
+}
+
+static const std::vector<int32_t> &
+circt_uvm_flatten_port_connections(int32_t port) {
+  auto it = circt_uvm_port_connections_flat_cache.find(port);
+  if (it != circt_uvm_port_connections_flat_cache.end())
+    return it->second;
+
+  std::vector<int32_t> flat;
+  std::unordered_set<int32_t> visited;
+  visited.insert(port);
+
+  std::vector<int32_t> worklist;
+  auto rootIt = circt_uvm_port_connections.find(port);
+  if (rootIt != circt_uvm_port_connections.end())
+    worklist.insert(worklist.end(), rootIt->second.begin(), rootIt->second.end());
+
+  while (!worklist.empty()) {
+    int32_t cur = worklist.back();
+    worklist.pop_back();
+    if (cur == 0)
+      continue;
+
+    auto connIt = circt_uvm_port_connections.find(cur);
+    if (connIt == circt_uvm_port_connections.end()) {
+      flat.push_back(cur);
+      continue;
+    }
+
+    if (!visited.insert(cur).second)
+      continue;
+    worklist.insert(worklist.end(), connIt->second.begin(), connIt->second.end());
+  }
+
+  auto ins = circt_uvm_port_connections_flat_cache.emplace(port, std::move(flat));
+  return ins.first->second;
 }
 
 extern "C" int32_t circt_uvm_port_conn_count(int32_t port) {
-  auto it = circt_uvm_port_connections.find(port);
-  if (it == circt_uvm_port_connections.end())
-    return 0;
-  return static_cast<int32_t>(it->second.size());
+  int32_t count =
+      static_cast<int32_t>(circt_uvm_flatten_port_connections(port).size());
+  if (circt_uvm_trace_ports_enabled())
+    std::fprintf(stderr, "[circt-uvm] port_conn_count port=%d count=%d\n", port,
+                 count);
+  return count;
 }
 
 extern "C" int32_t circt_uvm_port_conn_get(int32_t port, int32_t idx) {
-  auto it = circt_uvm_port_connections.find(port);
-  if (it == circt_uvm_port_connections.end())
-    return 0;
   if (idx < 0)
     return 0;
   size_t pos = static_cast<size_t>(idx);
-  if (pos >= it->second.size())
+  const auto &flat = circt_uvm_flatten_port_connections(port);
+  if (pos >= flat.size())
     return 0;
-  return it->second[pos];
+  int32_t provider = flat[pos];
+  if (circt_uvm_trace_ports_enabled())
+    std::fprintf(stderr, "[circt-uvm] port_conn_get port=%d idx=%d provider=%d\n",
+                 port, idx, provider);
+  return provider;
+}
+
+extern "C" int32_t circt_uvm_export_get_seq_item_mbox(int32_t exportHandle) {
+  if (!circt_uvm_shims_enabled())
+    return 0;
+  if (exportHandle == 0)
+    return 0;
+  auto it = circt_uvm_export_seq_item_mbox.find(exportHandle);
+  if (it != circt_uvm_export_seq_item_mbox.end())
+    return it->second;
+  int32_t mbox = circt_sv_mailbox_alloc_i32(/*size=*/0);
+  circt_uvm_export_seq_item_mbox[exportHandle] = mbox;
+  return mbox;
+}
+
+extern "C" int32_t circt_uvm_sequencer_get_seq_item_mbox(int32_t sequencer) {
+  if (!circt_uvm_shims_enabled())
+    return 0;
+  if (sequencer == 0)
+    return 0;
+
+  auto it = circt_uvm_sequencer_export.find(sequencer);
+  if (it != circt_uvm_sequencer_export.end())
+    return circt_uvm_export_get_seq_item_mbox(it->second);
+
+  auto jt = circt_uvm_sequencer_seq_item_mbox.find(sequencer);
+  if (jt != circt_uvm_sequencer_seq_item_mbox.end())
+    return jt->second;
+
+  int32_t mbox = circt_sv_mailbox_alloc_i32(/*size=*/0);
+  circt_uvm_sequencer_seq_item_mbox[sequencer] = mbox;
+  return mbox;
+}
+
+extern "C" void circt_uvm_bind_sequencer_export(int32_t sequencer,
+                                                int32_t exportHandle) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (sequencer == 0 || exportHandle == 0)
+    return;
+
+  circt_uvm_sequencer_export[sequencer] = exportHandle;
+
+  // If the sequencer mailbox was created before we observed the export
+  // connection, reuse it for the export so both endpoints agree.
+  auto seqIt = circt_uvm_sequencer_seq_item_mbox.find(sequencer);
+  if (seqIt == circt_uvm_sequencer_seq_item_mbox.end())
+    return;
+
+  auto expIt = circt_uvm_export_seq_item_mbox.find(exportHandle);
+  if (expIt == circt_uvm_export_seq_item_mbox.end()) {
+    circt_uvm_export_seq_item_mbox[exportHandle] = seqIt->second;
+    return;
+  }
+  if (expIt->second != seqIt->second)
+    circt_uvm_sequencer_seq_item_mbox[sequencer] = expIt->second;
+}
+
+extern "C" void circt_uvm_sequence_set_seq_item_mbox(int32_t seq,
+                                                     int32_t mbox) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (seq == 0)
+    return;
+  circt_uvm_sequence_seq_item_mbox[seq] = mbox;
+}
+
+extern "C" int32_t circt_uvm_sequence_get_seq_item_mbox(int32_t seq) {
+  if (!circt_uvm_shims_enabled())
+    return 0;
+  if (seq == 0)
+    return 0;
+  auto it = circt_uvm_sequence_seq_item_mbox.find(seq);
+  if (it == circt_uvm_sequence_seq_item_mbox.end())
+    return 0;
+  return it->second;
 }
 
 extern "C" void circt_uvm_analysis_imp_set_impl(int32_t imp, int32_t impl) {
@@ -1811,13 +2071,31 @@ extern "C" void circt_uvm_analysis_imp_set_impl(int32_t imp, int32_t impl) {
   if (imp == 0)
     return;
   circt_uvm_analysis_imp_impl[imp] = impl;
+  if (circt_uvm_trace_ports_enabled())
+    std::fprintf(stderr, "[circt-uvm] analysis_imp_set_impl imp=%d impl=%d\n",
+                 imp, impl);
 }
 
 extern "C" int32_t circt_uvm_analysis_imp_get_impl(int32_t imp) {
-  auto it = circt_uvm_analysis_imp_impl.find(imp);
-  if (it == circt_uvm_analysis_imp_impl.end())
+  if (imp == 0)
     return 0;
-  return it->second;
+  auto it = circt_uvm_analysis_imp_impl.find(imp);
+  if (it != circt_uvm_analysis_imp_impl.end()) {
+    if (circt_uvm_trace_ports_enabled())
+      std::fprintf(stderr, "[circt-uvm] analysis_imp_get_impl imp=%d impl=%d\n",
+                   imp, it->second);
+    return it->second;
+  }
+
+  // Lowered UVM analysis_imps in Moore currently store their implementation
+  // object handle in a well-known integer field (set by uvm_analysis_imp::new).
+  // Fall back to reading it from the class field database so analysis port
+  // dispatch works without requiring explicit runtime registration.
+  int32_t impl = circt_sv_class_get_i32(imp, /*fieldId=*/8);
+  if (circt_uvm_trace_ports_enabled())
+    std::fprintf(stderr, "[circt-uvm] analysis_imp_get_impl imp=%d impl=%d\n",
+                 imp, impl);
+  return impl;
 }
 
 extern "C" int32_t circt_uvm_report_server_get_server() { return 1; }
@@ -1833,4 +2111,20 @@ extern "C" int32_t circt_uvm_get_severity_count(int32_t severity) {
 
 extern "C" bool circt_uvm_phase_all_done() {
   return circt_uvm_phase_all_done_state;
+}
+
+extern "C" void circt_uvm_sequence_base_start(int32_t seq, int32_t sequencer,
+                                              int32_t parent_sequence,
+                                              int32_t this_priority,
+                                              bool call_pre_post)
+    __asm__("uvm_pkg::uvm_sequence_base::start");
+
+extern "C" __attribute__((weak)) void circt_uvm_sequence_base_start(
+    int32_t seq, int32_t sequencer, int32_t parent_sequence, int32_t this_priority,
+    bool call_pre_post) {
+  (void)seq;
+  (void)sequencer;
+  (void)parent_sequence;
+  (void)this_priority;
+  (void)call_pre_post;
 }

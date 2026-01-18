@@ -1226,9 +1226,9 @@ LogicalResult Context::finalizeUvmShims() {
   if (!intoModuleOp.lookupSymbol<mlir::func::FuncOp>("circt_uvm_run_all_phases"))
     return success();
 
-  auto rebuildPhaseDispatch = [&](StringRef methodName,
-                                  StringRef fnName) -> LogicalResult {
-    Location loc = UnknownLoc::get(getContext());
+	  auto rebuildPhaseDispatch = [&](StringRef methodName,
+	                                  StringRef fnName) -> LogicalResult {
+	    Location loc = UnknownLoc::get(getContext());
 
     mlir::func::FuncOp dispatchFn =
         intoModuleOp.lookupSymbol<mlir::func::FuncOp>(fnName);
@@ -1249,12 +1249,18 @@ LogicalResult Context::finalizeUvmShims() {
     if (fnTy.getNumInputs() < 1)
       return success();
 
-    SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
-    for (auto [cls, classId] : classIds) {
-      if (!cls)
-        continue;
-      llvm::StringRef clsName(cls->name.data(), cls->name.size());
-      if (clsName.starts_with("uvm_"))
+	    SmallVector<std::pair<const slang::ast::ClassType *, int32_t>>
+	        classIdSnapshot;
+	    classIdSnapshot.reserve(classIds.size());
+	    for (auto &entry : classIds)
+	      classIdSnapshot.push_back({entry.first, entry.second});
+
+	    SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+	    for (auto [cls, classId] : classIdSnapshot) {
+	      if (!cls)
+	        continue;
+	      llvm::StringRef clsName(cls->name.data(), cls->name.size());
+	      if (clsName.starts_with("uvm_"))
         continue;
       const slang::ast::SubroutineSymbol *impl = nullptr;
       for (auto &method : cls->membersOfType<slang::ast::SubroutineSymbol>()) {
@@ -1362,6 +1368,243 @@ LogicalResult Context::finalizeUvmShims() {
   if (failed(
           rebuildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase")))
     return failure();
+
+  // Rebuild the minimal analysis-port dispatch shim used by the UVM bring-up
+  // runtime. The `uvm_analysis_port::write` lowering can be encountered before
+  // we've assigned IDs / converted all user classes (e.g. monitors defined
+  // before scoreboards). In that case, the initial dispatch stub may be empty
+  // and later writes become no-ops.
+  if (intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+          "__circt_uvm_analysis_port_write") ||
+      intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+          "__circt_uvm_dispatch_analysis_write")) {
+    auto i32Ty = moore::IntType::get(getContext(), /*width=*/32,
+                                     moore::Domain::TwoValued);
+    auto fnTy = FunctionType::get(getContext(), {i32Ty, i32Ty}, {});
+
+    int32_t analysisImpId = 0;
+    for (auto [cls, classId] : classIds) {
+      if (!cls)
+        continue;
+      llvm::StringRef clsName(cls->name.data(), cls->name.size());
+      if (clsName == "uvm_analysis_imp") {
+        analysisImpId = classId;
+        break;
+      }
+    }
+
+	    auto rebuildAnalysisDispatch = [&]() -> LogicalResult {
+	      Location loc = UnknownLoc::get(getContext());
+
+	      mlir::func::FuncOp dispatchFn =
+	          intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+	              "__circt_uvm_dispatch_analysis_write");
+	      if (!dispatchFn) {
+	        OpBuilder::InsertionGuard g(builder);
+	        builder.setInsertionPointToStart(intoModuleOp.getBody());
+	        getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+	        dispatchFn = mlir::func::FuncOp::create(
+	            builder, loc, "__circt_uvm_dispatch_analysis_write", fnTy);
+	        dispatchFn.setPrivate();
+	        symbolTable.insert(dispatchFn);
+	      }
+
+	      // Avoid deleting existing blocks: the initial dispatch stub may already
+	      // contain a CFG, and wiping it here can invalidate in-flight builder
+	      // state. Instead, overwrite the entry terminator to jump to a freshly
+	      // built dispatcher, leaving the old blocks unreachable.
+	      Block *entry = dispatchFn.getBody().empty()
+	                         ? &dispatchFn.getBody().emplaceBlock()
+	                         : &dispatchFn.getBody().front();
+	      if (entry->getNumArguments() == 0)
+	        for (auto ty : fnTy.getInputs())
+	          entry->addArgument(ty, loc);
+
+	      OpBuilder b(getContext());
+	      // Drop the existing terminator (if any) so we can append the rebuilt
+	      // dispatcher logic to the entry block.
+	      if (auto *term = entry->getTerminator())
+	        term->erase();
+	      b.setInsertionPointToEnd(entry);
+
+	      Value thisArg = entry->getArgument(0);
+	      Value itemArg = entry->getArgument(1);
+
+	      auto getTypeFnTy = FunctionType::get(getContext(), {thisArg.getType()},
+	                                           {thisArg.getType()});
+	      auto getTypeFn = intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+          "circt_sv_class_get_type");
+      if (!getTypeFn || getTypeFn.getFunctionType() != getTypeFnTy) {
+        OpBuilder::InsertionGuard g(builder);
+        builder.setInsertionPointToStart(intoModuleOp.getBody());
+        getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+        getTypeFn = mlir::func::FuncOp::create(builder, loc,
+                                               "circt_sv_class_get_type",
+                                               getTypeFnTy);
+        getTypeFn.setPrivate();
+        symbolTable.insert(getTypeFn);
+      }
+      Value dynType =
+          mlir::func::CallOp::create(b, loc, getTypeFn, {thisArg}).getResult(0);
+
+      auto cmpTy = moore::IntType::get(
+          getContext(), /*width=*/32,
+          cast<moore::IntType>(dynType.getType()).getDomain());
+
+	      // Collect all `write` methods on user classes (non-UVM) that match the
+	      // expected lowered signature: (i32 this, i32 item) -> void.
+	      SmallVector<std::pair<const slang::ast::ClassType *, int32_t>>
+	          classIdSnapshot;
+	      classIdSnapshot.reserve(classIds.size());
+	      for (auto &entry : classIds)
+	        classIdSnapshot.push_back({entry.first, entry.second});
+
+	      SmallVector<std::pair<int32_t, mlir::func::FuncOp>> impls;
+	      for (auto [cls, classId] : classIdSnapshot) {
+	        if (!cls)
+	          continue;
+	        llvm::StringRef clsName(cls->name.data(), cls->name.size());
+	        if (clsName.starts_with("uvm_"))
+          continue;
+        const slang::ast::SubroutineSymbol *impl = nullptr;
+        for (auto &method : cls->membersOfType<slang::ast::SubroutineSymbol>()) {
+          if (llvm::StringRef(method.name.data(), method.name.size()) ==
+              "write") {
+            impl = &method;
+            break;
+          }
+        }
+        if (!impl)
+          continue;
+        if (failed(convertFunction(*impl)))
+          continue;
+        auto *implLowering = declareFunction(*impl);
+        if (!implLowering || !implLowering->op)
+          continue;
+        if (implLowering->op.getFunctionType() != fnTy)
+          continue;
+        impls.push_back({classId, implLowering->op});
+      }
+      llvm::sort(impls, [](const auto &a, const auto &b) {
+        return a.first < b.first;
+      });
+
+      mlir::func::FuncOp getImplFn;
+      if (analysisImpId != 0) {
+        auto getImplFnTy = FunctionType::get(getContext(), {i32Ty}, {i32Ty});
+        getImplFn = intoModuleOp.lookupSymbol<mlir::func::FuncOp>(
+            "circt_uvm_analysis_imp_get_impl");
+        if (!getImplFn || getImplFn.getFunctionType() != getImplFnTy) {
+          OpBuilder::InsertionGuard g(builder);
+          builder.setInsertionPointToStart(intoModuleOp.getBody());
+          getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+          getImplFn = mlir::func::FuncOp::create(builder, loc,
+                                                 "circt_uvm_analysis_imp_get_impl",
+                                                 getImplFnTy);
+          getImplFn.setPrivate();
+          symbolTable.insert(getImplFn);
+        }
+      }
+
+	      // Build a non-recursive dispatcher:
+	      // - If the callee is an analysis_imp, resolve its impl and dispatch based
+	      //   on the impl type.
+	      // - Otherwise, dispatch based on the callee type directly.
+
+      Block *impBlock = nullptr;
+      if (analysisImpId != 0)
+        impBlock = &dispatchFn.getBody().emplaceBlock();
+
+      SmallVector<Block *> checkBlocks;
+      SmallVector<Block *> caseBlocks;
+      checkBlocks.reserve(impls.size());
+      caseBlocks.reserve(impls.size());
+      for (size_t i = 0, e = impls.size(); i < e; ++i) {
+        Block *check = &dispatchFn.getBody().emplaceBlock();
+        check->addArgument(i32Ty, loc); // target
+        check->addArgument(cmpTy, loc); // dynType
+        checkBlocks.push_back(check);
+
+        Block *body = &dispatchFn.getBody().emplaceBlock();
+        body->addArgument(i32Ty, loc); // target
+        caseBlocks.push_back(body);
+      }
+
+      Block *defaultBlock = &dispatchFn.getBody().emplaceBlock();
+      b.setInsertionPointToStart(defaultBlock);
+      mlir::func::ReturnOp::create(b, loc);
+
+      auto branchToDispatch =
+          [&](OpBuilder &bb, Block *dest, Value target, Value type) {
+            if (!dest) {
+              mlir::cf::BranchOp::create(bb, loc, defaultBlock);
+              return;
+            }
+            mlir::cf::BranchOp::create(bb, loc, dest, ValueRange{target, type});
+          };
+
+	      b.setInsertionPointToEnd(entry);
+	      // Jump into the rebuilt dispatcher CFG.
+	      if (checkBlocks.empty()) {
+	        mlir::cf::BranchOp::create(b, loc, defaultBlock);
+	      } else if (analysisImpId != 0) {
+	        Value analysisIdVal =
+	            moore::ConstantOp::create(b, loc, cmpTy, analysisImpId,
+	                                     /*isSigned=*/true);
+	        Value eq = b.createOrFold<moore::EqOp>(loc, dynType, analysisIdVal);
+	        eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+	        Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+	        mlir::cf::CondBranchOp::create(b, loc, cond, impBlock, ValueRange{},
+	                                       checkBlocks.front(),
+	                                       ValueRange{thisArg, dynType});
+	      } else {
+	        mlir::cf::BranchOp::create(b, loc, checkBlocks.front(),
+	                                   ValueRange{thisArg, dynType});
+	      }
+
+	      if (analysisImpId != 0) {
+	        b.setInsertionPointToStart(impBlock);
+	        if (getImplFn) {
+          Value impl =
+              mlir::func::CallOp::create(b, loc, getImplFn, {thisArg}).getResult(0);
+          Value implType =
+              mlir::func::CallOp::create(b, loc, getTypeFn, {impl}).getResult(0);
+          branchToDispatch(b, checkBlocks.front(), impl, implType);
+        } else {
+          mlir::cf::BranchOp::create(b, loc, defaultBlock);
+        }
+      }
+
+      for (size_t i = 0, e = impls.size(); i < e; ++i) {
+        int32_t classId = impls[i].first;
+        mlir::func::FuncOp implFn = impls[i].second;
+        Block *next = (i + 1 < e) ? checkBlocks[i + 1] : defaultBlock;
+
+        b.setInsertionPointToStart(checkBlocks[i]);
+        Value target = checkBlocks[i]->getArgument(0);
+        Value targetType = checkBlocks[i]->getArgument(1);
+        Value classIdVal =
+            moore::ConstantOp::create(b, loc, cmpTy, classId, /*isSigned=*/true);
+        Value eq = b.createOrFold<moore::EqOp>(loc, targetType, classIdVal);
+        eq = b.createOrFold<moore::BoolCastOp>(loc, eq);
+        Value cond = moore::ToBuiltinBoolOp::create(b, loc, eq);
+        ValueRange nextArgs =
+            (next == defaultBlock) ? ValueRange{} : ValueRange{target, targetType};
+        mlir::cf::CondBranchOp::create(b, loc, cond, caseBlocks[i],
+                                       ValueRange{target}, next, nextArgs);
+
+        b.setInsertionPointToStart(caseBlocks[i]);
+        Value caseTarget = caseBlocks[i]->getArgument(0);
+        mlir::func::CallOp::create(b, loc, implFn, ValueRange{caseTarget, itemArg});
+        mlir::func::ReturnOp::create(b, loc);
+      }
+
+      return success();
+    };
+
+    if (failed(rebuildAnalysisDispatch()))
+      return failure();
+  }
   return success();
 }
 
