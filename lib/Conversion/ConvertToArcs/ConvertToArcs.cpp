@@ -594,6 +594,56 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
                                {rewriter.getI64Type()}));
 
+  // String frame hooks are inserted lazily with the exact string type used in
+  // the scheduler frame (to avoid type-alias mismatches).
+  Type frameStringTy;
+  auto ensureFrameStringFuncs = [&](Type ty) -> LogicalResult {
+    Type baseTy = ty;
+    while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+      baseTy = alias.getInnerType();
+    if (!isa<hw::StringType>(baseTy))
+      return success();
+
+    // These are module-global runtime hooks. If another scheduled process has
+    // already inserted them, require the same string type to avoid generating
+    // invalid IR (func.call operand/result types must match the callee type).
+    if (auto fn = module.lookupSymbol<mlir::func::FuncOp>(
+            "__arcilator_frame_store_str")) {
+      if (fn.getFunctionType().getNumInputs() != 3)
+        return execOp.emitOpError()
+               << "__arcilator_frame_store_str has unexpected signature";
+      Type existingTy = fn.getFunctionType().getInput(2);
+      if (existingTy != ty)
+        return execOp.emitOpError()
+               << "string frame type mismatch for __arcilator_frame_store_str ("
+               << existingTy << " vs " << ty << ")";
+      frameStringTy = existingTy;
+      return success();
+    }
+
+    if (frameStringTy && frameStringTy != ty)
+      return execOp.emitOpError()
+             << "cannot lower scheduled process with multiple distinct string "
+                "types ("
+             << frameStringTy << " vs " << ty << ")";
+    if (!frameStringTy) {
+      frameStringTy = ty;
+      OpBuilder builder(module.getBodyRegion());
+      builder.setInsertionPointToStart(module.getBody());
+      auto storeTy = rewriter.getFunctionType(
+          {rewriter.getI32Type(), rewriter.getI32Type(), frameStringTy}, {});
+      auto loadTy = rewriter.getFunctionType(
+          {rewriter.getI32Type(), rewriter.getI32Type()}, {frameStringTy});
+      auto fnStore = builder.create<mlir::func::FuncOp>(
+          module.getLoc(), "__arcilator_frame_store_str", storeTy);
+      fnStore.setPrivate();
+      auto fnLoad = builder.create<mlir::func::FuncOp>(
+          module.getLoc(), "__arcilator_frame_load_str", loadTy);
+      fnLoad.setPrivate();
+    }
+    return success();
+  };
+
   // Insert the dispatch block as the new entry. If the original entry block has
   // captured values as arguments, move those captures to the dispatch block so
   // they remain available when the scheduler jumps directly to a wait state.
@@ -624,9 +674,14 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
 
   // Helpers to pack/unpack values stored in the cycle-scheduler frame.
   auto canFrameType = [&](Type ty) -> bool {
-    if (isa<hw::InOutType>(ty))
+    Type baseTy = ty;
+    while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+      baseTy = alias.getInnerType();
+    if (isa<hw::InOutType>(baseTy))
       return false;
-    int64_t bw = hw::getBitWidth(ty);
+    if (isa<hw::StringType>(baseTy))
+      return true;
+    int64_t bw = hw::getBitWidth(baseTy);
     if (bw < 0 || bw > 64)
       return false;
     // Zero-width values (e.g. array indices for 1-element arrays) still need to
@@ -703,13 +758,36 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
     if (operands.size() != args.size())
       return failure();
     for (auto [operand, argInfo] : llvm::zip(operands, args)) {
-      auto packed = packToI64(operand);
-      if (failed(packed))
-        return failure();
       Value slotVal = buildI32Constant(rewriter, storeLoc, argInfo.second);
-      rewriter.create<mlir::func::CallOp>(
-          storeLoc, "__arcilator_frame_store_u64", TypeRange{},
-          ValueRange{procIdVal, slotVal, *packed});
+      Value argVal = argInfo.first;
+      if (!operand || !argVal)
+        return execOp.emitOpError()
+               << "null operand while lowering scheduler frame phi stores";
+      Type argTy = argVal.getType();
+      Type operandTy = operand.getType();
+      if (!operandTy || !argTy)
+        return execOp.emitOpError()
+               << "scheduler frame phi operand has null type";
+      if (operandTy != argTy)
+        return execOp.emitOpError()
+               << "scheduler frame phi operand type mismatch";
+      Type baseTy = argTy;
+      while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+        baseTy = alias.getInnerType();
+      if (isa<hw::StringType>(baseTy)) {
+        if (failed(ensureFrameStringFuncs(argTy)))
+          return failure();
+        rewriter.create<mlir::func::CallOp>(
+            storeLoc, "__arcilator_frame_store_str", TypeRange{},
+            ValueRange{procIdVal, slotVal, operand});
+      } else {
+        auto packed = packToI64(operand);
+        if (failed(packed))
+          return failure();
+        rewriter.create<mlir::func::CallOp>(
+            storeLoc, "__arcilator_frame_store_u64", TypeRange{},
+            ValueRange{procIdVal, slotVal, *packed});
+      }
     }
     return success();
   };
@@ -830,18 +908,35 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       rewriter.setInsertionPointToStart(block);
       for (auto [arg, slot] : args) {
         Value slotVal = buildI32Constant(rewriter, arg.getLoc(), slot);
-        Value loaded =
-            rewriter
-                .create<mlir::func::CallOp>(arg.getLoc(),
-                                            "__arcilator_frame_load_u64",
-                                            rewriter.getI64Type(),
-                                            ValueRange{procIdVal, slotVal})
-                .getResult(0);
-        auto unpacked = unpackFromI64(loaded, arg.getType(), arg.getLoc());
-        if (failed(unpacked))
-          return execOp.emitOpError()
-                 << "cannot reload block argument of type " << arg.getType();
-        arg.replaceAllUsesWith(*unpacked);
+        Type argTy = arg.getType();
+        Type baseTy = argTy;
+        while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+          baseTy = alias.getInnerType();
+        if (isa<hw::StringType>(baseTy)) {
+          if (failed(ensureFrameStringFuncs(argTy)))
+            return failure();
+          Value loaded =
+              rewriter
+                  .create<mlir::func::CallOp>(arg.getLoc(),
+                                              "__arcilator_frame_load_str",
+                                              argTy,
+                                              ValueRange{procIdVal, slotVal})
+                  .getResult(0);
+          arg.replaceAllUsesWith(loaded);
+        } else {
+          Value loaded =
+              rewriter
+                  .create<mlir::func::CallOp>(arg.getLoc(),
+                                              "__arcilator_frame_load_u64",
+                                              rewriter.getI64Type(),
+                                              ValueRange{procIdVal, slotVal})
+                  .getResult(0);
+          auto unpacked = unpackFromI64(loaded, arg.getType(), arg.getLoc());
+          if (failed(unpacked))
+            return execOp.emitOpError()
+                   << "cannot reload block argument of type " << arg.getType();
+          arg.replaceAllUsesWith(*unpacked);
+        }
       }
       while (block->getNumArguments() != 0)
         block->eraseArgument(0);
@@ -1215,14 +1310,27 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
     auto &values = it.second;
     rewriter.setInsertionPoint(defBlock->getTerminator());
     for (auto [value, slot] : values) {
-      auto packed = packToI64(value);
-      if (failed(packed))
-        return execOp.emitOpError() << "cannot spill value of type "
-                                    << value.getType();
       Value slotVal = buildI32Constant(rewriter, value.getLoc(), slot);
-      rewriter.create<mlir::func::CallOp>(
-          value.getLoc(), "__arcilator_frame_store_u64", TypeRange{},
-          ValueRange{procIdVal, slotVal, *packed});
+      Type ty = value.getType();
+      Type baseTy = ty;
+      while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+        baseTy = alias.getInnerType();
+      if (isa<hw::StringType>(baseTy)) {
+        if (failed(ensureFrameStringFuncs(ty)))
+          return failure();
+        rewriter.create<mlir::func::CallOp>(value.getLoc(),
+                                            "__arcilator_frame_store_str",
+                                            TypeRange{},
+                                            ValueRange{procIdVal, slotVal, value});
+      } else {
+        auto packed = packToI64(value);
+        if (failed(packed))
+          return execOp.emitOpError() << "cannot spill value of type "
+                                      << value.getType();
+        rewriter.create<mlir::func::CallOp>(
+            value.getLoc(), "__arcilator_frame_store_u64", TypeRange{},
+            ValueRange{procIdVal, slotVal, *packed});
+      }
     }
   }
 
@@ -1245,6 +1353,21 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
     }
 
     Value slotVal = buildI32Constant(rewriter, loc, slot);
+    Type baseTy = ty;
+    while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+      baseTy = alias.getInnerType();
+    if (isa<hw::StringType>(baseTy)) {
+      if (failed(ensureFrameStringFuncs(ty)))
+        return failure();
+      Value loaded =
+          rewriter
+              .create<mlir::func::CallOp>(loc, "__arcilator_frame_load_str",
+                                          ty, ValueRange{procIdVal, slotVal})
+              .getResult(0);
+      blockCache.try_emplace(slot, loaded);
+      return loaded;
+    }
+
     Value loaded =
         rewriter
             .create<mlir::func::CallOp>(loc, "__arcilator_frame_load_u64",
