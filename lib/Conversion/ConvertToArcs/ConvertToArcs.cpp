@@ -731,8 +731,10 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   // Lower SSA block arguments (phi nodes) by modeling branch operands as frame
   // stores and replacing the block arguments with frame loads. This avoids
   // having to pass operands when the scheduler jumps directly to a state.
-  DenseMap<Block *, SmallVector<std::pair<BlockArgument, uint32_t>>>
-      phiArgsByBlock;
+  // NOTE: We replace block arguments with frame loads and then erase the block
+  // arguments. Do not store `BlockArgument` values in this map, as they become
+  // invalid after erasure. Keep only the type + slot mapping.
+  DenseMap<Block *, SmallVector<std::pair<Type, uint32_t>>> phiArgsByBlock;
   uint32_t nextPhiSlot = 0;
   for (Block &block : region) {
     if (&block == dispatchBlock || &block == exitBlock)
@@ -745,7 +747,7 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         return execOp.emitOpError()
                << "cannot lower scheduled process with block argument of type "
                << arg.getType();
-      args.push_back({arg, nextPhiSlot++});
+      args.push_back({arg.getType(), nextPhiSlot++});
     }
   }
 
@@ -759,11 +761,10 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       return failure();
     for (auto [operand, argInfo] : llvm::zip(operands, args)) {
       Value slotVal = buildI32Constant(rewriter, storeLoc, argInfo.second);
-      Value argVal = argInfo.first;
-      if (!operand || !argVal)
+      Type argTy = argInfo.first;
+      if (!operand)
         return execOp.emitOpError()
                << "null operand while lowering scheduler frame phi stores";
-      Type argTy = argVal.getType();
       Type operandTy = operand.getType();
       if (!operandTy || !argTy)
         return execOp.emitOpError()
@@ -906,7 +907,12 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
       auto &args = it.second;
       OpBuilder::InsertionGuard g(rewriter);
       rewriter.setInsertionPointToStart(block);
-      for (auto [arg, slot] : args) {
+      auto blockArgs = llvm::to_vector(block->getArguments());
+      if (blockArgs.size() != args.size())
+        return execOp.emitOpError()
+               << "scheduler frame phi argument arity mismatch";
+      for (auto [arg, argInfo] : llvm::zip(blockArgs, args)) {
+        uint32_t slot = argInfo.second;
         Value slotVal = buildI32Constant(rewriter, arg.getLoc(), slot);
         Type argTy = arg.getType();
         Type baseTy = argTy;
@@ -1396,6 +1402,154 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
         return execOp.emitOpError()
                << "cannot reload spilled value of type " << value.getType();
       use.set(*repl);
+    }
+  }
+
+  // If the scheduler frame is updated within a single `arc.execute` invocation
+  // (e.g., loop induction variables), values reloaded in the dispatch block
+  // must not be cached and reused across other state blocks. Otherwise, loops
+  // can observe stale values and run unbounded (causing runaway allocations or
+  // stack growth).
+  //
+  // Fix this by localizing any dispatch-defined SSA values that depend on
+  // mutable frame slots into the blocks that use them: clone the defining ops
+  // (including the `__arcilator_frame_load_*` calls) into each use block.
+  DenseSet<uint32_t> mutableFrameSlots;
+  execOp.walk([&](mlir::func::CallOp call) {
+    StringRef callee = call.getCallee();
+    if (callee != "__arcilator_frame_store_u64" &&
+        callee != "__arcilator_frame_store_str")
+      return;
+    if (call.getNumOperands() < 2)
+      return;
+    auto slotCst = call.getOperand(1).getDefiningOp<hw::ConstantOp>();
+    if (!slotCst || slotCst.getValue().getBitWidth() != 32)
+      return;
+    mutableFrameSlots.insert(
+        static_cast<uint32_t>(slotCst.getValue().getZExtValue()));
+  });
+
+  if (!mutableFrameSlots.empty()) {
+    auto isFrameLoad = [](mlir::func::CallOp call) -> bool {
+      StringRef callee = call.getCallee();
+      return callee == "__arcilator_frame_load_u64" ||
+             callee == "__arcilator_frame_load_str";
+    };
+
+    auto isCloneableDispatchOp = [&](Operation *op) -> bool {
+      if (!op || op->getBlock() != dispatchBlock)
+        return false;
+      if (auto call = dyn_cast<mlir::func::CallOp>(op))
+        return isFrameLoad(call);
+      // Only clone side-effect-free, regionless ops from the dispatch block.
+      return op->getNumRegions() == 0 && mlir::isMemoryEffectFree(op);
+    };
+
+    // Taint values defined in the dispatch block that depend on mutable frame
+    // loads.
+    DenseSet<Value> tainted;
+    for (Operation &op : dispatchBlock->without_terminator()) {
+      bool opTainted = false;
+      if (auto call = dyn_cast<mlir::func::CallOp>(op)) {
+        if (isFrameLoad(call) && call.getNumOperands() >= 2 &&
+            call.getNumResults() == 1) {
+          auto slotCst = call.getOperand(1).getDefiningOp<hw::ConstantOp>();
+          if (slotCst && slotCst.getValue().getBitWidth() == 32) {
+            uint32_t slot =
+                static_cast<uint32_t>(slotCst.getValue().getZExtValue());
+            opTainted = mutableFrameSlots.contains(slot);
+          }
+        }
+      }
+      if (!opTainted) {
+        for (Value operand : op.getOperands()) {
+          if (tainted.contains(operand)) {
+            opTainted = true;
+            break;
+          }
+        }
+      }
+      if (!opTainted || !isCloneableDispatchOp(&op))
+        continue;
+      for (Value result : op.getResults())
+        tainted.insert(result);
+    }
+
+    if (!tainted.empty()) {
+      DenseMap<Block *, DenseMap<Value, Value>> cloneCache;
+      DenseMap<Block *, Operation *> insertBeforeByBlock;
+
+      auto getInsertBefore = [&](Block *block) -> Operation * {
+        if (auto it = insertBeforeByBlock.find(block);
+            it != insertBeforeByBlock.end())
+          return it->second;
+        Operation *insertBefore = block->empty() ? nullptr : &block->front();
+        while (insertBefore) {
+          auto call = dyn_cast<mlir::func::CallOp>(insertBefore);
+          if (!call || call.getCallee() != "__arcilator_set_pc")
+            break;
+          insertBefore = insertBefore->getNextNode();
+        }
+        insertBeforeByBlock.try_emplace(block, insertBefore);
+        return insertBefore;
+      };
+
+      auto localize = [&](Value value, Block *destBlock, Location loc,
+                          auto &self) -> FailureOr<Value> {
+        if (!value || destBlock == dispatchBlock || !tainted.contains(value))
+          return value;
+        Operation *defOp = value.getDefiningOp();
+        if (!defOp || defOp->getBlock() != dispatchBlock)
+          return value;
+        if (!isCloneableDispatchOp(defOp))
+          return execOp.emitOpError()
+                 << "cannot localize non-cloneable dispatch op for type "
+                 << value.getType();
+
+        auto &blockCache = cloneCache[destBlock];
+        if (auto it = blockCache.find(value); it != blockCache.end())
+          return it->second;
+
+        // Clone dependencies first so insertion order is topological.
+        IRMapping mapping;
+        for (Value operand : defOp->getOperands()) {
+          auto repl = self(operand, destBlock, loc, self);
+          if (failed(repl))
+            return failure();
+          mapping.map(operand, *repl);
+        }
+
+        OpBuilder::InsertionGuard g(rewriter);
+        Operation *insertBefore = getInsertBefore(destBlock);
+        if (insertBefore)
+          rewriter.setInsertionPoint(insertBefore);
+        else
+          rewriter.setInsertionPointToEnd(destBlock);
+
+        Operation *cloned = rewriter.clone(*defOp, mapping);
+        for (auto [oldRes, newRes] :
+             llvm::zip(defOp->getResults(), cloned->getResults()))
+          blockCache.try_emplace(oldRes, newRes);
+        auto it = blockCache.find(value);
+        if (it == blockCache.end())
+          return failure();
+        return it->second;
+      };
+
+      // Replace cross-block uses of tainted dispatch values with localized
+      // clones.
+      for (Value value : tainted) {
+        for (OpOperand &use : llvm::make_early_inc_range(value.getUses())) {
+          Operation *user = use.getOwner();
+          Block *useBlock = user->getBlock();
+          if (useBlock == dispatchBlock)
+            continue;
+          auto repl = localize(value, useBlock, user->getLoc(), localize);
+          if (failed(repl))
+            return failure();
+          use.set(*repl);
+        }
+      }
     }
   }
 

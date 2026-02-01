@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 struct Signal {
@@ -1437,7 +1438,9 @@ static int32_t circt_sv_class_alloc_handle() {
 
 extern "C" int32_t circt_sv_class_alloc(int32_t typeId) {
   int32_t handle = circt_sv_class_alloc_handle();
-  circt_sv_class_objects.emplace(handle, CirctSvClassObject{typeId, {}});
+  auto [it, inserted] = circt_sv_class_objects.try_emplace(handle);
+  (void)inserted;
+  it->second.typeId = typeId;
   return handle;
 }
 
