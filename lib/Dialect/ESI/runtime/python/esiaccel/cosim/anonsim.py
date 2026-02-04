@@ -4,15 +4,18 @@
 
 import os
 from pathlib import Path
-from typing import List, Optional, Callable, Dict
+from typing import Callable, Dict, List, Optional
 
 from .simulator import CosimCollateralDir, Simulator, SourceFiles
 
 
-class Questa(Simulator):
-  """Run and compile funcs for Questasim."""
+class AnonSim(Simulator):
+  """Run and compile funcs for the AnonSim (vsim) simulator."""
 
   DefaultDriver = CosimCollateralDir / "driver.sv"
+
+  # AnonSim doesn't use stderr for error messages. Everything goes to stdout.
+  UsesStderr = False
 
   def __init__(
       self,
@@ -25,8 +28,8 @@ class Questa(Simulator):
       compile_stderr_callback: Optional[Callable[[str], None]] = None,
       make_default_logs: bool = True,
       macro_definitions: Optional[Dict[str, str]] = None,
-      # An optional list of questa error codes to suppress
-      suppressed_questa_errors: Optional[List[int]] = None):
+      suppressed_vsim_errors: Optional[List[int]] = None,
+  ):
     super().__init__(
         sources=sources,
         run_dir=run_dir,
@@ -38,19 +41,16 @@ class Questa(Simulator):
         make_default_logs=make_default_logs,
         macro_definitions=macro_definitions,
     )
-    self.suppressed_questa_errors = suppressed_questa_errors
-
-  # Questa doesn't use stderr for error messages. Everything goes to stdout.
-  UsesStderr = False
+    self.suppressed_vsim_errors = suppressed_vsim_errors
 
   def internal_compile_commands(self) -> List[str]:
     cmds = [
         "onerror { quit -f -code 1 }",
     ]
     sources = self.sources.rtl_sources
-    sources.append(Questa.DefaultDriver)
+    sources.append(AnonSim.DefaultDriver)
 
-    # Format macro definition command
+    # Format macro definition command.
     if self.macro_definitions:
       macro_definitions_cmd = " ".join([
           f"+define+{k}={v}" if v is not None else f"+define+{k}"
@@ -59,18 +59,32 @@ class Questa(Simulator):
     else:
       macro_definitions_cmd = ""
 
-    # Format error suppression command
-    if self.suppressed_questa_errors:
-      suppressed_questa_errors_cmd = " ".join(
-          [f"-suppress {ec}" for ec in self.suppressed_questa_errors])
+    # Format warning/error suppression command.
+    if self.suppressed_vsim_errors:
+      suppressed_errors_cmd = " ".join(
+          [f"-suppress {ec}" for ec in self.suppressed_vsim_errors])
     else:
-      suppressed_questa_errors_cmd = ""
+      suppressed_errors_cmd = ""
 
     for src in sources:
-      cmds.append(
-          f"vlog -incr +acc -sv {macro_definitions_cmd} {suppressed_questa_errors_cmd} +define+TOP_MODULE={self.sources.top}"
-          f" +define+SIMULATION {src.as_posix()}")
-    cmds.append(f"vopt -incr driver -o driver_opt +acc")
+      parts = [
+          "vlog",
+          "-incr",
+          "+acc",
+          "-sv",
+      ]
+      if macro_definitions_cmd:
+        parts.append(macro_definitions_cmd)
+      if suppressed_errors_cmd:
+        parts.append(suppressed_errors_cmd)
+      parts += [
+          f"+define+TOP_MODULE={self.sources.top}",
+          "+define+SIMULATION",
+          src.as_posix(),
+      ]
+      cmds.append(" ".join(parts))
+
+    cmds.append("vopt -incr driver -o driver_opt +acc")
     return cmds
 
   def compile_commands(self) -> List[List[str]]:
@@ -100,7 +114,7 @@ class Questa(Simulator):
       ]
 
       if self.debug:
-        # Create waveform dump .do file
+        # Create waveform dump .do file.
         wave_file = Path("wave.do")
         with wave_file.open("w") as f:
           f.write("log -r /*\n")
@@ -108,11 +122,10 @@ class Questa(Simulator):
             "-do",
             str(wave_file.resolve()),
         ]
-        # Questa will by default log to a vsim.wlf file in the current
+        # AnonSim will by default log to a vsim.wlf file in the current
         # directory.
-        print(
-            f"Debug mode enabled - waveform will be in {wave_file.resolve().parent / 'vsim.wlf'}"
-        )
+        print("Debug mode enabled - waveform will be in "
+              f"{wave_file.resolve().parent / 'vsim.wlf'}")
 
       cmd += [
           "-do",
@@ -120,9 +133,9 @@ class Questa(Simulator):
       ]
 
     for lib in self.sources.dpi_so_paths():
-      svLib = os.path.splitext(lib)[0]
+      sv_lib = os.path.splitext(lib)[0]
       cmd.append("-sv_lib")
-      cmd.append(svLib)
+      cmd.append(sv_lib)
     return cmd
 
   def run(self,
@@ -130,12 +143,12 @@ class Questa(Simulator):
           gui: bool = False,
           server_only: bool = False) -> int:
     """Override the Simulator.run() to add a soft link in the run directory (to
-    the work directory) before running vsim the usual way."""
+    the work directory) before running the simulator."""
 
     # Create a soft link to the work directory.
-    workDir = self.run_dir / "work"
-    if not workDir.exists():
-      os.symlink(Path(os.getcwd()) / "work", workDir)
+    work_dir = self.run_dir / "work"
+    if not work_dir.exists():
+      os.symlink(Path(os.getcwd()) / "work", work_dir)
 
     # Run the simulation.
     return super().run(inner_command, gui, server_only=server_only)

@@ -43,7 +43,7 @@ config.timeout = "@CIRCT_INTEGRATION_TIMEOUT@"
 config.yosys_path = "@YOSYS_PATH@"
 config.quartus_path = "@QUARTUS_PATH@"
 config.vivado_path = "@VIVADO_PATH@"
-config.questa_path = "@QUESTA_PATH@"
+config.anonsim_path = "@ANONSIM_PATH@"
 config.iverilog_path = "@IVERILOG_PATH@"
 config.bindings_python_enabled = @CIRCT_BINDINGS_PYTHON_ENABLED@
 

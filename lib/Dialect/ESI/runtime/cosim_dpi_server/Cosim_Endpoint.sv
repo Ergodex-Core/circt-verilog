@@ -192,7 +192,7 @@ module Cosim_Endpoint_FromHost
   ///
   /// It has been observed that some simulators (verilator) does not handle
   /// combinational driving from DPI well (resulting in non-determinism wrt
-  /// some of the combinational outputs being dropped/replicated). Questa does
+  /// some of the combinational outputs being dropped/replicated). AnonSim does
   /// not show this behavior.
   /// A mitigation is to add a skid buffer to decouple the DPI interface
   /// from the output interface.

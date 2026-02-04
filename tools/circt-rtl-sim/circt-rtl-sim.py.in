@@ -36,24 +36,24 @@ class IEEEDriver:
       self.top = "driver"
 
 
-class Questa(IEEEDriver):
-  """Run and compile funcs for Questasim."""
+class AnonSim(IEEEDriver):
+  """Run and compile funcs for AnonSimsim."""
 
   def __init__(self, path, args):
     super().__init__(path, args)
 
-    # Find Questa
+    # Find AnonSim
     if os.path.exists(path):
       if os.path.isfile(path):
         self.path = os.path.dirname(path)
       else:
         self.path = path
-    elif "@QUESTA_PATH@" != "":
-      self.path = "@QUESTA_PATH@"
+    elif "@ANONSIM_PATH@" != "":
+      self.path = "@ANONSIM_PATH@"
       if os.path.isfile(self.path):
         self.path = os.path.dirname(self.path)
-    elif "QUESTA_PATH" in os.environ:
-      self.path = os.environ["QUESTA_PATH"]
+    elif "ANONSIM_PATH" in os.environ:
+      self.path = os.environ["ANONSIM_PATH"]
 
   def compile(self, sources, args):
     self.dpiLibs = filter(lambda fn: fn.endswith(".so") or fn.endswith(".dll"),
@@ -308,8 +308,8 @@ def __main__(args):
   simParts = os.path.split(args.sim)
   simName = simParts[1]
 
-  if simName in ["questa", "vsim", "vlog", "vopt"]:
-    sim = Questa(simParts[0], args)
+  if simName in ["anonsim", "vsim", "vlog", "vopt"]:
+    sim = AnonSim(simParts[0], args)
   elif simName == "xsim":
     sim = Vivado(simParts[0], args)
   elif simName == "iverilog":

@@ -1,4 +1,4 @@
-// REQUIRES: questa
+// REQUIRES: anonsim
 
 // RUN: firtool --verilog %s > %t1.1995.v
 // RUN: firtool --verilog %s > %t1.2001.v

@@ -389,8 +389,8 @@ def get_simulator(name: str, sources: SourceFiles, rundir: Path,
   if name == "verilator":
     from .verilator import Verilator
     return Verilator(sources, rundir, debug)
-  elif name == "questa":
-    from .questa import Questa
-    return Questa(sources, rundir, debug)
+  elif name == "anonsim":
+    from .anonsim import AnonSim
+    return AnonSim(sources, rundir, debug)
   else:
     raise ValueError(f"Unknown simulator: {name}")

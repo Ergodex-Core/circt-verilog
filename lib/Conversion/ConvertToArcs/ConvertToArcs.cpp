@@ -2045,7 +2045,7 @@ static LogicalResult sinkProcessResultDrives(llhd::ProcessOp proc) {
 /// variable declaration initializers) as module-level `llhd.drv` ops. Our
 /// best-effort `llhd.drv` lowering treats module-level drives as combinational
 /// updates and re-applies them every evaluation, which clobbers procedural
-/// state and diverges from event-driven simulators (Questa).
+/// state and diverges from event-driven simulators (AnonSim).
 ///
 /// Hoist constant, time-0 drives into an `llhd.process` that runs once and
 /// halts. The cycle scheduler can then model their "run once" semantics via
@@ -4865,7 +4865,7 @@ void ConvertToArcsPass::runOnOperation() {
       // semantics via the runtime PC state. Converting them to `seq.initial`
       // causes the body to execute on every evaluation, clobbering procedural
       // state (e.g. counters in `always @(posedge ...)` blocks) and leading to
-      // waveform mismatches vs Questa.
+      // waveform mismatches vs AnonSim.
       if (!needsCycleScheduler(proc))
         (void)convertOneShotProcessToInitial(proc);
     }

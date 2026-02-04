@@ -79,7 +79,14 @@ def __main__(args):
   sources = SourceFiles(args.top)
   sources.add_dir(Path(args.source))
 
-  sim = get_simulator(args.sim, sources, Path(args.rundir), args.debug)
+  try:
+    sim = get_simulator(args.sim, sources, Path(args.rundir), args.debug)
+  except ValueError as e:
+    print(str(e))
+    print("Supported simulators:")
+    print("  - verilator")
+    print("  - anonsim")
+    return 1
   if not args.no_compile:
     rc = sim.compile()
     if rc != 0:

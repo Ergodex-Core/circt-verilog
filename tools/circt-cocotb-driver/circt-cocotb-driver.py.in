@@ -22,7 +22,7 @@ def parseArgs(args):
                          help="Name of the top level verilog module.")
 
   argparser.add_argument("--simulator",
-                         choices=['icarus', 'questa'],
+                         choices=['icarus', 'anonsim'],
                          default="icarus",
                          help="Name of the simulator to use.")
 
@@ -44,7 +44,7 @@ def parseArgs(args):
   argparser.add_argument(
       "--gui",
       action="store_true",
-      help="Run the simulator with a GUI. Only supported by Questa.")
+      help="Run the simulator with a GUI. Only supported by AnonSim.")
 
   argparser.add_argument(
       "sources",
@@ -100,28 +100,28 @@ class Icarus(csim.Icarus):
     return super().run()
 
 
-class Questa(csim.Questa):
+class AnonSim(csim.AnonSim):
   """ Class for handling icarus-verilog specific commands and patching."""
 
   def __init__(self, **kwargs):
     super().__init__(**kwargs)
 
-    # If cmake discovered the Questa path, add it to the path.
-    if "@QUESTA_PATH@" != "":
-      os.environ["PATH"] = f"@QUESTA_PATH@:{os.environ['PATH']}"
+    # If cmake discovered the AnonSim path, add it to the path.
+    if "@ANONSIM_PATH@" != "":
+      os.environ["PATH"] = f"@ANONSIM_PATH@:{os.environ['PATH']}"
 
-    # Ensure that Questa is available in path and it is at least iverilog v11
+    # Ensure that AnonSim is available in path and it is at least iverilog v11
     try:
       out = subprocess.check_output(["vlog", "-version"])
     except subprocess.CalledProcessError:
       raise Exception("vlog not found in path")
 
-    # find the Questa version string and extract the version number using a
+    # find the AnonSim version string and extract the version number using a
     # regex
-    ver_re = r"QuestaSim-64 vlog (\d+\.\d+)"
+    ver_re = r"AnonSimSim-64 vlog (\d+\.\d+)"
     ver_match = re.search(ver_re, out.decode("utf-8"))
     if ver_match is None:
-      raise Exception("Could not find Questa version")
+      raise Exception("Could not find AnonSim version")
 
   def run(self, objDir, gui=False):
     # If no timescale is defined in the source code, icarus assumes a
@@ -169,8 +169,8 @@ def main():
   try:
     if args.simulator == "icarus":
       sim = Icarus(**kwargs)
-    elif args.simulator == "questa":
-      sim = Questa(**kwargs)
+    elif args.simulator == "anonsim":
+      sim = AnonSim(**kwargs)
     else:
       raise Exception(f"Unknown simulator: {args.simulator}")
   except Exception as e:
