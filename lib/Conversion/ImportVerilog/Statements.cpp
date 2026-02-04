@@ -1113,7 +1113,7 @@ struct StmtVisitor {
       return failure();
 
     // For deferred immediate assertions (`assert #0` / `assert final`), ignore
-    // action blocks for now and keep only the verification semantics. Questa
+    // action blocks for now and keep only the verification semantics. AnonSim
     // does not execute `else` blocks for these forms (it reports an assertion
     // failure but does not run `$error` / `uvm_error` actions), and sv-tests
     // treats such runs as PASS. Lowering them as "if-else" control flow causes

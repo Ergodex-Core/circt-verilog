@@ -341,26 +341,26 @@ else()
 endif()
 
 #-------------------------------------------------------------------------------
-# Questa Configuration
+# AnonSim Configuration
 #-------------------------------------------------------------------------------
 
-# If Questa hasn't been explicitly disabled, find it.
-option(QUESTA_DISABLE "Disable the Questa simulation tests.")
-if (QUESTA_DISABLE)
-  message(STATUS "Disabling Questa tests.")
+# If AnonSim hasn't been explicitly disabled, find it.
+option(ANONSIM_DISABLE "Disable the AnonSim simulation tests.")
+if (ANONSIM_DISABLE)
+  message(STATUS "Disabling AnonSim tests.")
 else()
-  if (EXISTS ${QUESTA_PATH})
-    message(STATUS "Setting Questa path to ${QUESTA_PATH}.")
+  if (EXISTS ${ANONSIM_PATH})
+    message(STATUS "Setting AnonSim path to ${ANONSIM_PATH}.")
   else()
-    # Search for Questa's `vsim` command.
-    find_program(QUESTA_PATH "vsim")
-    if(EXISTS ${QUESTA_PATH})
+    # Search for AnonSim's `vsim` command.
+    find_program(ANONSIM_PATH "vsim")
+    if(EXISTS ${ANONSIM_PATH})
       # Then strip the filename.
-      get_filename_component(QUESTA_PATH ${QUESTA_PATH} DIRECTORY)
-      message(STATUS "Found Questa at ${QUESTA_PATH}.")
+      get_filename_component(ANONSIM_PATH ${ANONSIM_PATH} DIRECTORY)
+      message(STATUS "Found AnonSim at ${ANONSIM_PATH}.")
     else()
-      set(QUESTA_PATH "")
-      message(STATUS "Did not find Questa.")
+      set(ANONSIM_PATH "")
+      message(STATUS "Did not find AnonSim.")
     endif()
   endif()
 endif()

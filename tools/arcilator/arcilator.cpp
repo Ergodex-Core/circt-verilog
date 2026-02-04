@@ -39,6 +39,7 @@
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Sim/SimOps.h"
@@ -89,6 +90,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 
+#include <functional>
 #include <optional>
 
 using namespace mlir;
@@ -450,6 +452,109 @@ struct LowerVerifAssertLikeToSimPass
           .getResult();
     };
 
+    auto getU32FromConstant = [](Value value) -> std::optional<uint32_t> {
+      if (!value)
+        return std::nullopt;
+      if (auto cst = value.getDefiningOp<hw::ConstantOp>()) {
+        auto apInt = cst.getValue();
+        if (apInt.getBitWidth() > 32)
+          return std::nullopt;
+        return static_cast<uint32_t>(apInt.getZExtValue());
+      }
+      return std::nullopt;
+    };
+
+    DenseMap<uint32_t, uint32_t> nextFrameSlot;
+    uint32_t maxProcId = 0;
+    module.walk([&](func::CallOp op) {
+      auto callee = op.getCallee();
+      if (callee != "__arcilator_frame_load_u64" &&
+          callee != "__arcilator_frame_store_u64")
+        return;
+      if (op.getNumOperands() < 2)
+        return;
+      auto procId = getU32FromConstant(op.getOperand(0));
+      auto slot = getU32FromConstant(op.getOperand(1));
+      if (!procId || !slot)
+        return;
+      auto &next = nextFrameSlot[*procId];
+      next = std::max(next, *slot + 1u);
+      maxProcId = std::max(maxProcId, *procId);
+    });
+
+    module.walk([&](arc::ExecuteOp exec) {
+      if (auto procIdAttr =
+              exec->getAttrOfType<IntegerAttr>("arcilator.proc_id")) {
+        maxProcId = std::max(
+            maxProcId,
+            static_cast<uint32_t>(procIdAttr.getValue().getZExtValue()));
+      }
+    });
+
+    uint32_t monitorProcId = maxProcId + 1;
+    if (monitorProcId == 0)
+      monitorProcId = maxProcId;
+
+    auto canCloneSideEffectCall = [](func::CallOp call) -> bool {
+      if (!call)
+        return false;
+      auto callee = call.getCallee();
+      return callee == "__arcilator_sig_load_u64" ||
+             callee == "__arcilator_sig_load_nba_u64" ||
+             callee == "__arcilator_sig_read_u64" ||
+             callee == "__arcilator_frame_load_u64" ||
+             callee == "__arcilator_now_fs";
+    };
+
+    std::function<Value(Value, Operation *, OpBuilder &, IRMapping &)>
+        cloneValueIntoBlock = [&](Value value, Operation *scopeOp,
+                                  OpBuilder &builder,
+                                  IRMapping &mapping) -> Value {
+      if (!value)
+        return {};
+      if (auto mapped = mapping.lookupOrNull(value))
+        return mapped;
+
+      // Values defined outside `scopeOp` can be referenced directly.
+      if (auto barg = dyn_cast<BlockArgument>(value)) {
+        mapping.map(value, barg);
+        return barg;
+      }
+
+      auto *defOp = value.getDefiningOp();
+      if (!defOp)
+        return {};
+      if (!scopeOp || !scopeOp->isAncestor(defOp)) {
+        mapping.map(value, value);
+        return value;
+      }
+
+      // Only clone simple computation. Allow cloning calls to known read-only
+      // arcilator runtime hooks since they are safe to duplicate for hoisting.
+      if (defOp->getNumRegions() != 0)
+        return {};
+      bool allowSideEffects = isa<llhd::PrbOp>(defOp);
+      if (auto call = dyn_cast<func::CallOp>(defOp))
+        allowSideEffects |= canCloneSideEffectCall(call);
+
+      if (!defOp->hasTrait<OpTrait::ConstantLike>() && !isMemoryEffectFree(defOp) &&
+          !allowSideEffects)
+        return {};
+
+      for (auto operand : defOp->getOperands()) {
+        if (!cloneValueIntoBlock(operand, scopeOp, builder, mapping))
+          return {};
+      }
+
+      Operation *cloned = builder.clone(*defOp, mapping);
+      auto result = dyn_cast<OpResult>(value);
+      if (!result)
+        return {};
+      auto clonedResult = cloned->getResult(result.getResultNumber());
+      mapping.map(value, clonedResult);
+      return clonedResult;
+    };
+
     auto lowerUnclockedAssertLike = [&](auto op) {
       if (!op.getProperty().getType().isInteger(1)) {
         op.emitWarning()
@@ -468,6 +573,131 @@ struct LowerVerifAssertLikeToSimPass
           comb::XorOp::create(builder, loc, op.getProperty(),
                               getI1Constant(builder, loc, /*value=*/true));
       Value failCond = comb::AndOp::create(builder, loc, enable, notProperty);
+
+      auto ifFail =
+          scf::IfOp::create(builder, loc, failCond, /*withElse=*/false);
+      builder.setInsertionPoint(ifFail.thenYield());
+      sim::TerminateOp::create(builder, loc, /*success=*/false,
+                               /*verbose=*/false);
+
+      op.erase();
+    };
+
+    auto lowerClockedAssertLike = [&](auto op) {
+      if (op.getEdge() != verif::ClockEdge::Pos &&
+          op.getEdge() != verif::ClockEdge::Neg &&
+          op.getEdge() != verif::ClockEdge::Both) {
+        op.emitWarning() << "unsupported verif clock edge; dropping";
+        op.erase();
+        return;
+      }
+
+      if (!op.getProperty().getType().isInteger(1)) {
+        op.emitWarning()
+            << "unsupported non-i1 verif assert-like property; dropping";
+        op.erase();
+        return;
+      }
+
+      auto modelOp = op->template getParentOfType<arc::ModelOp>();
+      if (!modelOp) {
+        op.emitWarning()
+            << "clocked verif op not in arcilator model; dropping";
+        op.erase();
+        return;
+      }
+
+      auto execOp = op->template getParentOfType<arc::ExecuteOp>();
+      uint32_t slot = nextFrameSlot[monitorProcId]++;
+
+      Block &modelBlock = modelOp.getBody().front();
+      OpBuilder builder(&modelBlock, modelBlock.end());
+      auto loc = op.getLoc();
+
+      IRMapping mapping;
+      Value property =
+          cloneValueIntoBlock(op.getProperty(), execOp, builder, mapping);
+      Value clock = cloneValueIntoBlock(op.getClock(), execOp, builder, mapping);
+      Value clonedEnable;
+      if (op.getEnable())
+        clonedEnable =
+            cloneValueIntoBlock(op.getEnable(), execOp, builder, mapping);
+
+      if (!property || !clock || (op.getEnable() && !clonedEnable)) {
+        op.emitWarning() << "unable to hoist clocked verif op operands; dropping";
+        op.erase();
+        return;
+      }
+
+      Value procIdVal = hw::ConstantOp::create(builder, loc, builder.getI32Type(),
+                                               monitorProcId);
+      Value slotVal =
+          hw::ConstantOp::create(builder, loc, builder.getI32Type(), slot);
+
+      // Load `{valid, oldClock}` from a per-process frame slot.
+      auto frameLoad = FlatSymbolRefAttr::get(builder.getContext(),
+                                              "__arcilator_frame_load_u64");
+      auto frameStore = FlatSymbolRefAttr::get(builder.getContext(),
+                                               "__arcilator_frame_store_u64");
+
+      Value oldPacked =
+          func::CallOp::create(builder, loc, frameLoad, builder.getI64Type(),
+                               ValueRange{procIdVal, slotVal})
+              .getResult(0);
+      Value oldClock =
+          comb::ExtractOp::create(builder, loc, oldPacked, /*lowBit=*/0,
+                                  /*bitWidth=*/1);
+      Value oldValid =
+          comb::ExtractOp::create(builder, loc, oldPacked, /*lowBit=*/1,
+                                  /*bitWidth=*/1);
+
+      if (isa<seq::ClockType>(clock.getType()))
+        clock = seq::FromClockOp::create(builder, loc, clock);
+
+      // Update the stored previous clock value and mark the slot valid. The
+      // initial value of the frame slot is zero, so the valid bit prevents a
+      // false edge trigger at time 0 when the clock starts high.
+      Value zero62 =
+          hw::ConstantOp::create(builder, loc, builder.getIntegerType(62), 0);
+      Value validBit = getI1Constant(builder, loc, /*value=*/true);
+      Value newPacked =
+          comb::ConcatOp::create(builder, loc,
+                                 ValueRange{zero62, validBit, clock});
+      func::CallOp::create(builder, loc, frameStore, TypeRange{},
+                           ValueRange{procIdVal, slotVal, newPacked});
+
+      // Detect clock edge.
+      Value edge = comb::XorOp::create(builder, loc, oldClock, clock);
+      Value event;
+      switch (op.getEdge()) {
+      case verif::ClockEdge::Pos:
+        event = comb::AndOp::create(builder, loc, edge, clock);
+        break;
+      case verif::ClockEdge::Neg: {
+        Value notClock =
+            comb::XorOp::create(builder, loc, clock,
+                                getI1Constant(builder, loc, /*value=*/true));
+        event = comb::AndOp::create(builder, loc, edge, notClock);
+        break;
+      }
+      case verif::ClockEdge::Both:
+        event = edge;
+        break;
+      }
+      event = comb::AndOp::create(builder, loc, oldValid, event);
+
+      Value enable = clonedEnable;
+      if (!enable)
+        enable = getI1Constant(builder, loc, /*value=*/true);
+
+      Value notProperty =
+          comb::XorOp::create(builder, loc, property,
+                              getI1Constant(builder, loc, /*value=*/true));
+
+      Value gated =
+          comb::AndOp::create(builder, loc, event, enable);
+      Value failCond =
+          comb::AndOp::create(builder, loc, gated, notProperty);
 
       auto ifFail =
           scf::IfOp::create(builder, loc, failCond, /*withElse=*/false);
@@ -505,19 +735,10 @@ struct LowerVerifAssertLikeToSimPass
     for (auto op : covers)
       op.erase();
 
-    // If any clocked ops survive to this point, they are not supported by the
-    // current strict-mode bridge (proper scheduling is still M1). Drop them
-    // with a warning rather than failing Arc→LLVM lowering.
-    for (auto op : clockedAsserts) {
-      op.emitWarning()
-          << "unlowered verif.clocked_assert reached Arc→LLVM; dropping";
-      op.erase();
-    }
-    for (auto op : clockedAssumes) {
-      op.emitWarning()
-          << "unlowered verif.clocked_assume reached Arc→LLVM; dropping";
-      op.erase();
-    }
+    for (auto op : clockedAsserts)
+      lowerClockedAssertLike(op);
+    for (auto op : clockedAssumes)
+      lowerClockedAssertLike(op);
     for (auto op : clockedCovers)
       op.erase();
   }

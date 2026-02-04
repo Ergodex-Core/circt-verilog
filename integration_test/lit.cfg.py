@@ -138,23 +138,23 @@ if config.vivado_path != "":
   config.substitutions.append(('%xsim%', os.path.join(config.vivado_path,
                                                       "xsim")))
 
-# Enable Questa if it has been detected.
-if config.questa_path != "":
-  config.available_features.add('questa')
+# Enable AnonSim if it has been detected.
+if config.anonsim_path != "":
+  config.available_features.add('anonsim')
   config.available_features.add('ieee-sim')
   config.available_features.add('rtl-sim')
   if 'LM_LICENSE_FILE' in os.environ:
     llvm_config.with_environment('LM_LICENSE_FILE',
                                  os.environ['LM_LICENSE_FILE'])
 
-  tool_dirs.append(config.questa_path)
+  tool_dirs.append(config.anonsim_path)
   tools.append('vlog')
   tools.append('vsim')
 
   config.substitutions.append(
-      ('%questa', os.path.join(config.questa_path, "vsim")))
+      ('%anonsim', os.path.join(config.anonsim_path, "vsim")))
   config.substitutions.append(
-      ('%ieee-sim', os.path.join(config.questa_path, "vsim")))
+      ('%ieee-sim', os.path.join(config.anonsim_path, "vsim")))
 
 ieee_sims = list(filter(lambda x: x[0] == '%ieee-sim', config.substitutions))
 if len(ieee_sims) > 1:

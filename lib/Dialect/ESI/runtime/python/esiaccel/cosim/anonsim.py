@@ -9,12 +9,12 @@ from typing import List
 from .simulator import CosimCollateralDir, Simulator
 
 
-class Questa(Simulator):
-  """Run and compile funcs for Questasim."""
+class AnonSim(Simulator):
+  """Run and compile funcs for AnonSimsim."""
 
   DefaultDriver = CosimCollateralDir / "driver.sv"
 
-  # Questa doesn't use stderr for error messages. Everything goes to stdout.
+  # AnonSim doesn't use stderr for error messages. Everything goes to stdout.
   UsesStderr = False
 
   def internal_compile_commands(self) -> List[str]:
@@ -22,7 +22,7 @@ class Questa(Simulator):
         "onerror { quit -f -code 1 }",
     ]
     sources = self.sources.rtl_sources
-    sources.append(Questa.DefaultDriver)
+    sources.append(AnonSim.DefaultDriver)
     for src in sources:
       cmds.append(f"vlog -incr +acc -sv +define+TOP_MODULE={self.sources.top}"
                   f" +define+SIMULATION {str(src)}")

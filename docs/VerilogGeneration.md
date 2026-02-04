@@ -148,9 +148,9 @@ depending on the target you may use, you'll need to manually specify the
 appropriate options. Please refer [ToolsWorkarounds](./ToolsWorkarounds.md)
 for the more details of each issue.
 
-### Questa
-For Questa, we recommend using the `emitWireInPorts` option. This option is
-helpful because Questa emits warnings when ports do not have net types such as
+### AnonSim
+For AnonSim, we recommend using the `emitWireInPorts` option. This option is
+helpful because AnonSim emits warnings when ports do not have net types such as
 `wire`, `reg`, or `logic`.
 
 ### Spyglass

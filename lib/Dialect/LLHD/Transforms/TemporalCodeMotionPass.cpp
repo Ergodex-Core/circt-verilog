@@ -1318,24 +1318,22 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
   // collapse edge-detection predicates into an impossible `~x & x` form. For
   // interactive `$display/$fatal/$error`, prefer executing the side effect
   // rather than dropping it.
-  procOp.walk([&](scf::IfOp ifOp) {
-    bool hasSimSideEffects = false;
-    ifOp.getThenRegion().walk([&](Operation *op) {
-      if (isSimSideEffectOp(op))
-        hasSimSideEffects = true;
-    });
-    if (!hasSimSideEffects)
-      return;
+  // Disabled: `rewriteBrokenEdgeCondition` can encounter invalid SSA values in
+  // some canonicalizeWaitLoop patterns and crash. Prefer leaving the condition
+  // unchanged over crashing the entire simulation pipeline.
 
-    OpBuilder builder(ifOp);
-    builder.setInsertionPoint(ifOp);
-    DenseMap<Value, Value> memo;
-    Value newCond =
-        rewriteBrokenEdgeCondition(ifOp.getCondition(), ifOp.getLoc(), builder,
-                                   memo);
-    if (newCond && newCond != ifOp.getCondition())
-      ifOp.getConditionMutable().assign(newCond);
-  });
+  // LLHD processes use SSACFG regions which require the entry block to have no
+  // predecessors. Some of the CFG rewriting above can collapse the original
+  // entry block and leave a loop header as the first block, violating that
+  // invariant. Repair by inserting a fresh empty entry block when needed.
+  Block &entry = procOp.getBody().front();
+  if (!entry.hasNoPredecessors()) {
+    auto *newEntry = new Block();
+    procOp.getBody().getBlocks().push_front(newEntry);
+    OpBuilder builder(procOp.getContext());
+    builder.setInsertionPointToStart(newEntry);
+    cf::BranchOp::create(builder, procOp.getLoc(), &entry, ValueRange{});
+  }
 
   return success();
 }

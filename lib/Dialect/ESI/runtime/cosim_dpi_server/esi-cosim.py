@@ -19,7 +19,7 @@ import sys
 import textwrap
 from typing import Dict, List
 
-from esiaccel.cosim.questa import Questa
+from esiaccel.cosim.anonsim import AnonSim
 from esiaccel.cosim.verilator import Verilator
 from esiaccel.cosim.simulator import SourceFiles
 
@@ -84,13 +84,13 @@ def __main__(args):
 
   if args.sim == "verilator":
     sim = Verilator(sources, Path(args.rundir), args.debug)
-  elif args.sim == "questa":
-    sim = Questa(sources, Path(args.rundir), args.debug)
+  elif args.sim == "anonsim":
+    sim = AnonSim(sources, Path(args.rundir), args.debug)
   else:
     print("Unknown simulator: " + args.sim)
     print("Supported simulators: ")
     print("  - verilator")
-    print("  - questa")
+    print("  - anonsim")
     return 1
 
   if not args.no_compile:
