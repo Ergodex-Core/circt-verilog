@@ -106,16 +106,24 @@ static Type stripInOutAndAliasTypes(Type ty) {
   return ty;
 }
 
+static constexpr uint64_t kArcilatorRuntimeWordBits = 64;
+// Keep runtime-managed packed storage bounded; extremely wide packed values
+// should be lowered differently (or explicitly split).
+static constexpr uint64_t kArcilatorRuntimeMaxBitWidth = 4096;
+
 static std::optional<APInt> tryEvalRuntimeSignalInitAttr(Attribute initAttr,
                                                          Type elemTy);
 
 static std::optional<APInt>
 tryEvalRuntimeSignalInitStructFields(ArrayRef<Attribute> fields,
                                      hw::StructType structTy) {
-  const unsigned structWidth =
-      static_cast<unsigned>(hw::getBitWidth(structTy));
-  if (structWidth == 0 || structWidth > 64)
+  int64_t structWidthSigned = hw::getBitWidth(structTy);
+  if (structWidthSigned <= 0)
     return std::nullopt;
+  uint64_t structWidthU = static_cast<uint64_t>(structWidthSigned);
+  if (structWidthU > kArcilatorRuntimeMaxBitWidth)
+    return std::nullopt;
+  const unsigned structWidth = static_cast<unsigned>(structWidthU);
 
   auto elements = structTy.getElements();
   if (fields.size() != elements.size())
@@ -128,8 +136,6 @@ tryEvalRuntimeSignalInitStructFields(ArrayRef<Attribute> fields,
     if (fieldWidthSigned <= 0)
       return std::nullopt;
     unsigned fieldWidth = static_cast<unsigned>(fieldWidthSigned);
-    if (fieldWidth > 64)
-      return std::nullopt;
 
     // Match HW struct packing (MSB-first). Keep the special-case 4-state
     // `{value, unknown}` encoding stable by treating `value` as low bits.
@@ -266,8 +272,10 @@ static std::optional<APInt> tryDefaultRuntimeSignalInit(Type elemTy) {
       return std::nullopt;
     unsigned elemWidth = static_cast<unsigned>(elemWidthSigned);
     uint64_t numElems = arrayTy.getNumElements();
+    if (elemWidth == 0 || numElems > kArcilatorRuntimeMaxBitWidth / elemWidth)
+      return std::nullopt;
     uint64_t totalWidthU = numElems * static_cast<uint64_t>(elemWidth);
-    if (totalWidthU == 0 || totalWidthU > 64)
+    if (totalWidthU == 0 || totalWidthU > kArcilatorRuntimeMaxBitWidth)
       return std::nullopt;
     unsigned totalWidth = static_cast<unsigned>(totalWidthU);
     APInt packed(totalWidth, 0);
@@ -290,8 +298,10 @@ static std::optional<APInt> tryDefaultRuntimeSignalInit(Type elemTy) {
       return std::nullopt;
     unsigned elemWidth = static_cast<unsigned>(elemWidthSigned);
     uint64_t numElems = arrayTy.getNumElements();
+    if (elemWidth == 0 || numElems > kArcilatorRuntimeMaxBitWidth / elemWidth)
+      return std::nullopt;
     uint64_t totalWidthU = numElems * static_cast<uint64_t>(elemWidth);
-    if (totalWidthU == 0 || totalWidthU > 64)
+    if (totalWidthU == 0 || totalWidthU > kArcilatorRuntimeMaxBitWidth)
       return std::nullopt;
     unsigned totalWidth = static_cast<unsigned>(totalWidthU);
     APInt packed(totalWidth, 0);
@@ -307,10 +317,13 @@ static std::optional<APInt> tryDefaultRuntimeSignalInit(Type elemTy) {
   }
 
   if (auto structTy = dyn_cast<hw::StructType>(elemTy)) {
-    const unsigned structWidth =
-        static_cast<unsigned>(hw::getBitWidth(structTy));
-    if (structWidth == 0 || structWidth > 64)
+    int64_t structWidthSigned = hw::getBitWidth(structTy);
+    if (structWidthSigned <= 0)
       return std::nullopt;
+    uint64_t structWidthU = static_cast<uint64_t>(structWidthSigned);
+    if (structWidthU > kArcilatorRuntimeMaxBitWidth)
+      return std::nullopt;
+    const unsigned structWidth = static_cast<unsigned>(structWidthU);
 
     APInt packed(structWidth, 0);
     auto elements = structTy.getElements();
@@ -591,6 +604,10 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
                                {}));
   (void)getOrInsertFunc(
       module, "__arcilator_frame_load_u64",
+      rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                               {rewriter.getI64Type()}));
+  (void)getOrInsertFunc(
+      module, "__arcilator_sig_read_u64",
       rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
                                {rewriter.getI64Type()}));
 
@@ -1635,7 +1652,8 @@ static LogicalResult resolveRuntimeSignal(Value handle, ResolvedRuntimeSignal &o
         while (auto alias = dyn_cast<hw::TypeAliasType>(outTy))
           outTy = alias.getInnerType();
         int64_t bw = hw::getBitWidth(outTy);
-        if (bw > 0 && bw <= 64 && isa<hw::StructType, hw::ArrayType>(outTy))
+        if (bw > 0 && static_cast<uint64_t>(bw) <= kArcilatorRuntimeMaxBitWidth &&
+            isa<hw::StructType, hw::ArrayType>(outTy))
           break;
         if (isa<hw::InOutType>(cast.getResult(0).getType()))
           break;
@@ -1683,7 +1701,8 @@ static LogicalResult resolveRuntimeSignal(Value handle, ResolvedRuntimeSignal &o
         while (auto alias = dyn_cast<hw::TypeAliasType>(outTy))
           outTy = alias.getInnerType();
         int64_t bw = hw::getBitWidth(outTy);
-        if (bw > 0 && bw <= 64 && isa<hw::StructType, hw::ArrayType>(outTy)) {
+        if (bw > 0 && static_cast<uint64_t>(bw) <= kArcilatorRuntimeMaxBitWidth &&
+            isa<hw::StructType, hw::ArrayType>(outTy)) {
           out.dynSigId = input;
           out.totalWidth = static_cast<uint64_t>(bw);
           return success();
@@ -3700,8 +3719,11 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
       }
 
       Type convertedTy = typeConverter->convertType(op.getType());
-      int64_t totalWidth = convertedTy ? hw::getBitWidth(convertedTy) : -1;
-      if (needsRuntimeStorage && totalWidth > 0 && totalWidth <= 64) {
+      int64_t totalWidthSigned = convertedTy ? hw::getBitWidth(convertedTy) : -1;
+      uint64_t totalWidth =
+          totalWidthSigned > 0 ? static_cast<uint64_t>(totalWidthSigned) : 0;
+      if (needsRuntimeStorage && totalWidth > 0 &&
+          totalWidth <= kArcilatorRuntimeMaxBitWidth) {
         Value handle;
         if (auto intTy = dyn_cast<IntegerType>(convertedTy)) {
           uint64_t sigId = static_cast<uint64_t>(sigIdAttr.getInt());
@@ -3716,7 +3738,7 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
             defOp->setAttr(kArcilatorSigOffsetAttr,
                            rewriter.getI32IntegerAttr(0));
             defOp->setAttr(kArcilatorSigTotalWidthAttr,
-                           rewriter.getI32IntegerAttr(totalWidth));
+                           rewriter.getI32IntegerAttr(static_cast<int64_t>(totalWidth)));
             // Preserve the LLHD signal initializer as a constant i64 payload so
             // the later Arc state-lowering pipeline can seed runtime-managed
             // signals at time 0 (important for 2-state SV types).
@@ -3738,24 +3760,45 @@ struct SignalOpConversion : public OpConversionPattern<llhd::SignalOp> {
             if (initBits) {
               APInt bits =
                   initBits->zextOrTrunc(static_cast<unsigned>(totalWidth));
-              uint64_t initU64 = bits.getZExtValue();
+              uint64_t initWord0 = 0;
+              if (totalWidth <= 64) {
+                initWord0 = bits.zextOrTrunc(64).getZExtValue();
+              } else {
+                uint64_t chunkWidth = std::min<uint64_t>(64, totalWidth);
+                APInt chunk = bits.extractBits(static_cast<unsigned>(chunkWidth), 0);
+                initWord0 = chunk.zextOrTrunc(64).getZExtValue();
+              }
               defOp->setAttr(kArcilatorSigInitU64Attr,
-                             rewriter.getI64IntegerAttr(initU64));
+                             rewriter.getI64IntegerAttr(initWord0));
               if (sigInits) {
-                uint64_t sigId = static_cast<uint64_t>(sigIdAttr.getInt());
-                auto [it, inserted] = sigInits->try_emplace(
-                    sigId, ArcilatorRuntimeSigInit{
-                               initU64,
-                               static_cast<uint64_t>(totalWidth)});
-                if (!inserted) {
-                  // Keep the first initializer and width; later duplicates must
-                  // agree.
-                  if (it->second.initU64 != initU64)
-                    op->emitWarning("conflicting runtime init value for sigId ")
-                        << sigId;
-                  if (it->second.totalWidth != static_cast<uint64_t>(totalWidth))
-                    op->emitWarning("conflicting runtime width for sigId ")
-                        << sigId;
+                uint64_t baseSigId = static_cast<uint64_t>(sigIdAttr.getInt());
+                uint64_t words = (totalWidth + (kArcilatorRuntimeWordBits - 1)) /
+                                 kArcilatorRuntimeWordBits;
+                if (!words)
+                  words = 1;
+                for (uint64_t w = 0; w < words; ++w) {
+                  uint64_t chunkOffset = w * kArcilatorRuntimeWordBits;
+                  uint64_t chunkWidth =
+                      std::min<uint64_t>(kArcilatorRuntimeWordBits,
+                                         totalWidth - chunkOffset);
+                  if (chunkWidth == 0)
+                    break;
+                  APInt chunk = bits.extractBits(static_cast<unsigned>(chunkWidth),
+                                                 static_cast<unsigned>(chunkOffset));
+                  uint64_t initU64 = chunk.zextOrTrunc(64).getZExtValue();
+                  uint64_t sigId = baseSigId + w;
+                  auto [it, inserted] = sigInits->try_emplace(
+                      sigId, ArcilatorRuntimeSigInit{initU64, chunkWidth});
+                  if (!inserted) {
+                    // Keep the first initializer and width; later duplicates must
+                    // agree.
+                    if (it->second.initU64 != initU64)
+                      op->emitWarning("conflicting runtime init value for sigId ")
+                          << sigId;
+                    if (it->second.totalWidth != chunkWidth)
+                      op->emitWarning("conflicting runtime width for sigId ")
+                          << sigId;
+                  }
                 }
               }
             }
@@ -3791,10 +3834,13 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
     uint64_t totalWidth = resolved.totalWidth;
 
     Type convertedTy = typeConverter->convertType(op.getType());
-    int64_t resultWidth = convertedTy ? hw::getBitWidth(convertedTy) : -1;
-    if (!convertedTy || resultWidth <= 0 || resultWidth > 64)
+    int64_t resultWidthSigned = convertedTy ? hw::getBitWidth(convertedTy) : -1;
+    if (!convertedTy || resultWidthSigned <= 0)
       return rewriter.notifyMatchFailure(op, "unsupported probed signal type");
-    if (totalWidth == 0 || totalWidth > 64)
+    uint64_t resultWidth = static_cast<uint64_t>(resultWidthSigned);
+    if (resultWidth > kArcilatorRuntimeMaxBitWidth)
+      return rewriter.notifyMatchFailure(op, "unsupported probed signal width");
+    if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth)
       return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
 
     auto module = op->getParentOfType<mlir::ModuleOp>();
@@ -3805,6 +3851,27 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
         module, "__arcilator_sig_load_u64",
         rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
                                  {rewriter.getI64Type()}));
+    (void)getOrInsertFunc(
+        module, "__arcilator_sig_read_u64",
+        rewriter.getFunctionType({rewriter.getI32Type(), rewriter.getI32Type()},
+                                 {rewriter.getI64Type()}));
+
+    // In wait polling blocks, sample committed signal state rather than any
+    // in-delta pending writes. This avoids ordering-dependent loss of event
+    // triggers such as `->e;` paired with `always @(e)` at time 0.
+    bool committedRead = false;
+    for (Operation &candidate : *op->getBlock()) {
+      auto call = dyn_cast<mlir::func::CallOp>(candidate);
+      if (!call)
+        continue;
+      StringRef callee = call.getCallee();
+      if (callee == "__arcilator_wait_change" || callee == "__arcilator_wait_delay") {
+        committedRead = true;
+        break;
+      }
+    }
+    StringRef loadCallee =
+        committedRead ? "__arcilator_sig_read_u64" : "__arcilator_sig_load_u64";
 
     uint32_t procId = 0xFFFFFFFFu;
     if (auto exec = op->getParentOfType<arc::ExecuteOp>()) {
@@ -3832,15 +3899,29 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
         dyn = comb::ExtractOp::create(rewriter, op.getLoc(), dyn, 0, 32);
       sigIdVal = dyn;
     }
+    auto loadWord = [&](Value baseSigId, uint64_t wordIdx) -> Value {
+      Value wordId = baseSigId;
+      if (wordIdx != 0) {
+        Value add = buildI32Constant(rewriter, op.getLoc(),
+                                     static_cast<uint32_t>(wordIdx));
+        wordId = rewriter.createOrFold<comb::AddOp>(op.getLoc(), baseSigId, add,
+                                                    /*twoState=*/true);
+      }
+      return rewriter
+          .create<mlir::func::CallOp>(op.getLoc(), loadCallee,
+                                      rewriter.getI64Type(),
+                                      ValueRange{wordId, procIdVal})
+          .getResult(0);
+    };
 
-    Value loaded =
-        rewriter
-            .create<mlir::func::CallOp>(op.getLoc(), "__arcilator_sig_load_u64",
-                                        rewriter.getI64Type(),
-                                        ValueRange{sigIdVal, procIdVal})
-            .getResult(0);
-    Value bitsVal = loaded;
+    Value bitsVal;
     if (resolved.dynamicOffset) {
+      // TODO: support multi-word dynamic extracts. For now, keep the original
+      // single-word behavior (needed for common <=64-bit cases).
+      if (resultWidth > 64 || totalWidth > 64)
+        return rewriter.notifyMatchFailure(op, "unsupported dynamic probe width");
+
+      Value loaded = loadWord(sigIdVal, /*wordIdx=*/0);
       Value offsetVal = resolved.dynamicOffset;
       auto offsetTy = dyn_cast<IntegerType>(offsetVal.getType());
       if (!offsetTy)
@@ -3867,13 +3948,49 @@ struct ProbeOpConversion : public OpConversionPattern<llhd::PrbOp> {
                                           shifted, 0);
       }
     } else {
-      if (sliceOffset + static_cast<uint64_t>(resultWidth) > 64)
-        return rewriter.notifyMatchFailure(
-            op, "signal slice exceeds 64-bit runtime storage");
-      if (resultWidth != 64 || sliceOffset != 0) {
+      if (sliceOffset + resultWidth > totalWidth)
+        return rewriter.notifyMatchFailure(op, "signal slice exceeds runtime width");
+
+      uint64_t startBit = sliceOffset;
+      uint64_t endBit = sliceOffset + resultWidth - 1;
+      uint64_t firstWord = startBit / kArcilatorRuntimeWordBits;
+      uint64_t lastWord = endBit / kArcilatorRuntimeWordBits;
+      uint64_t bitInFirst = startBit % kArcilatorRuntimeWordBits;
+      uint64_t numWords = lastWord - firstWord + 1;
+      if (numWords == 0)
+        return rewriter.notifyMatchFailure(op, "empty probe slice");
+
+      // Load the necessary 64-bit words and concatenate MSB-first.
+      Value packed;
+      if (numWords == 1) {
+        packed = loadWord(sigIdVal, firstWord);
+      } else {
+        packed = loadWord(sigIdVal, lastWord);
+        for (uint64_t w = lastWord; w-- > firstWord;) {
+          Value part = loadWord(sigIdVal, w);
+          packed = rewriter.createOrFold<comb::ConcatOp>(op.getLoc(), packed, part);
+        }
+      }
+
+      Value aligned = packed;
+      if (bitInFirst != 0) {
+        unsigned packedWidth = cast<IntegerType>(packed.getType()).getWidth();
+        Value shiftAmt =
+            hw::ConstantOp::create(rewriter, op.getLoc(),
+                                   APInt(packedWidth, bitInFirst));
+        aligned =
+            rewriter.createOrFold<comb::ShrUOp>(op.getLoc(), packed, shiftAmt);
+      }
+
+      unsigned packedWidth = cast<IntegerType>(aligned.getType()).getWidth();
+      if (resultWidth != static_cast<uint64_t>(packedWidth) || bitInFirst != 0) {
+        if (resultWidth > static_cast<uint64_t>(packedWidth))
+          return rewriter.notifyMatchFailure(op, "probe slice overflow");
         bitsVal = comb::ExtractOp::create(rewriter, op.getLoc(),
                                           rewriter.getIntegerType(resultWidth),
-                                          loaded, sliceOffset);
+                                          aligned, 0);
+      } else {
+        bitsVal = aligned;
       }
     }
 
@@ -3927,7 +4044,8 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
 
     Type rawValueTy = adaptor.getValue().getType();
     int64_t valueWidth = hw::getBitWidth(rawValueTy);
-    if (valueWidth <= 0 || valueWidth > 64)
+    if (valueWidth <= 0 ||
+        static_cast<uint64_t>(valueWidth) > kArcilatorRuntimeMaxBitWidth)
       return rewriter.notifyMatchFailure(op, "unsupported driven value type");
 
     auto valueTy = rewriter.getIntegerType(valueWidth);
@@ -3939,7 +4057,7 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
 
     uint64_t sliceOffset = resolved.baseOffset;
     uint64_t totalWidth = resolved.totalWidth;
-    if (totalWidth == 0 || totalWidth > 64)
+    if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth)
       return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
     if (!resolved.dynamicOffset &&
         sliceOffset + static_cast<uint64_t>(valueTy.getWidth()) > totalWidth)
@@ -3975,8 +4093,6 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
 
     const StringRef loadCallee =
         isNbaDrive ? "__arcilator_sig_load_nba_u64" : "__arcilator_sig_load_u64";
-    const StringRef storeCallee =
-        isNbaDrive ? "__arcilator_sig_store_nba_u64" : "__arcilator_sig_store_u64";
 
     uint32_t procId = 0xFFFFFFFFu;
     if (auto exec = op->getParentOfType<arc::ExecuteOp>()) {
@@ -4027,6 +4143,8 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
       value64 = comb::createZExt(rewriter, loc, value64, 64);
 
     if (resolved.dynamicOffset) {
+      if (totalWidth > 64 || valueWidth > 64)
+        return rewriter.notifyMatchFailure(op, "unsupported dynamic drive width");
       Value offsetVal = resolved.dynamicOffset;
       auto offsetTy = dyn_cast<IntegerType>(offsetVal.getType());
       if (!offsetTy)
@@ -4114,101 +4232,132 @@ struct DrvOpConversion : public OpConversionPattern<llhd::DrvOp> {
       return success();
     }
 
-    if (sliceOffset != 0) {
-      Value shiftAmt = buildI64Constant(rewriter, loc, sliceOffset);
-      value64 = rewriter.createOrFold<comb::ShlOp>(loc, value64, shiftAmt);
-    }
+    // Static slice store into potentially multi-word runtime-managed packed
+    // storage. Split the drive into 64-bit runtime words and preserve
+    // nonblocking assignment semantics via masked NBA stores.
+    uint64_t startBit = sliceOffset;
+    uint64_t endBit = sliceOffset + static_cast<uint64_t>(valueWidth) - 1;
+    if (endBit >= totalWidth)
+      return rewriter.notifyMatchFailure(op, "signal slice exceeds runtime width");
 
-    APInt totalMask = APInt::getAllOnes(64);
-    if (totalWidth < 64)
-      totalMask = APInt::getAllOnes(totalWidth).zext(64);
-    Value totalMaskCst = hw::ConstantOp::create(
-        rewriter, loc, rewriter.getIntegerAttr(rewriter.getI64Type(), totalMask));
+    auto wordSigId = [&](uint64_t wordIdx) -> Value {
+      Value wordId = sigIdVal;
+      if (wordIdx != 0) {
+        Value add = buildI32Constant(rewriter, loc,
+                                     static_cast<uint32_t>(wordIdx));
+        wordId = rewriter.createOrFold<comb::AddOp>(loc, sigIdVal, add,
+                                                    /*twoState=*/true);
+      }
+      return wordId;
+    };
 
-    const bool isFullWrite =
-        (sliceOffset == 0 && static_cast<uint64_t>(valueWidth) == totalWidth);
-    Value storeVal;
-    if (isFullWrite) {
-      Value newVal = rewriter.createOrFold<comb::AndOp>(loc, value64, totalMaskCst);
+    uint64_t firstWord = startBit / kArcilatorRuntimeWordBits;
+    uint64_t lastWord = endBit / kArcilatorRuntimeWordBits;
+    for (uint64_t wordIdx = firstWord; wordIdx <= lastWord; ++wordIdx) {
+      uint64_t wordStartBit = wordIdx * kArcilatorRuntimeWordBits;
+      uint64_t wordWidth = std::min<uint64_t>(kArcilatorRuntimeWordBits,
+                                              totalWidth - wordStartBit);
+      if (wordWidth == 0)
+        return rewriter.notifyMatchFailure(op, "empty runtime signal word");
+
+      uint64_t wordMaskU64 =
+          wordWidth == 64 ? ~0ULL : ((1ULL << wordWidth) - 1ULL);
+
+      uint64_t regionStartBit = std::max<uint64_t>(startBit, wordStartBit);
+      uint64_t regionEndBit =
+          std::min<uint64_t>(endBit, wordStartBit + kArcilatorRuntimeWordBits - 1);
+      uint64_t bitInWord = regionStartBit - wordStartBit;
+      uint64_t regionWidth = regionEndBit - regionStartBit + 1;
+      if (regionWidth == 0 || regionWidth > kArcilatorRuntimeWordBits)
+        return rewriter.notifyMatchFailure(op, "invalid drive slice");
+
+      uint64_t regionMaskU64 = 0;
+      if (regionWidth == 64) {
+        regionMaskU64 = ~0ULL;
+      } else {
+        regionMaskU64 = ((1ULL << regionWidth) - 1ULL) << bitInWord;
+      }
+      regionMaskU64 &= wordMaskU64;
+
+      Value wordMaskCst = buildI64Constant(rewriter, loc, wordMaskU64);
+      Value regionMaskCst = buildI64Constant(rewriter, loc, regionMaskU64);
+
+      uint64_t valueOffset = regionStartBit - startBit;
+      Value chunk = valueInt;
+      if (valueOffset != 0 ||
+          static_cast<uint64_t>(valueWidth) != regionWidth) {
+        chunk = comb::ExtractOp::create(rewriter, loc, valueInt,
+                                        static_cast<unsigned>(valueOffset),
+                                        static_cast<unsigned>(regionWidth));
+      }
+
+      Value chunk64 = chunk;
+      if (regionWidth < 64)
+        chunk64 = comb::createZExt(rewriter, loc, chunk64, 64);
+      Value inserted = chunk64;
+      if (bitInWord != 0) {
+        Value shiftAmt = buildI64Constant(rewriter, loc, bitInWord);
+        inserted = rewriter.createOrFold<comb::ShlOp>(loc, inserted, shiftAmt);
+      }
+      inserted = rewriter.createOrFold<comb::AndOp>(loc, inserted, regionMaskCst);
+
+      Value wordId = wordSigId(wordIdx);
       if (isNbaDrive) {
-        Value mask = totalMaskCst;
+        Value mask = regionMaskCst;
         if (!constEnable || !*constEnable) {
           Value zero = buildI64Constant(rewriter, loc, 0);
           mask = rewriter.createOrFold<comb::MuxOp>(loc, enable, mask, zero);
         }
         rewriter.create<mlir::func::CallOp>(
             loc, "__arcilator_sig_store_nba_masked_u64", TypeRange{},
-            ValueRange{sigIdVal, mask, newVal, procIdVal});
-        rewriter.eraseOp(op);
-        if (resolved.dynamicOffsetOp &&
-            llvm::all_of(resolved.dynamicOffsetOp->getResults(),
-                         [](Value v) { return v.use_empty(); }))
-          rewriter.eraseOp(resolved.dynamicOffsetOp);
-        return success();
+            ValueRange{wordId, mask, inserted, procIdVal});
+        continue;
       }
-      storeVal = newVal;
-      if (!constEnable || !*constEnable) {
+
+      Value storeVal;
+      if (regionMaskU64 == wordMaskU64) {
+        storeVal = rewriter.createOrFold<comb::AndOp>(loc, inserted, wordMaskCst);
+        if (!constEnable || !*constEnable) {
+          Value cur =
+              rewriter
+                  .create<mlir::func::CallOp>(loc, loadCallee,
+                                              rewriter.getI64Type(),
+                                              ValueRange{wordId, procIdVal})
+                  .getResult(0);
+          Value curMasked =
+              rewriter.createOrFold<comb::AndOp>(loc, cur, wordMaskCst);
+          storeVal =
+              rewriter.createOrFold<comb::MuxOp>(loc, enable, storeVal, curMasked);
+        }
+      } else {
+        uint64_t clearMaskU64 = wordMaskU64 & ~regionMaskU64;
+        Value clearMaskCst = buildI64Constant(rewriter, loc, clearMaskU64);
+
         Value cur =
             rewriter
                 .create<mlir::func::CallOp>(loc, loadCallee,
                                             rewriter.getI64Type(),
-                                            ValueRange{sigIdVal, procIdVal})
+                                            ValueRange{wordId, procIdVal})
                 .getResult(0);
-        Value curMasked = rewriter.createOrFold<comb::AndOp>(loc, cur, totalMaskCst);
-        storeVal =
-            rewriter.createOrFold<comb::MuxOp>(loc, enable, newVal, curMasked);
-      }
-    } else {
-      Value cur =
-          rewriter
-              .create<mlir::func::CallOp>(loc, loadCallee,
-                                          rewriter.getI64Type(),
-                                          ValueRange{sigIdVal, procIdVal})
-              .getResult(0);
+        Value curMasked = rewriter.createOrFold<comb::AndOp>(loc, cur, wordMaskCst);
 
-      unsigned sliceWidth = static_cast<unsigned>(valueWidth);
-      APInt sliceMask = APInt::getAllOnes(sliceWidth).zext(64) << sliceOffset;
-      Value sliceMaskCst = hw::ConstantOp::create(
-          rewriter, loc,
-          rewriter.getIntegerAttr(rewriter.getI64Type(), sliceMask));
-      if (isNbaDrive) {
-        Value mask = sliceMaskCst;
+        Value cleared =
+            rewriter.createOrFold<comb::AndOp>(loc, curMasked, clearMaskCst);
+        Value storeSlice = inserted;
         if (!constEnable || !*constEnable) {
-          Value zero = buildI64Constant(rewriter, loc, 0);
-          mask = rewriter.createOrFold<comb::MuxOp>(loc, enable, mask, zero);
+          Value oldSlice =
+              rewriter.createOrFold<comb::AndOp>(loc, curMasked, regionMaskCst);
+          storeSlice =
+              rewriter.createOrFold<comb::MuxOp>(loc, enable, storeSlice, oldSlice);
         }
-        Value inserted =
-            rewriter.createOrFold<comb::AndOp>(loc, value64, sliceMaskCst);
-        rewriter.create<mlir::func::CallOp>(
-            loc, "__arcilator_sig_store_nba_masked_u64", TypeRange{},
-            ValueRange{sigIdVal, mask, inserted, procIdVal});
-        rewriter.eraseOp(op);
-        if (resolved.dynamicOffsetOp &&
-            llvm::all_of(resolved.dynamicOffsetOp->getResults(),
-                         [](Value v) { return v.use_empty(); }))
-          rewriter.eraseOp(resolved.dynamicOffsetOp);
-        return success();
+        Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, storeSlice);
+        storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, wordMaskCst);
       }
-      APInt clearMask = APInt::getAllOnes(64) ^ sliceMask;
-      Value clearMaskCst = hw::ConstantOp::create(
-          rewriter, loc,
-          rewriter.getIntegerAttr(rewriter.getI64Type(), clearMask));
 
-      Value cleared = rewriter.createOrFold<comb::AndOp>(loc, cur, clearMaskCst);
-      Value inserted = rewriter.createOrFold<comb::AndOp>(loc, value64, sliceMaskCst);
-      Value storeSlice = inserted;
-      if (!constEnable || !*constEnable) {
-        Value oldSlice = rewriter.createOrFold<comb::AndOp>(loc, cur, sliceMaskCst);
-        storeSlice =
-            rewriter.createOrFold<comb::MuxOp>(loc, enable, storeSlice, oldSlice);
-      }
-      Value updated = rewriter.createOrFold<comb::OrOp>(loc, cleared, storeSlice);
-      storeVal = rewriter.createOrFold<comb::AndOp>(loc, updated, totalMaskCst);
+      rewriter.create<mlir::func::CallOp>(loc, "__arcilator_sig_store_u64",
+                                          TypeRange{},
+                                          ValueRange{wordId, storeVal, procIdVal});
     }
-
-    rewriter.create<mlir::func::CallOp>(loc, storeCallee,
-                                        TypeRange{},
-                                        ValueRange{sigIdVal, storeVal, procIdVal});
     rewriter.eraseOp(op);
 
     if (resolved.dynamicOffsetOp &&
@@ -4268,7 +4417,7 @@ struct SigExtractOpConversion : public OpConversionPattern<llhd::SigExtractOp> {
           totalWidth = static_cast<uint64_t>(hw::getBitWidth(inputVal.getType()));
 
         uint64_t newOffset = baseOffset + *lowBit;
-        if (totalWidth == 0 || totalWidth > 64 ||
+        if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth ||
             newOffset + outTy.getWidth() > totalWidth)
           return rewriter.notifyMatchFailure(op, "extract slice exceeds runtime width");
 
@@ -4349,7 +4498,7 @@ struct SigStructExtractOpConversion
         if (totalWidth == 0)
           totalWidth =
               static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
-        if (totalWidth == 0 || totalWidth > 64)
+        if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth)
           return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
 
         auto structTy = type_cast<hw::StructType>(adaptor.getInput().getType());
@@ -4442,7 +4591,7 @@ struct SigArrayGetOpConversion
         if (totalWidth == 0)
           totalWidth =
               static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
-        if (totalWidth == 0 || totalWidth > 64)
+        if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth)
           return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
 
         auto arrayTy = type_cast<hw::ArrayType>(adaptor.getInput().getType());
@@ -4501,7 +4650,7 @@ struct StructFieldInOutOpConversion
         if (totalWidth == 0)
           totalWidth =
               static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
-        if (totalWidth == 0 || totalWidth > 64)
+        if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth)
           return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
 
         auto structTy = type_cast<hw::StructType>(adaptor.getInput().getType());
@@ -4570,7 +4719,7 @@ struct StructFieldInOutOpConversion
       uint64_t totalWidth = resolved.totalWidth;
       if (totalWidth == 0)
         totalWidth = static_cast<uint64_t>(hw::getBitWidth(adaptor.getInput().getType()));
-      if (totalWidth == 0 || totalWidth > 64)
+      if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth)
         return rewriter.notifyMatchFailure(op, "unsupported runtime signal width");
 
       auto structTy = type_cast<hw::StructType>(adaptor.getInput().getType());
@@ -4896,16 +5045,45 @@ void ConvertToArcsPass::runOnOperation() {
                       idBuilder.getI32IntegerAttr(nextWaitId++));
     });
   });
+  auto runtimeWordsForSignal = [&](llhd::SignalOp sig) -> uint32_t {
+    bool needsRuntimeStorage = false;
+    for (Operation *user : sig.getResult().getUsers()) {
+      if (isa<llhd::PrbOp, llhd::DrvOp, llhd::SigExtractOp,
+              llhd::SigStructExtractOp, llhd::SigArrayGetOp,
+              llhd::SigArraySliceOp, sv::StructFieldInOutOp>(user)) {
+        needsRuntimeStorage = true;
+        break;
+      }
+    }
+    if (!needsRuntimeStorage)
+      return 1u;
+
+    Type ty = stripInOutAndAliasTypes(sig.getType());
+    int64_t bwSigned = hw::getBitWidth(ty);
+    if (bwSigned <= 0)
+      return 1u;
+    uint64_t bw = static_cast<uint64_t>(bwSigned);
+    if (bw <= kArcilatorRuntimeWordBits)
+      return 1u;
+    if (bw > kArcilatorRuntimeMaxBitWidth)
+      return 1u;
+    uint64_t words = (bw + (kArcilatorRuntimeWordBits - 1)) / kArcilatorRuntimeWordBits;
+    return words ? static_cast<uint32_t>(words) : 1u;
+  };
+
   getOperation().walk([&](llhd::SignalOp sig) {
     if (auto sigIdAttr = sig->getAttrOfType<IntegerAttr>(kArcilatorSigIdAttr)) {
       uint64_t id = static_cast<uint64_t>(sigIdAttr.getInt());
-      if (id + 1 > nextSigId)
-        nextSigId = static_cast<uint32_t>(id + 1);
+      uint64_t end = id + static_cast<uint64_t>(runtimeWordsForSignal(sig));
+      if (end > nextSigId)
+        nextSigId = static_cast<uint32_t>(end);
     }
   });
   getOperation().walk([&](llhd::SignalOp sig) {
-    if (!sig->hasAttr(kArcilatorSigIdAttr))
-      sig->setAttr(kArcilatorSigIdAttr, idBuilder.getI32IntegerAttr(nextSigId++));
+    if (!sig->hasAttr(kArcilatorSigIdAttr)) {
+      sig->setAttr(kArcilatorSigIdAttr, idBuilder.getI32IntegerAttr(nextSigId));
+      nextSigId += runtimeWordsForSignal(sig);
+    }
   });
 
   // Pre-lower scheduled LLHD processes into `arc.execute` state machines before
@@ -5962,7 +6140,8 @@ void ConvertToArcsPass::runOnOperation() {
 
     Type resultTy = prb.getType();
     int64_t resultWidth = hw::getBitWidth(resultTy);
-    if (resultWidth <= 0 || resultWidth > 64) {
+    if (resultWidth <= 0 ||
+        static_cast<uint64_t>(resultWidth) > kArcilatorRuntimeMaxBitWidth) {
       prb.emitOpError() << "unsupported probed type for runtime lowering: "
                         << resultTy;
       probeLoweringFailed = true;
@@ -5972,10 +6151,10 @@ void ConvertToArcsPass::runOnOperation() {
     uint64_t totalWidth = resolved.totalWidth;
     if (totalWidth == 0) {
       int64_t bw = hw::getBitWidth(resultTy);
-      if (bw > 0)
-        totalWidth = static_cast<uint64_t>(bw);
-    }
-    if (totalWidth == 0 || totalWidth > 64) {
+    if (bw > 0)
+      totalWidth = static_cast<uint64_t>(bw);
+  }
+    if (totalWidth == 0 || totalWidth > kArcilatorRuntimeMaxBitWidth) {
       prb.emitOpError() << "unsupported runtime signal width for probe: "
                         << totalWidth;
       probeLoweringFailed = true;
@@ -6025,15 +6204,28 @@ void ConvertToArcsPass::runOnOperation() {
       sigIdVal = dyn;
     }
 
-    Value loaded =
-        b.create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
-                                     b.getI64Type(),
-                                     ValueRange{sigIdVal, procIdVal})
-            .getResult(0);
-
-    Value bitsVal = loaded;
     uint64_t sliceOffset = resolved.baseOffset;
+    auto loadWord = [&](uint64_t wordIdx) -> Value {
+      Value wordId = sigIdVal;
+      if (wordIdx != 0) {
+        Value add = buildI32Constant(b, loc, static_cast<uint32_t>(wordIdx));
+        wordId = b.createOrFold<comb::AddOp>(loc, sigIdVal, add, /*twoState=*/true);
+      }
+      return b
+          .create<mlir::func::CallOp>(loc, "__arcilator_sig_load_u64",
+                                      b.getI64Type(),
+                                      ValueRange{wordId, procIdVal})
+          .getResult(0);
+    };
+
+    Value bitsVal;
     if (resolved.dynamicOffset) {
+      if (resultWidth > 64 || totalWidth > 64) {
+        prb.emitOpError() << "unsupported dynamic probe width for runtime lowering";
+        probeLoweringFailed = true;
+        continue;
+      }
+      Value loaded = loadWord(/*wordIdx=*/0);
       Value offsetVal = resolved.dynamicOffset;
       auto offsetTy = dyn_cast<IntegerType>(offsetVal.getType());
       if (!offsetTy) {
@@ -6061,15 +6253,55 @@ void ConvertToArcsPass::runOnOperation() {
                                           shifted, 0);
       }
     } else {
-      if (sliceOffset + static_cast<uint64_t>(resultWidth) > 64) {
-        prb.emitOpError()
-            << "signal slice exceeds 64-bit runtime storage for probe";
+      uint64_t sliceWidth = static_cast<uint64_t>(resultWidth);
+      if (sliceOffset + sliceWidth > totalWidth) {
+        prb.emitOpError() << "signal slice exceeds runtime width for probe";
         probeLoweringFailed = true;
         continue;
       }
-      if (resultWidth != 64 || sliceOffset != 0) {
+
+      uint64_t startBit = sliceOffset;
+      uint64_t endBit = sliceOffset + sliceWidth - 1;
+      uint64_t firstWord = startBit / kArcilatorRuntimeWordBits;
+      uint64_t lastWord = endBit / kArcilatorRuntimeWordBits;
+      uint64_t bitInFirst = startBit % kArcilatorRuntimeWordBits;
+      uint64_t numWords = lastWord - firstWord + 1;
+      if (numWords == 0) {
+        prb.emitOpError() << "empty probe slice for runtime lowering";
+        probeLoweringFailed = true;
+        continue;
+      }
+
+      Value packed;
+      if (numWords == 1) {
+        packed = loadWord(firstWord);
+      } else {
+        packed = loadWord(lastWord);
+        for (uint64_t w = lastWord; w-- > firstWord;) {
+          Value part = loadWord(w);
+          packed = b.createOrFold<comb::ConcatOp>(loc, packed, part);
+        }
+      }
+
+      Value aligned = packed;
+      if (bitInFirst != 0) {
+        unsigned packedWidth = cast<IntegerType>(packed.getType()).getWidth();
+        Value shiftAmt =
+            hw::ConstantOp::create(b, loc, APInt(packedWidth, bitInFirst));
+        aligned = b.createOrFold<comb::ShrUOp>(loc, packed, shiftAmt);
+      }
+
+      unsigned packedWidth = cast<IntegerType>(aligned.getType()).getWidth();
+      if (sliceWidth > static_cast<uint64_t>(packedWidth)) {
+        prb.emitOpError() << "probe slice overflow for runtime lowering";
+        probeLoweringFailed = true;
+        continue;
+      }
+      if (sliceWidth != static_cast<uint64_t>(packedWidth) || bitInFirst != 0) {
         bitsVal = comb::ExtractOp::create(b, loc, b.getIntegerType(resultWidth),
-                                          loaded, sliceOffset);
+                                          aligned, 0);
+      } else {
+        bitsVal = aligned;
       }
     }
 
@@ -6078,6 +6310,11 @@ void ConvertToArcsPass::runOnOperation() {
       replacement = b.createOrFold<hw::BitcastOp>(loc, resultTy, replacement);
     prb.replaceAllUsesWith(replacement);
     prb.erase();
+
+    if (resolved.dynamicOffsetOp &&
+        llvm::all_of(resolved.dynamicOffsetOp->getResults(),
+                     [](Value v) { return v.use_empty(); }))
+      resolved.dynamicOffsetOp->erase();
   }
   if (probeLoweringFailed) {
     emitError(getOperation().getLoc())
