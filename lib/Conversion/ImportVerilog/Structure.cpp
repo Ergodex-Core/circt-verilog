@@ -2208,6 +2208,16 @@ int32_t Context::getOrAssignClassFieldId(const slang::ast::VariableSymbol &field
   return id;
 }
 
+int32_t Context::getOrAssignConstraintBlockId(
+    const slang::ast::ConstraintBlockSymbol &block) {
+  auto it = constraintBlockIds.find(&block);
+  if (it != constraintBlockIds.end())
+    return it->second;
+  int32_t id = nextConstraintBlockId++;
+  constraintBlockIds[&block] = id;
+  return id;
+}
+
 /// Convert a function and its arguments to a function declaration in the IR.
 /// This does not convert the function body.
 FunctionLowering *

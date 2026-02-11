@@ -151,6 +151,8 @@ struct Context {
   LogicalResult convertGlobalVariable(const slang::ast::VariableSymbol &var);
   int32_t getOrAssignClassId(const slang::ast::ClassType &type);
   int32_t getOrAssignClassFieldId(const slang::ast::VariableSymbol &field);
+  int32_t
+  getOrAssignConstraintBlockId(const slang::ast::ConstraintBlockSymbol &block);
 
   /// Checks whether one class (actualTy) is derived from another class
   /// (baseTy). True if it's a subclass, false otherwise.
@@ -331,8 +333,10 @@ struct Context {
   /// virtual dispatch without embedding full object layouts in the IR.
   DenseMap<const slang::ast::ClassType *, int32_t> classIds;
   DenseMap<const slang::ast::VariableSymbol *, int32_t> classFieldIds;
+  DenseMap<const slang::ast::ConstraintBlockSymbol *, int32_t> constraintBlockIds;
   int32_t nextClassId = 1;
   int32_t nextClassFieldId = 1;
+  int32_t nextConstraintBlockId = 1;
 
   /// A table of defined values, such as variables, that may be referred to by
   /// name in expressions. The expressions use this table to lookup the MLIR

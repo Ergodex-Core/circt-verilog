@@ -1562,6 +1562,72 @@ struct StringCmpOpConversion : public OpConversionPattern<StringCmpOp> {
   }
 };
 
+struct UArrayCmpOpConversion : public OpConversionPattern<UArrayCmpOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(UArrayCmpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto lhs = adaptor.getLhs();
+    auto rhs = adaptor.getRhs();
+    auto lhsTy = dyn_cast<hw::ArrayType>(lhs.getType());
+    auto rhsTy = dyn_cast<hw::ArrayType>(rhs.getType());
+    if (!lhsTy || !rhsTy || lhsTy != rhsTy)
+      return rewriter.notifyMatchFailure(loc, "expected hw::ArrayType operands");
+
+    auto elementType = lhsTy.getElementType();
+    bool isIntElem = isa<IntegerType>(elementType);
+    bool isFourValuedElem = isFourValuedIntType(elementType);
+    if (!isIntElem && !isFourValuedElem)
+      return rewriter.notifyMatchFailure(
+          loc, "unsupported unpacked array element type");
+
+    unsigned numElems = lhsTy.getNumElements();
+    unsigned idxWidth = std::max<unsigned>(llvm::Log2_64_Ceil(numElems), 1);
+    auto idxType = rewriter.getIntegerType(idxWidth);
+    auto i1Type = rewriter.getI1Type();
+
+    Value allEq = hw::ConstantOp::create(rewriter, loc, i1Type, 1);
+    for (unsigned i = 0; i < numElems; ++i) {
+      Value idx = hw::ConstantOp::create(rewriter, loc, idxType, i);
+      Value lhsElem = rewriter.create<hw::ArrayGetOp>(loc, lhs, idx);
+      Value rhsElem = rewriter.create<hw::ArrayGetOp>(loc, rhs, idx);
+
+      Value elemEq;
+      if (isFourValuedElem) {
+        Value lhsVal = getFourValuedValue(rewriter, loc, lhsElem);
+        Value lhsUnk = getFourValuedUnknown(rewriter, loc, lhsElem);
+        Value rhsVal = getFourValuedValue(rewriter, loc, rhsElem);
+        Value rhsUnk = getFourValuedUnknown(rewriter, loc, rhsElem);
+        Value valEq = rewriter.create<comb::ICmpOp>(loc, i1Type,
+                                                    comb::ICmpPredicate::eq,
+                                                    lhsVal, rhsVal);
+        Value unkEq = rewriter.create<comb::ICmpOp>(loc, i1Type,
+                                                    comb::ICmpPredicate::eq,
+                                                    lhsUnk, rhsUnk);
+        elemEq = rewriter.create<comb::AndOp>(loc, valEq, unkEq);
+      } else {
+        elemEq = rewriter.create<comb::ICmpOp>(
+            loc, i1Type, comb::ICmpPredicate::eq, lhsElem, rhsElem);
+      }
+
+      allEq = rewriter.create<comb::AndOp>(loc, allEq, elemEq);
+    }
+
+    Value result = allEq;
+    if (op.getPredicate() == moore::UArrayCmpPredicate::ne) {
+      Value zero = hw::ConstantOp::create(rewriter, loc, i1Type, 0);
+      result = rewriter.create<comb::ICmpOp>(loc, i1Type,
+                                             comb::ICmpPredicate::eq, result,
+                                             zero);
+    }
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 struct NetOpConversion : public OpConversionPattern<NetOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -3629,6 +3695,42 @@ struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
         return success();
       }
 
+      if (auto arrTy = dyn_cast<hw::ArrayType>(adaptor.getInput().getType())) {
+        // Best-effort formatting for fixed-size unpacked arrays. This is
+        // primarily used by `%p` formatting in UVM tests; provide a stable
+        // representation rather than failing legalization.
+        auto elemTy = arrTy.getElementType();
+        if (isa<IntegerType>(elemTy)) {
+          SmallVector<Value> frags;
+          frags.push_back(rewriter.create<sim::FormatLitOp>(loc, "{"));
+
+          unsigned numElems = arrTy.getNumElements();
+          unsigned idxWidth = std::max<unsigned>(llvm::Log2_64_Ceil(numElems), 1);
+          auto idxType = rewriter.getIntegerType(idxWidth);
+          auto baseAttr = rewriter.getI32IntegerAttr(10);
+          auto widthAttr = rewriter.getI32IntegerAttr(0);
+          auto flagsAttr = rewriter.getI32IntegerAttr(0);
+
+          for (unsigned i = 0; i < numElems; ++i) {
+            if (i != 0)
+              frags.push_back(rewriter.create<sim::FormatLitOp>(loc, ", "));
+            Value idx = hw::ConstantOp::create(rewriter, loc, idxType, i);
+            Value elem = rewriter.create<hw::ArrayGetOp>(loc, adaptor.getInput(), idx);
+            frags.push_back(
+                rewriter.create<sim::FormatIntOp>(loc, elem, baseAttr, widthAttr,
+                                                  flagsAttr));
+          }
+
+          frags.push_back(rewriter.create<sim::FormatLitOp>(loc, "}"));
+          rewriter.replaceOpWithNewOp<sim::FormatStringConcatOp>(op, frags);
+          return success();
+        }
+
+        rewriter.replaceOpWithNewOp<sim::FormatLitOp>(
+            op, rewriter.getStringAttr("<array>"));
+        return success();
+      }
+
       return failure();
     }
 
@@ -5635,6 +5737,7 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     FCmpOpConversion<EqRealOp, arith::CmpFPredicate::OEQ>,
     CaseXZEqOpConversion<CaseZEqOp, true>,
     CaseXZEqOpConversion<CaseXZEqOp, false>,
+    UArrayCmpOpConversion,
     StringCmpOpConversion,
 
     // Patterns of structural operations.
