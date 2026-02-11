@@ -1416,6 +1416,94 @@ extern "C" void circt_sv_process_set_randstate(const char *state) {
 }
 
 //===----------------------------------------------------------------------===//
+// SV randomization mode controls (`rand_mode` / `constraint_mode`)
+//===----------------------------------------------------------------------===//
+
+static uint64_t circt_sv_key_i32_i32(int32_t a, int32_t b) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32) |
+         static_cast<uint64_t>(static_cast<uint32_t>(b));
+}
+
+static std::unordered_map<int32_t, int32_t> circt_sv_rand_mode_object;
+static std::unordered_map<uint64_t, int32_t> circt_sv_rand_mode_field;
+static std::unordered_map<int32_t, int32_t> circt_sv_rand_mode_static;
+
+extern "C" int32_t circt_sv_rand_mode_get_i32(int32_t handle, int32_t fieldId) {
+  // fieldId < 0 => object-level default.
+  if (fieldId < 0) {
+    auto it = circt_sv_rand_mode_object.find(handle);
+    return it == circt_sv_rand_mode_object.end() ? 1 : it->second;
+  }
+  uint64_t key = circt_sv_key_i32_i32(handle, fieldId);
+  auto it = circt_sv_rand_mode_field.find(key);
+  if (it != circt_sv_rand_mode_field.end())
+    return it->second;
+  auto jt = circt_sv_rand_mode_object.find(handle);
+  return jt == circt_sv_rand_mode_object.end() ? 1 : jt->second;
+}
+
+extern "C" void circt_sv_rand_mode_set_i32(int32_t handle, int32_t fieldId,
+                                           int32_t mode) {
+  mode = mode ? 1 : 0;
+  if (fieldId < 0) {
+    circt_sv_rand_mode_object[handle] = mode;
+    return;
+  }
+  uint64_t key = circt_sv_key_i32_i32(handle, fieldId);
+  circt_sv_rand_mode_field[key] = mode;
+}
+
+extern "C" int32_t circt_sv_rand_mode_get_static_i32(int32_t fieldId) {
+  auto it = circt_sv_rand_mode_static.find(fieldId);
+  return it == circt_sv_rand_mode_static.end() ? 1 : it->second;
+}
+
+extern "C" void circt_sv_rand_mode_set_static_i32(int32_t fieldId,
+                                                  int32_t mode) {
+  circt_sv_rand_mode_static[fieldId] = mode ? 1 : 0;
+}
+
+static std::unordered_map<int32_t, int32_t> circt_sv_constraint_mode_object;
+static std::unordered_map<uint64_t, int32_t> circt_sv_constraint_mode_block;
+static std::unordered_map<int32_t, int32_t> circt_sv_constraint_mode_static;
+
+extern "C" int32_t circt_sv_constraint_mode_get_i32(int32_t handle,
+                                                    int32_t blockId) {
+  // blockId < 0 => object-level default.
+  if (blockId < 0) {
+    auto it = circt_sv_constraint_mode_object.find(handle);
+    return it == circt_sv_constraint_mode_object.end() ? 1 : it->second;
+  }
+  uint64_t key = circt_sv_key_i32_i32(handle, blockId);
+  auto it = circt_sv_constraint_mode_block.find(key);
+  if (it != circt_sv_constraint_mode_block.end())
+    return it->second;
+  auto jt = circt_sv_constraint_mode_object.find(handle);
+  return jt == circt_sv_constraint_mode_object.end() ? 1 : jt->second;
+}
+
+extern "C" void circt_sv_constraint_mode_set_i32(int32_t handle, int32_t blockId,
+                                                 int32_t mode) {
+  mode = mode ? 1 : 0;
+  if (blockId < 0) {
+    circt_sv_constraint_mode_object[handle] = mode;
+    return;
+  }
+  uint64_t key = circt_sv_key_i32_i32(handle, blockId);
+  circt_sv_constraint_mode_block[key] = mode;
+}
+
+extern "C" int32_t circt_sv_constraint_mode_get_static_i32(int32_t blockId) {
+  auto it = circt_sv_constraint_mode_static.find(blockId);
+  return it == circt_sv_constraint_mode_static.end() ? 1 : it->second;
+}
+
+extern "C" void circt_sv_constraint_mode_set_static_i32(int32_t blockId,
+                                                        int32_t mode) {
+  circt_sv_constraint_mode_static[blockId] = mode ? 1 : 0;
+}
+
+//===----------------------------------------------------------------------===//
 // Minimal SV class runtime shims
 //===----------------------------------------------------------------------===//
 
@@ -1527,6 +1615,79 @@ extern "C" void circt_sv_class_set_ptr(int32_t handle, int32_t fieldId,
   if (it == circt_sv_class_objects.end())
     it = circt_sv_class_objects.emplace(handle, CirctSvClassObject{}).first;
   it->second.ptrFields[fieldId] = static_cast<uintptr_t>(value);
+}
+
+//===----------------------------------------------------------------------===//
+// SV class nonblocking assignment (NBA) queue
+//===----------------------------------------------------------------------===//
+
+struct CirctSvClassNbaI32Update {
+  int32_t handle = 0;
+  int32_t fieldId = 0;
+  int32_t value = 0;
+};
+
+struct CirctSvClassNbaStrUpdate {
+  int32_t handle = 0;
+  int32_t fieldId = 0;
+  std::string value;
+};
+
+struct CirctSvClassNbaPtrUpdate {
+  int32_t handle = 0;
+  int32_t fieldId = 0;
+  uintptr_t value = 0;
+};
+
+static std::vector<CirctSvClassNbaI32Update> circt_sv_class_nba_i32_updates;
+static std::vector<CirctSvClassNbaStrUpdate> circt_sv_class_nba_str_updates;
+static std::vector<CirctSvClassNbaPtrUpdate> circt_sv_class_nba_ptr_updates;
+
+extern "C" void circt_sv_class_set_i32_nba(int32_t handle, int32_t fieldId,
+                                           int32_t value) {
+  circt_sv_class_nba_i32_updates.push_back({handle, fieldId, value});
+}
+
+extern "C" void circt_sv_class_set_str_nba(int32_t handle, int32_t fieldId,
+                                           const char *value) {
+  circt_sv_class_nba_str_updates.push_back(
+      {handle, fieldId, value ? value : ""});
+}
+
+extern "C" void circt_sv_class_set_ptr_nba(int32_t handle, int32_t fieldId,
+                                           uint64_t value) {
+  circt_sv_class_nba_ptr_updates.push_back(
+      {handle, fieldId, static_cast<uintptr_t>(value)});
+}
+
+extern "C" bool circt_sv_class_commit_nba() {
+  bool changed = false;
+
+  for (const auto &u : circt_sv_class_nba_i32_updates) {
+    int32_t oldValue = circt_sv_class_get_i32(u.handle, u.fieldId);
+    if (oldValue != u.value)
+      changed = true;
+    circt_sv_class_set_i32(u.handle, u.fieldId, u.value);
+  }
+
+  for (const auto &u : circt_sv_class_nba_str_updates) {
+    const char *old = circt_sv_class_get_str(u.handle, u.fieldId);
+    if (std::string(old ? old : "") != u.value)
+      changed = true;
+    circt_sv_class_set_str(u.handle, u.fieldId, u.value.c_str());
+  }
+
+  for (const auto &u : circt_sv_class_nba_ptr_updates) {
+    uint64_t oldValue = circt_sv_class_get_ptr(u.handle, u.fieldId);
+    if (oldValue != static_cast<uint64_t>(u.value))
+      changed = true;
+    circt_sv_class_set_ptr(u.handle, u.fieldId, static_cast<uint64_t>(u.value));
+  }
+
+  circt_sv_class_nba_i32_updates.clear();
+  circt_sv_class_nba_str_updates.clear();
+  circt_sv_class_nba_ptr_updates.clear();
+  return changed;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1762,6 +1923,7 @@ static bool circt_uvm_phase_all_done_state = false;
 static bool circt_uvm_test_done_requested = false;
 static int64_t circt_uvm_objection_count = 0;
 static bool circt_uvm_phases_ready_state = false;
+static int64_t circt_uvm_severity_counts[4] = {0, 0, 0, 0};
 
 static void circt_uvm_update_phase_all_done_state() {
   if (!circt_uvm_shims_enabled())
@@ -1793,6 +1955,42 @@ static std::string circt_uvm_resource_db_key(const char *scope, const char *name
   if (name)
     key += name;
   return key;
+}
+
+extern "C" void circt_uvm_report(int32_t self, int32_t severity, const char *id,
+                                 const char *message) {
+  if (!circt_uvm_shims_enabled())
+    return;
+  if (severity >= 0 && severity < 4) {
+    if (circt_uvm_severity_counts[severity] < INT64_MAX)
+      ++circt_uvm_severity_counts[severity];
+  }
+
+  const char *comp = "";
+  auto it = circt_uvm_component_names.find(self);
+  if (it != circt_uvm_component_names.end())
+    comp = it->second.c_str();
+
+  const char *idStr = id ? id : "";
+  const char *msgStr = message ? message : "";
+
+  // Print a minimal, sv-tests-friendly line prefix so offline checks can
+  // count UVM_ERROR/UVM_FATAL occurrences.
+  switch (severity) {
+  case 3:
+    std::fprintf(stdout, "UVM_FATAL %s [%s] %s\n", comp, idStr, msgStr);
+    break;
+  case 2:
+    std::fprintf(stdout, "UVM_ERROR %s [%s] %s\n", comp, idStr, msgStr);
+    break;
+  case 1:
+    std::fprintf(stdout, "UVM_WARNING %s [%s] %s\n", comp, idStr, msgStr);
+    break;
+  default:
+    std::fprintf(stdout, "UVM_INFO %s [%s] %s\n", comp, idStr, msgStr);
+    break;
+  }
+  std::fflush(stdout);
 }
 
 extern "C" void circt_uvm_run_test(const char *test_name) {
@@ -2106,10 +2304,16 @@ extern "C" int32_t circt_uvm_report_server_get_server() { return 1; }
 extern "C" int32_t circt_uvm_root_get() { return 1; }
 
 extern "C" int32_t circt_uvm_get_severity_count(int32_t severity) {
-  // The UVM M0 wrapper only queries UVM_ERROR and UVM_FATAL. Until CIRCT lowers
-  // the real report server, treat the counts as zero.
-  (void)severity;
-  return 0;
+  if (!circt_uvm_shims_enabled())
+    return 0;
+  if (severity < 0 || severity >= 4)
+    return 0;
+  int64_t cnt = circt_uvm_severity_counts[severity];
+  if (cnt <= 0)
+    return 0;
+  if (cnt > INT32_MAX)
+    return INT32_MAX;
+  return static_cast<int32_t>(cnt);
 }
 
 extern "C" bool circt_uvm_phase_all_done() {

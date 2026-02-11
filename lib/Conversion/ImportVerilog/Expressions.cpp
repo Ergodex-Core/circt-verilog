@@ -1524,10 +1524,14 @@ struct RvalueExprVisitor : public ExprVisitor {
           return fn;
         };
 
+        bool isNba = expr.isNonBlocking();
+
 	        if (isa<moore::StringType>(fieldType)) {
 	          auto fnType =
 	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, fieldType}, {});
-	          auto fn = getOrCreateExternFunc("circt_sv_class_set_str", fnType);
+	          auto fnName =
+	              isNba ? "circt_sv_class_set_str_nba" : "circt_sv_class_set_str";
+	          auto fn = getOrCreateExternFunc(fnName, fnType);
 	          mlir::func::CallOp::create(builder, loc, fn,
 	                                     {handleVal, fieldIdVal, rhs});
 	          return assignedValue;
@@ -1543,7 +1547,9 @@ struct RvalueExprVisitor : public ExprVisitor {
 	                         .getResult(0);
 	          auto fnType =
 	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, ptrTy}, {});
-	          auto fn = getOrCreateExternFunc("circt_sv_class_set_ptr", fnType);
+	          auto fnName =
+	              isNba ? "circt_sv_class_set_ptr_nba" : "circt_sv_class_set_ptr";
+	          auto fn = getOrCreateExternFunc(fnName, fnType);
 	          mlir::func::CallOp::create(builder, loc, fn,
 	                                     {handleVal, fieldIdVal, rhsPtr});
 	          return assignedValue;
@@ -1562,7 +1568,9 @@ struct RvalueExprVisitor : public ExprVisitor {
 
         auto fnType =
             FunctionType::get(context.getContext(), {i32Ty, i32Ty, i32Ty}, {});
-        auto fn = getOrCreateExternFunc("circt_sv_class_set_i32", fnType);
+        auto fnName =
+            isNba ? "circt_sv_class_set_i32_nba" : "circt_sv_class_set_i32";
+        auto fn = getOrCreateExternFunc(fnName, fnType);
         mlir::func::CallOp::create(builder, loc, fn,
                                    {handleVal, fieldIdVal, rhs});
         return assignedValue;
@@ -1622,10 +1630,14 @@ struct RvalueExprVisitor : public ExprVisitor {
           return fn;
         };
 
+        bool isNba = expr.isNonBlocking();
+
 	        if (isa<moore::StringType>(fieldType)) {
 	          auto fnType =
 	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, fieldType}, {});
-	          auto fn = getOrCreateExternFunc("circt_sv_class_set_str", fnType);
+	          auto fnName =
+	              isNba ? "circt_sv_class_set_str_nba" : "circt_sv_class_set_str";
+	          auto fn = getOrCreateExternFunc(fnName, fnType);
 	          mlir::func::CallOp::create(builder, loc, fn,
 	                                     {handleVal, fieldIdVal, rhs});
 	          return assignedValue;
@@ -1641,7 +1653,9 @@ struct RvalueExprVisitor : public ExprVisitor {
 	                         .getResult(0);
 	          auto fnType =
 	              FunctionType::get(context.getContext(), {i32Ty, i32Ty, ptrTy}, {});
-	          auto fn = getOrCreateExternFunc("circt_sv_class_set_ptr", fnType);
+	          auto fnName =
+	              isNba ? "circt_sv_class_set_ptr_nba" : "circt_sv_class_set_ptr";
+	          auto fn = getOrCreateExternFunc(fnName, fnType);
 	          mlir::func::CallOp::create(builder, loc, fn,
 	                                     {handleVal, fieldIdVal, rhsPtr});
 	          return assignedValue;
@@ -1660,7 +1674,9 @@ struct RvalueExprVisitor : public ExprVisitor {
 
         auto fnType =
             FunctionType::get(context.getContext(), {i32Ty, i32Ty, i32Ty}, {});
-        auto fn = getOrCreateExternFunc("circt_sv_class_set_i32", fnType);
+        auto fnName =
+            isNba ? "circt_sv_class_set_i32_nba" : "circt_sv_class_set_i32";
+        auto fn = getOrCreateExternFunc(fnName, fnType);
         mlir::func::CallOp::create(builder, loc, fn,
                                    {handleVal, fieldIdVal, rhs});
         return assignedValue;
@@ -3128,6 +3144,8 @@ struct RvalueExprVisitor : public ExprVisitor {
 	        StringRef shimName = "circt_uvm_run_all_phases";
 	        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
 	                                         moore::Domain::TwoValued);
+          auto i1Ty = moore::IntType::get(context.getContext(), /*width=*/1,
+                                          moore::Domain::TwoValued);
 
 	        auto buildPhaseDispatch = [&](StringRef methodName, StringRef fnName)
 	            -> mlir::func::FuncOp {
@@ -3245,6 +3263,8 @@ struct RvalueExprVisitor : public ExprVisitor {
             "connect_phase", "__circt_uvm_dispatch_connect_phase");
         mlir::func::FuncOp runFn =
             buildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase");
+        mlir::func::FuncOp reportFn =
+            buildPhaseDispatch("report_phase", "__circt_uvm_dispatch_report_phase");
 
         auto countFnTy = FunctionType::get(context.getContext(), {}, {i32Ty});
         auto countFn =
@@ -3337,9 +3357,118 @@ struct RvalueExprVisitor : public ExprVisitor {
           }
         };
 
+        auto ensureReportPhaseWorker = [&]() {
+          if (!callerSvModule || !reportFn)
+            return;
+          Block &modBody = callerSvModule.getBodyRegion().front();
+          for (auto proc : modBody.getOps<moore::ProcedureOp>()) {
+            if (proc->hasAttr("circt_uvm_report_phase_worker"))
+              return;
+          }
+
+          // Wait until the UVM "all phases done" state is reached (based on
+          // the minimal objection counter shims), then dispatch report_phase
+          // for all registered components.
+          auto phaseDoneFnTy = FunctionType::get(context.getContext(), {}, {i1Ty});
+          auto phaseDoneFn =
+              getOrCreateExternFunc("circt_uvm_phase_all_done", phaseDoneFnTy);
+          if (!phaseDoneFn)
+            return;
+
+          OpBuilder::InsertionGuard guard(context.builder);
+          context.builder.setInsertionPoint(modBody.getTerminator());
+          auto procOp = moore::ProcedureOp::create(context.builder, loc,
+                                                   moore::ProcedureKind::Initial);
+          procOp->setAttr("circt_uvm_report_phase_worker",
+                          context.builder.getUnitAttr());
+
+          auto &entry = procOp.getBody().emplaceBlock();
+          auto &readyCond = procOp.getBody().emplaceBlock();
+          auto &readyWait = procOp.getBody().emplaceBlock();
+          auto &deltaWait = procOp.getBody().emplaceBlock();
+          auto &doneCond = procOp.getBody().emplaceBlock();
+          auto &doneWait = procOp.getBody().emplaceBlock();
+          auto &idxCond = procOp.getBody().emplaceBlock();
+          idxCond.addArgument(i32Ty, loc);
+          auto &runBlock = procOp.getBody().emplaceBlock();
+          runBlock.addArgument(i32Ty, loc);
+          auto &done = procOp.getBody().emplaceBlock();
+
+          OpBuilder b(context.getContext());
+          b.setInsertionPointToStart(&entry);
+
+          Value zero = moore::ConstantOp::create(
+              b, loc, i32Ty, /*value=*/0, /*isSigned=*/true);
+          Value one = moore::ConstantOp::create(
+              b, loc, i32Ty, /*value=*/1, /*isSigned=*/true);
+
+          // First wait for phases_ready (set by circt_uvm_run_all_phases) so
+          // we don't dispatch report_phase before run_phase has had a chance
+          // to raise objections.
+          if (!readyFn)
+            return;
+
+          mlir::cf::BranchOp::create(b, loc, &readyCond, ValueRange{});
+
+          b.setInsertionPointToStart(&readyCond);
+          Value ready =
+              mlir::func::CallOp::create(b, loc, readyFn, ValueRange{}).getResult(0);
+          Value isReady = b.createOrFold<moore::NeOp>(loc, ready, zero);
+          isReady = b.createOrFold<moore::BoolCastOp>(loc, isReady);
+          Value readyCondVal = moore::ToBuiltinBoolOp::create(b, loc, isReady);
+          mlir::cf::CondBranchOp::create(b, loc, readyCondVal, &deltaWait,
+                                         ValueRange{}, &readyWait, ValueRange{});
+
+          b.setInsertionPointToStart(&readyWait);
+          Value zeroDelay0 = moore::ConstantTimeOp::create(b, loc, 0);
+          moore::WaitDelayOp::create(b, loc, zeroDelay0);
+          mlir::cf::BranchOp::create(b, loc, &readyCond, ValueRange{});
+
+          // Add one extra delta cycle so run_phase workers can schedule and
+          // raise objections before we start watching phase_all_done.
+          b.setInsertionPointToStart(&deltaWait);
+          Value zeroDelay1 = moore::ConstantTimeOp::create(b, loc, 0);
+          moore::WaitDelayOp::create(b, loc, zeroDelay1);
+          mlir::cf::BranchOp::create(b, loc, &doneCond, ValueRange{});
+
+          b.setInsertionPointToStart(&doneCond);
+          Value doneVal =
+              mlir::func::CallOp::create(b, loc, phaseDoneFn, ValueRange{})
+                  .getResult(0);
+          Value doneCondVal = moore::ToBuiltinBoolOp::create(b, loc, doneVal);
+          mlir::cf::CondBranchOp::create(b, loc, doneCondVal, &idxCond,
+                                         ValueRange{zero}, &doneWait, ValueRange{});
+
+          b.setInsertionPointToStart(&doneWait);
+          Value zeroDelay2 = moore::ConstantTimeOp::create(b, loc, 0);
+          moore::WaitDelayOp::create(b, loc, zeroDelay2);
+          mlir::cf::BranchOp::create(b, loc, &doneCond, ValueRange{});
+
+          b.setInsertionPointToStart(&idxCond);
+          Value idxVal = idxCond.getArgument(0);
+          Value count =
+              mlir::func::CallOp::create(b, loc, countFn, ValueRange{}).getResult(0);
+          Value lt = moore::UltOp::create(b, loc, idxVal, count);
+          Value ltCond = moore::ToBuiltinBoolOp::create(b, loc, lt);
+          mlir::cf::CondBranchOp::create(b, loc, ltCond, &runBlock,
+                                         ValueRange{idxVal}, &done, ValueRange{});
+
+          b.setInsertionPointToStart(&runBlock);
+          Value bodyIdx = runBlock.getArgument(0);
+          Value comp =
+              mlir::func::CallOp::create(b, loc, getFn, ValueRange{bodyIdx}).getResult(0);
+          mlir::func::CallOp::create(b, loc, reportFn, ValueRange{comp, zero});
+          Value next = moore::AddOp::create(b, loc, bodyIdx, one);
+          mlir::cf::BranchOp::create(b, loc, &idxCond, ValueRange{next});
+
+          b.setInsertionPointToStart(&done);
+          moore::ReturnOp::create(b, loc);
+        };
+
         if (auto shimFn =
                 context.intoModuleOp.lookupSymbol<mlir::func::FuncOp>(shimName)) {
           ensureRunPhaseWorkers();
+          ensureReportPhaseWorker();
           return shimFn;
         }
 
@@ -3418,6 +3547,7 @@ struct RvalueExprVisitor : public ExprVisitor {
         mlir::func::ReturnOp::create(b, loc);
 
         ensureRunPhaseWorkers();
+        ensureReportPhaseWorker();
         return shimFn;
       };
 
@@ -5133,9 +5263,9 @@ struct RvalueExprVisitor : public ExprVisitor {
 
       // uvm_report_object::uvm_report_enabled(...)
       //
-      // Report enabling depends on extensive class/runtime behavior. Return 0
-      // so report macros take their "disabled" fast path and elaboration remains
-      // lightweight.
+      // Report enabling depends on extensive class/runtime behavior. For CIRCT
+      // UVM bring-up, return 1 so report macros execute and can be wired to
+      // lightweight runtime sinks (e.g. for sv-tests PASS/FAIL parity).
       if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
           parentSym.name == "uvm_report_object" &&
           subroutine->name == "uvm_report_enabled") {
@@ -5160,29 +5290,75 @@ struct RvalueExprVisitor : public ExprVisitor {
               << resultType;
           return {};
         }
-        return moore::ConstantOp::create(builder, loc, intType, /*value=*/0,
+        return moore::ConstantOp::create(builder, loc, intType, /*value=*/1,
                                          /*isSigned=*/false);
       }
 
       // uvm_report_object::uvm_report_info/error/warning/fatal(...)
       //
-      // These are side-effecting report sinks. For bring-up, accept them as
-      // no-ops so link-time does not require the full UVM library.
+      // These are side-effecting report sinks. For bring-up, lower them to
+      // lightweight runtime hooks so sv-tests can observe failures and count
+      // severities.
       if (parentSym.kind == slang::ast::SymbolKind::ClassType &&
           parentSym.name == "uvm_report_object" &&
           (subroutine->name == "uvm_report_info" ||
            subroutine->name == "uvm_report_error" ||
            subroutine->name == "uvm_report_warning" ||
            subroutine->name == "uvm_report_fatal")) {
+        Value self;
         if (auto *thisExpr = expr.thisClass()) {
-          if (!context.convertRvalueExpression(*thisExpr))
-            return {};
-        } else if (context.thisStack.empty()) {
-          // See above: implicit `this` receiver.
+          self = context.convertRvalueExpression(*thisExpr);
+        } else if (!context.thisStack.empty()) {
+          self = context.thisStack.back();
         }
-        for (auto *argExpr : expr.arguments())
-          if (!context.convertRvalueExpression(*argExpr))
+        if (!self)
+          return {};
+
+        int32_t sev = -1;
+        if (subroutine->name == "uvm_report_info")
+          sev = 0;
+        else if (subroutine->name == "uvm_report_warning")
+          sev = 1;
+        else if (subroutine->name == "uvm_report_error")
+          sev = 2;
+        else if (subroutine->name == "uvm_report_fatal")
+          sev = 3;
+        if (sev < 0) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_report_object::uvm_report_*`: ")
+              << subroutine->name;
+          return {};
+        }
+
+        if (expr.arguments().size() < 2) {
+          mlir::emitError(loc,
+                          "unsupported call to `uvm_report_object::uvm_report_*`: "
+                          "expected at least 2 arguments, got ")
+              << expr.arguments().size();
+          return {};
+        }
+        Value id = context.convertRvalueExpression(*expr.arguments()[0]);
+        Value message = context.convertRvalueExpression(*expr.arguments()[1]);
+        if (!id || !message)
+          return {};
+        for (size_t i = 2, e = expr.arguments().size(); i < e; ++i)
+          if (!context.convertRvalueExpression(*expr.arguments()[i]))
             return {};
+
+        auto i32Ty = moore::IntType::get(context.getContext(), /*width=*/32,
+                                         moore::Domain::TwoValued);
+        Value sevVal =
+            moore::ConstantOp::create(builder, loc, i32Ty, sev, /*isSigned=*/true);
+
+        auto fnType = FunctionType::get(context.getContext(),
+                                        {self.getType(), i32Ty, id.getType(),
+                                         message.getType()},
+                                        {});
+        auto fn = getOrCreateExternFunc("circt_uvm_report", fnType);
+        if (!fn)
+          return {};
+        mlir::func::CallOp::create(builder, loc, fn,
+                                   ValueRange{self, sevVal, id, message});
         return makeVoidValue();
       }
 
@@ -6396,23 +6572,254 @@ struct RvalueExprVisitor : public ExprVisitor {
                                        /*isSigned=*/false);
     }
 
-    // Bring-up stubs for randomization controls commonly used by chapter-18
-    // tests. These must elaborate even when full random semantics are not yet
-    // modeled.
+    // Bring-up support for randomization controls commonly used by chapter-18
+    // tests. Track `rand_mode` / `constraint_mode` state in the runtime so
+    // UVM can observe correct enable/disable behavior even before full
+    // randomization semantics are modeled.
     if (subroutine.name == "rand_mode" || subroutine.name == "constraint_mode") {
+      const bool isRandMode = subroutine.name == "rand_mode";
+
       auto resultType = context.convertType(*expr.type);
       if (!resultType)
         return {};
-      if (isa<moore::VoidType>(resultType))
-        return makeVoidValue();
-      auto intTy = dyn_cast<moore::IntType>(resultType);
-      if (!intTy) {
+      const bool isVoidResult = isa<moore::VoidType>(resultType);
+      auto intResultType = dyn_cast<moore::IntType>(resultType);
+      if (!isVoidResult && !intResultType) {
         mlir::emitError(loc, "unsupported `") << subroutine.name
                                               << "` return type: " << resultType;
         return {};
       }
-      // Treat as enabled / success.
-      return moore::ConstantOp::create(builder, loc, intTy, /*value=*/1,
+
+      // Getter: receiver only. Setter: receiver + 1 argument.
+      if (args.size() != 1 && args.size() != 2) {
+        if (isVoidResult)
+          return makeVoidValue();
+        return moore::ConstantOp::create(builder, loc, intResultType, /*value=*/1,
+                                         /*isSigned=*/true);
+      }
+
+      const slang::ast::Expression *recvExpr = args[0];
+      const slang::ast::Expression *modeExpr = (args.size() == 2) ? args[1] : nullptr;
+      const bool isSetter = modeExpr != nullptr;
+
+      auto lowerModeOperand = [&]() -> Value {
+        if (!modeExpr)
+          return {};
+        Value v = context.convertRvalueExpression(*modeExpr);
+        if (!v)
+          return {};
+        v = context.convertToSimpleBitVector(v);
+        if (!v)
+          return {};
+        v = context.materializeConversion(i32Ty, v, /*isSigned=*/true, loc);
+        if (!v)
+          return {};
+        return v;
+      };
+
+      auto lowerHandle = [&](const slang::ast::Expression &e) -> Value {
+        Value h = context.convertRvalueExpression(e);
+        if (!h)
+          return {};
+        h = context.materializeConversion(i32Ty, h, /*isSigned=*/false, loc);
+        if (!h)
+          return {};
+        return h;
+      };
+
+      auto lowerGetterResult = [&](Value v) -> Value {
+        if (isVoidResult)
+          return makeVoidValue();
+        if (v.getType() != resultType) {
+          v = context.materializeConversion(resultType, v, expr.type->isSigned(), loc);
+          if (!v)
+            return {};
+        }
+        return v;
+      };
+
+      auto emitSetAndReturn = [&](mlir::func::FuncOp setFn, ValueRange operands,
+                                  Value setValue) -> Value {
+        if (!setFn)
+          return {};
+        mlir::func::CallOp::create(builder, loc, setFn, operands);
+        if (isVoidResult)
+          return makeVoidValue();
+        // Return the new mode value when the caller expects a result.
+        return lowerGetterResult(setValue);
+      };
+
+      // Member-access forms: obj.<field>.rand_mode / obj.<constraint>.constraint_mode.
+      if (recvExpr) {
+        if (auto *mem = recvExpr->as_if<slang::ast::MemberAccessExpression>()) {
+          // rand_mode on a class property.
+          if (isRandMode) {
+            if (auto *prop =
+                    mem->member.as_if<slang::ast::ClassPropertySymbol>()) {
+              const int32_t fieldId = context.getOrAssignClassFieldId(*prop);
+              Value fieldIdVal = moore::ConstantOp::create(builder, loc, i32Ty, fieldId,
+                                                          /*isSigned=*/true);
+              const bool isStatic =
+                  prop->lifetime == slang::ast::VariableLifetime::Static;
+
+              if (isSetter) {
+                Value modeVal = lowerModeOperand();
+                if (!modeVal)
+                  return {};
+
+                if (isStatic) {
+                  auto fnType =
+                      FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+                  auto fn = getOrCreateExternFunc("circt_sv_rand_mode_set_static_i32",
+                                                  fnType);
+                  return emitSetAndReturn(fn, ValueRange{fieldIdVal, modeVal}, modeVal);
+                }
+
+                Value handle = lowerHandle(mem->value());
+                if (!handle)
+                  return {};
+                auto fnType =
+                    FunctionType::get(context.getContext(), {i32Ty, i32Ty, i32Ty}, {});
+                auto fn =
+                    getOrCreateExternFunc("circt_sv_rand_mode_set_i32", fnType);
+                return emitSetAndReturn(fn, ValueRange{handle, fieldIdVal, modeVal},
+                                        modeVal);
+              }
+
+              if (isStatic) {
+                auto fnType =
+                    FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+                auto fn = getOrCreateExternFunc("circt_sv_rand_mode_get_static_i32",
+                                                fnType);
+                if (!fn)
+                  return {};
+                Value res =
+                    mlir::func::CallOp::create(builder, loc, fn, {fieldIdVal})
+                        .getResult(0);
+                return lowerGetterResult(res);
+              }
+
+              Value handle = lowerHandle(mem->value());
+              if (!handle)
+                return {};
+              auto fnType =
+                  FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+              auto fn =
+                  getOrCreateExternFunc("circt_sv_rand_mode_get_i32", fnType);
+              if (!fn)
+                return {};
+              Value res =
+                  mlir::func::CallOp::create(builder, loc, fn,
+                                             ValueRange{handle, fieldIdVal})
+                      .getResult(0);
+              return lowerGetterResult(res);
+            }
+          } else {
+            // constraint_mode on a constraint block.
+            if (auto *blk =
+                    mem->member.as_if<slang::ast::ConstraintBlockSymbol>()) {
+              const int32_t blockId = context.getOrAssignConstraintBlockId(*blk);
+              Value blockIdVal = moore::ConstantOp::create(builder, loc, i32Ty, blockId,
+                                                          /*isSigned=*/true);
+              const bool isStatic =
+                  blk->flags.has(slang::ast::ConstraintBlockFlags::Static);
+
+              if (isSetter) {
+                Value modeVal = lowerModeOperand();
+                if (!modeVal)
+                  return {};
+
+                if (isStatic) {
+                  auto fnType =
+                      FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {});
+                  auto fn = getOrCreateExternFunc(
+                      "circt_sv_constraint_mode_set_static_i32", fnType);
+                  return emitSetAndReturn(fn, ValueRange{blockIdVal, modeVal}, modeVal);
+                }
+
+                Value handle = lowerHandle(mem->value());
+                if (!handle)
+                  return {};
+                auto fnType =
+                    FunctionType::get(context.getContext(), {i32Ty, i32Ty, i32Ty}, {});
+                auto fn = getOrCreateExternFunc("circt_sv_constraint_mode_set_i32",
+                                                fnType);
+                return emitSetAndReturn(fn, ValueRange{handle, blockIdVal, modeVal},
+                                        modeVal);
+              }
+
+              if (isStatic) {
+                auto fnType =
+                    FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+                auto fn = getOrCreateExternFunc(
+                    "circt_sv_constraint_mode_get_static_i32", fnType);
+                if (!fn)
+                  return {};
+                Value res =
+                    mlir::func::CallOp::create(builder, loc, fn, {blockIdVal})
+                        .getResult(0);
+                return lowerGetterResult(res);
+              }
+
+              Value handle = lowerHandle(mem->value());
+              if (!handle)
+                return {};
+              auto fnType =
+                  FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+              auto fn = getOrCreateExternFunc("circt_sv_constraint_mode_get_i32",
+                                              fnType);
+              if (!fn)
+                return {};
+              Value res =
+                  mlir::func::CallOp::create(builder, loc, fn,
+                                             ValueRange{handle, blockIdVal})
+                      .getResult(0);
+              return lowerGetterResult(res);
+            }
+          }
+        }
+
+        // Object-level calls: obj.rand_mode / obj.constraint_mode.
+        if (recvExpr->type &&
+            recvExpr->type->getCanonicalType().as_if<slang::ast::ClassType>()) {
+          Value handle = lowerHandle(*recvExpr);
+          if (!handle)
+            return {};
+          Value objIdVal =
+              moore::ConstantOp::create(builder, loc, i32Ty, -1, /*isSigned=*/true);
+
+          if (isSetter) {
+            Value modeVal = lowerModeOperand();
+            if (!modeVal)
+              return {};
+            auto fnType =
+                FunctionType::get(context.getContext(), {i32Ty, i32Ty, i32Ty}, {});
+            auto fn = getOrCreateExternFunc(
+                isRandMode ? "circt_sv_rand_mode_set_i32"
+                           : "circt_sv_constraint_mode_set_i32",
+                fnType);
+            return emitSetAndReturn(fn, ValueRange{handle, objIdVal, modeVal}, modeVal);
+          }
+
+          auto fnType =
+              FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+          auto fn = getOrCreateExternFunc(
+              isRandMode ? "circt_sv_rand_mode_get_i32"
+                         : "circt_sv_constraint_mode_get_i32",
+              fnType);
+          if (!fn)
+            return {};
+          Value res = mlir::func::CallOp::create(builder, loc, fn,
+                                                ValueRange{handle, objIdVal})
+                          .getResult(0);
+          return lowerGetterResult(res);
+        }
+      }
+
+      // Fallback: treat as enabled / success.
+      if (isVoidResult)
+        return makeVoidValue();
+      return moore::ConstantOp::create(builder, loc, intResultType, /*value=*/1,
                                        /*isSigned=*/true);
     }
 
@@ -6749,20 +7156,27 @@ struct RvalueExprVisitor : public ExprVisitor {
       if (!cls)
         return moore::ConstantOp::create(builder, loc, resultIntType, 1);
 
+      struct ConstraintExprInfo {
+        const slang::ast::Expression *expr = nullptr;
+        const slang::ast::ConstraintBlockSymbol *block = nullptr;
+        bool isInline = false;
+      };
+
       // Collect all constraint expressions (class constraints + inline constraints).
-      SmallVector<const slang::ast::Expression *> constraintExprs;
+      SmallVector<ConstraintExprInfo> constraintExprs;
 
       auto collectConstraintExprs =
           [&](const slang::ast::Constraint &c,
+              const slang::ast::ConstraintBlockSymbol *block, bool isInline,
               auto &self) -> void {
         if (auto *list = c.as_if<slang::ast::ConstraintList>()) {
           for (auto *item : list->list)
             if (item)
-              self(*item, self);
+              self(*item, block, isInline, self);
           return;
         }
         if (auto *exprC = c.as_if<slang::ast::ExpressionConstraint>()) {
-          constraintExprs.push_back(&exprC->expr);
+          constraintExprs.push_back({&exprC->expr, block, isInline});
           return;
         }
         // Ignore unsupported constraint kinds for now; they will be diagnosed
@@ -6773,7 +7187,8 @@ struct RvalueExprVisitor : public ExprVisitor {
       const slang::ast::ClassType *cur = cls;
       while (cur) {
         for (auto &blk : cur->membersOfType<slang::ast::ConstraintBlockSymbol>()) {
-          collectConstraintExprs(blk.getConstraints(), collectConstraintExprs);
+          collectConstraintExprs(blk.getConstraints(), &blk, /*isInline=*/false,
+                                 collectConstraintExprs);
         }
         const slang::ast::Type *base = cur->getBaseClass();
         cur = base ? base->getCanonicalType().as_if<slang::ast::ClassType>() : nullptr;
@@ -6782,7 +7197,8 @@ struct RvalueExprVisitor : public ExprVisitor {
       if (auto *randInfo = std::get_if<
               slang::ast::CallExpression::RandomizeCallInfo>(&info.extraInfo)) {
         if (randInfo->inlineConstraints)
-          collectConstraintExprs(*randInfo->inlineConstraints, collectConstraintExprs);
+          collectConstraintExprs(*randInfo->inlineConstraints, /*block=*/nullptr,
+                                 /*isInline=*/true, collectConstraintExprs);
       }
 
       // Collect `rand` class properties for this class (and base classes).
@@ -6838,9 +7254,9 @@ struct RvalueExprVisitor : public ExprVisitor {
       };
 
       CaptureVisitor capVisitor(randSyms, captureSet, captures);
-      for (const auto *ce : constraintExprs)
-        if (ce)
-          ce->visit(capVisitor);
+      for (const auto &ce : constraintExprs)
+        if (ce.expr)
+          ce.expr->visit(capVisitor);
 
       // Convert receiver and capture values for the helper call.
       Value thisVal = context.convertRvalueExpression(*recvExpr);
@@ -6924,6 +7340,20 @@ struct RvalueExprVisitor : public ExprVisitor {
         return moore::ConstantOp::create(context.builder, loc, i1Ty, b ? 1 : 0);
       };
 
+      auto selectI32 = [&](Value cond, Value t, Value f) -> Value {
+        auto condOp =
+            moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
+        auto &tb = condOp.getTrueRegion().emplaceBlock();
+        auto &fb = condOp.getFalseRegion().emplaceBlock();
+        OpBuilder::InsertionGuard gg(context.builder);
+        context.builder.setInsertionPointToStart(&tb);
+        moore::YieldOp::create(context.builder, loc, t);
+        context.builder.setInsertionPointToStart(&fb);
+        moore::YieldOp::create(context.builder, loc, f);
+        context.builder.setInsertionPointAfter(condOp);
+        return condOp.getResult();
+      };
+
       // Declare runtime helpers used by randomize().
       auto getOrCreateExternFunc = [&](StringRef name, FunctionType fnType) {
         if (auto existing =
@@ -6954,6 +7384,22 @@ struct RvalueExprVisitor : public ExprVisitor {
       auto rangeFnTy = FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
       auto rangeFn = getOrCreateExternFunc("circt_sv_rand_range_i32", rangeFnTy);
       if (!rangeFn)
+        return {};
+
+      auto modeGetFnTy =
+          FunctionType::get(context.getContext(), {i32Ty, i32Ty}, {i32Ty});
+      auto staticModeGetFnTy =
+          FunctionType::get(context.getContext(), {i32Ty}, {i32Ty});
+      auto randModeGetFn =
+          getOrCreateExternFunc("circt_sv_rand_mode_get_i32", modeGetFnTy);
+      auto randModeGetStaticFn = getOrCreateExternFunc(
+          "circt_sv_rand_mode_get_static_i32", staticModeGetFnTy);
+      auto constraintModeGetFn =
+          getOrCreateExternFunc("circt_sv_constraint_mode_get_i32", modeGetFnTy);
+      auto constraintModeGetStaticFn = getOrCreateExternFunc(
+          "circt_sv_constraint_mode_get_static_i32", staticModeGetFnTy);
+      if (!randModeGetFn || !randModeGetStaticFn || !constraintModeGetFn ||
+          !constraintModeGetStaticFn)
         return {};
 
       // Save old values of randomized fields.
@@ -7037,9 +7483,31 @@ struct RvalueExprVisitor : public ExprVisitor {
       };
 
       // Apply bounds from atomized inequality constraints.
-      for (const auto *ce : constraintExprs) {
+      for (const auto &ceInfo : constraintExprs) {
+        const auto *ce = ceInfo.expr;
         if (!ce)
           continue;
+
+        Value ceEnabled = mkBoolConst(true);
+        if (ceInfo.block) {
+          int32_t blockId = context.getOrAssignConstraintBlockId(*ceInfo.block);
+          Value blockIdVal = moore::ConstantOp::create(context.builder, loc, i32Ty, blockId,
+                                                      /*isSigned=*/true);
+          Value mode;
+          if (ceInfo.block->flags.has(slang::ast::ConstraintBlockFlags::Static)) {
+            mode =
+                mlir::func::CallOp::create(context.builder, loc,
+                                           constraintModeGetStaticFn, {blockIdVal})
+                    .getResult(0);
+          } else {
+            mode =
+                mlir::func::CallOp::create(context.builder, loc, constraintModeGetFn,
+                                           ValueRange{entry.getArgument(0), blockIdVal})
+                    .getResult(0);
+          }
+          ceEnabled = moore::BoolCastOp::create(context.builder, loc, mode);
+        }
+
         SmallVector<const slang::ast::Expression *> atoms;
         collectAtoms(*ce, collectAtoms, atoms);
 
@@ -7095,8 +7563,8 @@ struct RvalueExprVisitor : public ExprVisitor {
           Value one = moore::ConstantOp::create(context.builder, loc, i32Ty, 1, /*isSigned=*/true);
           Value cand = other;
 
-          auto setLo = [&](Value v) { loVals[idx] = v; };
-          auto setHi = [&](Value v) { hiVals[idx] = v; };
+          auto setLo = [&](Value v) { loVals[idx] = selectI32(ceEnabled, v, loVals[idx]); };
+          auto setHi = [&](Value v) { hiVals[idx] = selectI32(ceEnabled, v, hiVals[idx]); };
 
           auto maxVal = [&](Value a, Value b, bool signedCmp) -> Value {
             Value cond;
@@ -7199,7 +7667,8 @@ struct RvalueExprVisitor : public ExprVisitor {
       context.builder.setInsertionPointToStart(tryBlock);
       // Randomize fields.
       for (size_t i = 0, e = randProps.size(); i < e; ++i) {
-        int32_t fieldId = context.getOrAssignClassFieldId(*randProps[i]);
+        auto *prop = randProps[i];
+        int32_t fieldId = context.getOrAssignClassFieldId(*prop);
         Value fieldIdVal =
             moore::ConstantOp::create(context.builder, loc, i32Ty, fieldId, /*isSigned=*/true);
         Value lo = loVals[i];
@@ -7207,13 +7676,26 @@ struct RvalueExprVisitor : public ExprVisitor {
         Value r = mlir::func::CallOp::create(context.builder, loc, rangeFn,
                                              ValueRange{lo, hi})
                       .getResult(0);
+        Value mode;
+        if (prop->lifetime == slang::ast::VariableLifetime::Static) {
+          mode = mlir::func::CallOp::create(context.builder, loc, randModeGetStaticFn,
+                                            ValueRange{fieldIdVal})
+                     .getResult(0);
+        } else {
+          mode = mlir::func::CallOp::create(context.builder, loc, randModeGetFn,
+                                            ValueRange{entry.getArgument(0), fieldIdVal})
+                     .getResult(0);
+        }
+        Value enabled = moore::BoolCastOp::create(context.builder, loc, mode);
+        Value chosen = selectI32(enabled, r, oldVals[i]);
         mlir::func::CallOp::create(context.builder, loc, setFn,
-                                   ValueRange{entry.getArgument(0), fieldIdVal, r});
+                                   ValueRange{entry.getArgument(0), fieldIdVal, chosen});
       }
 
       // Evaluate all constraints (AND).
       Value allOk = mkBoolConst(true);
-      for (const auto *ce : constraintExprs) {
+      for (const auto &ceInfo : constraintExprs) {
+        const auto *ce = ceInfo.expr;
         if (!ce)
           continue;
         if (ce->kind == slang::ast::ExpressionKind::Dist)
@@ -7224,7 +7706,31 @@ struct RvalueExprVisitor : public ExprVisitor {
         Value b = context.convertToBool(v, moore::Domain::TwoValued);
         if (!b)
           return {};
-        allOk = moore::AndOp::create(context.builder, loc, allOk, b);
+        if (ceInfo.block) {
+          int32_t blockId = context.getOrAssignConstraintBlockId(*ceInfo.block);
+          Value blockIdVal = moore::ConstantOp::create(context.builder, loc, i32Ty, blockId,
+                                                      /*isSigned=*/true);
+          Value mode;
+          if (ceInfo.block->flags.has(slang::ast::ConstraintBlockFlags::Static)) {
+            mode =
+                mlir::func::CallOp::create(context.builder, loc,
+                                           constraintModeGetStaticFn, {blockIdVal})
+                    .getResult(0);
+          } else {
+            mode =
+                mlir::func::CallOp::create(context.builder, loc, constraintModeGetFn,
+                                           ValueRange{entry.getArgument(0), blockIdVal})
+                    .getResult(0);
+          }
+          Value enabled = moore::BoolCastOp::create(context.builder, loc, mode);
+          Value notEnabled =
+              moore::NotOp::create(context.builder, loc, enabled).getResult();
+          Value gate =
+              moore::OrOp::create(context.builder, loc, notEnabled, b);
+          allOk = moore::AndOp::create(context.builder, loc, allOk, gate);
+        } else {
+          allOk = moore::AndOp::create(context.builder, loc, allOk, b);
+        }
       }
 
       Value allOkI1 = moore::ToBuiltinBoolOp::create(context.builder, loc, allOk);

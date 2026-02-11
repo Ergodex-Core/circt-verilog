@@ -1112,46 +1112,6 @@ struct StmtVisitor {
     if (!cond)
       return failure();
 
-    // For deferred immediate assertions (`assert #0` / `assert final`), ignore
-    // action blocks for now and keep only the verification semantics. AnonSim
-    // does not execute `else` blocks for these forms (it reports an assertion
-    // failure but does not run `$error` / `uvm_error` actions), and sv-tests
-    // treats such runs as PASS. Lowering them as "if-else" control flow causes
-    // arcilator to emit `:assert:` markers and fail tests that are expected to
-    // pass.
-    if (stmt.isFinal || stmt.isDeferred) {
-      // Moore assertion ops currently require a `moore.procedure` parent. When
-      // an immediate assertion appears inside a function/task body that is
-      // lowered as an isolated region (e.g. `func.func`), keep the condition
-      // evaluation for side effects but otherwise drop the assertion.
-      if (!builder.getInsertionBlock() ||
-          !isa<moore::ProcedureOp>(builder.getInsertionBlock()->getParentOp()))
-        return success();
-
-      auto defer = moore::DeferAssert::Immediate;
-      if (stmt.isFinal)
-        defer = moore::DeferAssert::Final;
-      else if (stmt.isDeferred)
-        defer = moore::DeferAssert::Observed;
-
-      switch (stmt.assertionKind) {
-      case slang::ast::AssertionKind::Assert:
-        moore::AssertOp::create(builder, loc, defer, cond, StringAttr{});
-        return success();
-      case slang::ast::AssertionKind::Assume:
-        moore::AssumeOp::create(builder, loc, defer, cond, StringAttr{});
-        return success();
-      case slang::ast::AssertionKind::CoverProperty:
-        moore::CoverOp::create(builder, loc, defer, cond, StringAttr{});
-        return success();
-      default:
-        break;
-      }
-      mlir::emitError(loc) << "unsupported immediate assertion kind: "
-                           << slang::ast::toString(stmt.assertionKind);
-      return failure();
-    }
-
     // Handle assertion statements that don't have an action block.
     if (stmt.ifTrue && stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
       // Moore assertion ops currently require a `moore.procedure` parent. When
