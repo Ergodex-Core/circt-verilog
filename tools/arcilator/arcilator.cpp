@@ -130,6 +130,54 @@ private:
                                    OpBuilder &builder, IRMapping &mapping);
 };
 
+/// Work around unsupported dynamic strings for UVM reporting.
+///
+/// Some UVM tests call `uvm_info` with `$sformatf` messages (e.g. assertion
+/// action blocks). This lowers to `sim.fmt.to_string` feeding a
+/// `circt_uvm_report` call. Today, downstream LLHD normalization passes do not
+/// preserve these dynamic-string calls reliably, which can drop report events
+/// (affecting report counts exported via ports for VCD parity).
+///
+/// Until we have a robust runtime-string path through the LLHD→Arc pipeline,
+/// degrade gracefully by keeping the report event but substituting an empty
+/// string for the message. This preserves severity/id counters, which are the
+/// primary oracle for UVM internal parity checking.
+struct UvmReportMessageFallbackPass
+    : public PassWrapper<UvmReportMessageFallbackPass,
+                         OperationPass<mlir::ModuleOp>> {
+  void runOnOperation() override {
+    auto module = getOperation();
+    auto *ctx = module.getContext();
+    auto strTy = hw::StringType::get(ctx);
+
+    SmallVector<sim::FormatToStringOp> maybeDeadToStrings;
+    module.walk([&](func::CallOp call) {
+      if (call.getCallee() != "circt_uvm_report")
+        return;
+      if (call.getNumOperands() != 4)
+        return;
+      Value message = call.getOperand(3);
+      if (!message)
+        return;
+      if (message.getDefiningOp<sv::ConstantStrOp>())
+        return;
+
+      if (auto toStr = message.getDefiningOp<sim::FormatToStringOp>())
+        maybeDeadToStrings.push_back(toStr);
+
+      OpBuilder builder(call);
+      auto empty =
+          builder.create<sv::ConstantStrOp>(call.getLoc(), strTy,
+                                            builder.getStringAttr(""));
+      call.setOperand(3, empty);
+    });
+
+    for (auto toStr : maybeDeadToStrings)
+      if (toStr && toStr->use_empty())
+        toStr.erase();
+  }
+};
+
 bool MakeNoPortTopDriveablePass::isClockLikeName(StringRef name) {
   name = name.trim();
   return name == "clk" || name.ends_with(".clk") || name.ends_with("/clk");
@@ -295,6 +343,11 @@ void MakeNoPortTopDriveablePass::runOnOperation() {
         continue;
 
       auto drv = drives.front();
+      // Conservatively avoid inlining signals driven from within procedural
+      // regions. Such drives may be stateful (e.g. `x = x + 1;`) and replacing
+      // probes with the driven value can introduce cyclic SSA use.
+      if (drv->getBlock() != body)
+        continue;
       if (drv.getEnable())
         continue;
 
@@ -929,6 +982,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     pm.addPass(mlir::createSymbolDCEPass());
     pm.addPass(createConvertMooreToCorePass());
   }
+  pm.addPass(std::make_unique<UvmReportMessageFallbackPass>());
   pm.addPass(om::createStripOMPass());
   pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());

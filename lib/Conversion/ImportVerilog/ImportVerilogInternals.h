@@ -333,6 +333,19 @@ struct Context {
   /// control `@*`.
   std::function<void(moore::ReadOp)> rvalueReadCallback;
 
+  /// Optional override for lowering assertion-only system calls (e.g. `$past`,
+  /// `$rose`, `$fell`, `$stable`, `$changed`) when they appear in rvalue
+  /// expressions. When this is null, assertion calls are lowered through the
+  /// LTL dialect (see `convertAssertionCallExpression`).
+  std::function<Value(const slang::ast::CallExpression &,
+                      const slang::ast::CallExpression::SystemCallInfo &,
+                      Location)>
+      assertionCallOverride;
+
+  /// Monotonic id for creating unique names when synthesizing internal state
+  /// (e.g. sampled-value storage for `$past`-like calls).
+  unsigned nextAssertionCallScopeId = 0;
+
   /// The time scale currently in effect.
   slang::TimeScale timeScale;
 };

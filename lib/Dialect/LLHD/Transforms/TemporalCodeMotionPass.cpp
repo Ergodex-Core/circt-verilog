@@ -11,6 +11,7 @@
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
@@ -43,6 +44,11 @@ static bool isSimTerminate(Operation *op) {
 
 static bool isSimSideEffectOp(Operation *op) {
   return isSimProcPrint(op) || isSimTerminate(op);
+}
+
+static bool isCirctUvmReportCall(Operation *op) {
+  auto call = dyn_cast_or_null<func::CallOp>(op);
+  return call && call.getCallee() == "circt_uvm_report";
 }
 
 /// Return the `hw.constant` i1 value for `bit`.
@@ -1246,6 +1252,110 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
 
       for (Operation *op : toErase)
         op->erase();
+    }
+
+    // Preserve UVM report calls (`circt_uvm_report`) by cloning them into the
+    // current TR's exit block under the reachability condition from the TR
+    // entry. These calls have semantic effects (report counts) and must not be
+    // dropped when structuralizing the process CFG.
+    SmallVector<func::CallOp> uvmReportCalls;
+    procOp.walk([&](func::CallOp call) {
+      if (call->getParentOp() != procOp)
+        return;
+      if (trAnalysis.getBlockTR(call->getBlock()) != static_cast<int>(currTR))
+        return;
+      if (!isCirctUvmReportCall(call.getOperation()))
+        return;
+      uvmReportCalls.push_back(call);
+    });
+
+    if (!uvmReportCalls.empty()) {
+      OpBuilder reportBuilder(procOp.getContext());
+      reportBuilder.setInsertionPoint(moveBefore);
+
+      // Use the TR entry as dominator when reconstructing reachability.
+      Block *reachDominator = entryBlock;
+
+      // Ensure `circt_uvm_report_if` exists, matching `circt_uvm_report` but
+      // with a leading i1 enable. This avoids introducing nested region
+      // control flow (e.g. `scf.if`) which the Arc conversion pipeline does
+      // not currently handle in drive-bearing processes.
+      func::FuncOp reportIfFn;
+      if (auto module = procOp->getParentOfType<ModuleOp>()) {
+        reportIfFn = module.lookupSymbol<func::FuncOp>("circt_uvm_report_if");
+        if (!reportIfFn) {
+          OpBuilder modBuilder(module.getBodyRegion());
+          modBuilder.setInsertionPointToStart(module.getBody());
+          func::FuncOp reportFn =
+              module.lookupSymbol<func::FuncOp>("circt_uvm_report");
+          SmallVector<Type> inputs;
+          inputs.push_back(reportBuilder.getI1Type());
+          if (reportFn) {
+            auto fnTy = reportFn.getFunctionType();
+            inputs.append(fnTy.getInputs().begin(), fnTy.getInputs().end());
+            reportIfFn = func::FuncOp::create(
+                modBuilder, module.getLoc(), "circt_uvm_report_if",
+                FunctionType::get(procOp.getContext(), inputs,
+                                  fnTy.getResults()));
+          } else {
+            // Fallback: enable, self, severity, id, message.
+            inputs.push_back(reportBuilder.getI32Type());
+            inputs.push_back(reportBuilder.getI32Type());
+            auto strTy = hw::StringType::get(procOp.getContext());
+            inputs.push_back(strTy);
+            inputs.push_back(strTy);
+            reportIfFn = func::FuncOp::create(
+                modBuilder, module.getLoc(), "circt_uvm_report_if",
+                FunctionType::get(procOp.getContext(), inputs, {}));
+          }
+          reportIfFn.setPrivate();
+        }
+      }
+
+      for (func::CallOp reportCall : uvmReportCalls) {
+        Value enable = getBranchDecisionsFromDominatorToTarget(
+            reportBuilder, reportCall->getBlock(), reachDominator, mem,
+            clonedValues, cloneStack);
+
+        // Clone call operands into the exit block so they stay live after we
+        // drop intermediate blocks.
+        Block *targetBlock = reportBuilder.getBlock();
+        for (Value operand : reportCall.getOperands()) {
+          Value cloned =
+              cloneValueIntoBlock(operand, reportBuilder, targetBlock,
+                                  clonedValues, cloneStack);
+          if (!cloned)
+            cloned = operand;
+          // ConvertToArcs may materialize isolated regions; avoid capturing
+          // constants from parent regions by cloning them into the process.
+          if (cloned == operand) {
+            Operation *defOp = operand.getDefiningOp();
+            if (defOp && defOp->getParentRegion() != targetBlock->getParent() &&
+                isa<hw::ConstantOp>(defOp)) {
+              Operation *constClone = reportBuilder.clone(*defOp);
+              auto opResult = cast<OpResult>(operand);
+              cloned = constClone->getResult(opResult.getResultNumber());
+            }
+          }
+          Value mapped = clonedValues.lookupOrNull(operand);
+          if (!mapped || mapped == operand)
+            clonedValues.map(operand, cloned);
+        }
+
+        // Insert a conditional report call without nested regions.
+        SmallVector<Value, 8> operands;
+        operands.push_back(enable);
+        for (Value operand : reportCall.getOperands())
+          operands.push_back(clonedValues.lookupOrDefault(operand));
+        if (reportIfFn)
+          func::CallOp::create(reportBuilder, reportCall.getLoc(), reportIfFn,
+                               operands);
+        else
+          func::CallOp::create(reportBuilder, reportCall.getLoc(),
+                               reportBuilder.getStringAttr("circt_uvm_report_if"),
+                               TypeRange{}, operands);
+        reportCall.erase();
+      }
     }
 
     // Merge entry and exit block of each TR, remove all other blocks

@@ -426,6 +426,8 @@ FailureOr<Value> Context::convertAssertionSystemCallArity1(
 Value Context::convertAssertionCallExpression(
     const slang::ast::CallExpression &expr,
     const slang::ast::CallExpression::SystemCallInfo &info, Location loc) {
+  if (assertionCallOverride)
+    return assertionCallOverride(expr, info, loc);
 
   const auto &subroutine = *info.subroutine;
   auto args = expr.arguments();
