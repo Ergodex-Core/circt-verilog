@@ -9,6 +9,8 @@
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/SystemSubroutine.h"
+#include "slang/ast/TimingControl.h"
+#include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/types/AllTypes.h"
 #include "llvm/ADT/ScopeExit.h"
 
@@ -1131,13 +1133,13 @@ struct StmtVisitor {
 
   // Handle immediate assertion statements.
   LogicalResult visit(const slang::ast::ImmediateAssertionStatement &stmt) {
-    auto cond = context.convertRvalueExpression(stmt.cond);
-    cond = context.convertToBool(cond);
-    if (!cond)
-      return failure();
-
     // Handle assertion statements that don't have an action block.
     if (stmt.ifTrue && stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
+      auto cond = context.convertRvalueExpression(stmt.cond);
+      cond = context.convertToBool(cond);
+      if (!cond)
+        return failure();
+
       // Moore assertion ops currently require a `moore.procedure` parent. When
       // an immediate assertion appears inside a function/task body that is
       // lowered as an isolated region (e.g. `func.func`), keep the condition
@@ -1171,11 +1173,190 @@ struct StmtVisitor {
     }
 
     // Regard assertion statements with an action block as the "if-else".
-    if (auto ty = dyn_cast<moore::IntType>(cond.getType());
-        ty && ty.getDomain() == Domain::FourValued) {
-      cond = moore::LogicToIntOp::create(builder, loc, cond);
+    moore::ProcedureOp procOp;
+    if (auto *block = builder.getInsertionBlock())
+      procOp = dyn_cast<moore::ProcedureOp>(block->getParentOp());
+
+    // Some SV frontends desugar concurrent assertions with action blocks into a
+    // clocked procedural block containing an immediate assertion statement.
+    // Model sampled-value functions (`$past`, `$rose`, ...) in this procedural
+    // form by synthesizing per-assertion state.
+    DenseMap<const slang::ast::Expression *, Value> prevVars;
+    DenseMap<const slang::ast::Expression *, Value> curValues;
+    unsigned nextPrevId = 0;
+    Value havePastVar;
+    auto scopeId = context.nextAssertionCallScopeId++;
+    auto prefix = ("__svtests_sa" + Twine(scopeId)).str();
+
+    auto toMatchingIntType = [&](Value value,
+                                 moore::IntType targetType) -> Value {
+      if (!value)
+        return {};
+      auto srcType = dyn_cast<moore::IntType>(value.getType());
+      if (!srcType)
+        return {};
+
+      Value casted = value;
+      if (srcType.getDomain() != targetType.getDomain()) {
+        if (srcType.getDomain() == Domain::TwoValued &&
+            targetType.getDomain() == Domain::FourValued) {
+          casted = moore::IntToLogicOp::create(builder, value.getLoc(), casted);
+        } else if (srcType.getDomain() == Domain::FourValued &&
+                   targetType.getDomain() == Domain::TwoValued) {
+          casted = moore::LogicToIntOp::create(builder, value.getLoc(), casted);
+        } else {
+          return {};
+        }
+      }
+
+      // Replicate a 1-bit guard to match the target width, if needed.
+      auto srcBits = srcType.getBitSize();
+      auto dstBits = targetType.getBitSize();
+      if (!srcBits || !dstBits)
+        return {};
+      if (*srcBits != *dstBits) {
+        if (*srcBits != 1)
+          return {};
+        casted = moore::ReplicateOp::create(builder, value.getLoc(), targetType,
+                                            casted);
+      }
+      return casted;
+    };
+
+    auto ensureHavePastVar = [&](Location declLoc) -> Value {
+      if (havePastVar)
+        return havePastVar;
+      if (!procOp)
+        return {};
+
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&procOp.getBody().front());
+      auto havePastTy =
+          moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+      Value init0 = moore::ConstantOp::create(builder, declLoc, havePastTy, 0);
+      havePastVar = moore::VariableOp::create(
+          builder, declLoc,
+          moore::RefType::get(cast<moore::UnpackedType>(havePastTy)),
+          builder.getStringAttr(prefix + "_has_past"), init0);
+      return havePastVar;
+    };
+
+    auto getOrCreatePrevVar =
+        [&](const slang::ast::Expression *argExpr, moore::IntType intTy,
+            Location declLoc) -> Value {
+      if (!argExpr || !procOp)
+        return {};
+      if (Value existing = prevVars.lookup(argExpr))
+        return existing;
+
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&procOp.getBody().front());
+      Value init0 = moore::ConstantOp::create(builder, declLoc, intTy, 0);
+      auto name = builder.getStringAttr(
+          (Twine(prefix) + "_prev" + Twine(nextPrevId++)).str());
+      Value var = moore::VariableOp::create(
+          builder, declLoc,
+          moore::RefType::get(cast<moore::UnpackedType>(intTy)), name, init0);
+      prevVars.insert({argExpr, var});
+      return var;
+    };
+
+    Value cond;
+    {
+      auto savedOverride = context.assertionCallOverride;
+      context.assertionCallOverride =
+          [&](const slang::ast::CallExpression &expr,
+              const slang::ast::CallExpression::SystemCallInfo &info,
+              Location callLoc) -> Value {
+        const auto &subroutine = *info.subroutine;
+        auto args = expr.arguments();
+        if (args.size() != 1 || !args[0])
+          return {};
+
+        Value argVal = context.convertRvalueExpression(*args[0]);
+        if (!argVal)
+          return {};
+        auto intTy = dyn_cast<moore::IntType>(argVal.getType());
+        if (!intTy)
+          return {};
+
+        const slang::ast::Expression *argExpr = args[0];
+        Value prevVar = getOrCreatePrevVar(argExpr, intTy, callLoc);
+        if (!prevVar)
+          return {};
+        if (!curValues.count(argExpr))
+          curValues.insert({argExpr, argVal});
+
+        Value havePastRef = ensureHavePastVar(callLoc);
+        if (!havePastRef)
+          return {};
+        Value havePast = moore::ReadOp::create(builder, callLoc, havePastRef);
+        Value prevVal = moore::ReadOp::create(builder, callLoc, prevVar);
+
+        auto guardAnd = [&](Value guard, Value value) -> Value {
+          auto valueTy = dyn_cast<moore::IntType>(value.getType());
+          auto guardTy = dyn_cast<moore::IntType>(guard.getType());
+          if (!valueTy || !guardTy)
+            return Value{};
+          Value guardCast = toMatchingIntType(guard, valueTy);
+          if (!guardCast)
+            return {};
+          return moore::AndOp::create(builder, callLoc, guardCast, value);
+        };
+
+        if (subroutine.name == "$past") {
+          // Best-effort: `$past(x)` is `x[-1]` if a past sample exists, else 0.
+          return guardAnd(havePast, prevVal);
+        }
+
+        if (subroutine.name == "$stable") {
+          Value eq = moore::EqOp::create(builder, callLoc, argVal, prevVal);
+          auto eqTy = cast<moore::IntType>(eq.getType());
+          Value havePastBit = toMatchingIntType(havePast, eqTy);
+          if (!havePastBit)
+            return {};
+          return moore::AndOp::create(builder, callLoc, havePastBit, eq);
+        }
+
+        if (subroutine.name == "$changed") {
+          Value eq = moore::EqOp::create(builder, callLoc, argVal, prevVal);
+          auto eqTy = cast<moore::IntType>(eq.getType());
+          Value havePastBit = toMatchingIntType(havePast, eqTy);
+          if (!havePastBit)
+            return {};
+          Value stable = moore::AndOp::create(builder, callLoc, havePastBit, eq);
+          return moore::NotOp::create(builder, callLoc, stable);
+        }
+
+        // $rose/$fell are defined on single-bit arguments.
+        auto width = intTy.getBitSize();
+        if (!width || *width != 1)
+          return {};
+
+        if (subroutine.name == "$rose") {
+          Value notPrev = moore::NotOp::create(builder, callLoc, prevVal);
+          Value core = moore::AndOp::create(builder, callLoc, notPrev, argVal);
+          return guardAnd(havePast, core);
+        }
+
+        if (subroutine.name == "$fell") {
+          Value notCur = moore::NotOp::create(builder, callLoc, argVal);
+          Value core = moore::AndOp::create(builder, callLoc, prevVal, notCur);
+          return guardAnd(havePast, core);
+        }
+
+        return {};
+      };
+      auto restoreOverride = llvm::make_scope_exit(
+          [&] { context.assertionCallOverride = savedOverride; });
+
+      cond = context.convertRvalueExpression(stmt.cond);
+      cond = context.convertToBool(cond);
+      if (!cond)
+        return failure();
     }
-    cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+
+    cond = moore::ToBuiltinBoolOp::create(builder, loc, cond);
 
     // Create the blocks for the true and false branches, and the exit block.
     Block &exitBlock = createBlock();
@@ -1207,6 +1388,19 @@ struct StmtVisitor {
       setTerminated();
     } else {
       builder.setInsertionPointToEnd(&exitBlock);
+
+      if (havePastVar) {
+        for (auto [expr, cur] : curValues) {
+          Value prevVar = prevVars.lookup(expr);
+          if (!prevVar)
+            continue;
+          moore::BlockingAssignOp::create(builder, loc, prevVar, cur);
+        }
+        auto havePastTy =
+            moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+        Value one = moore::ConstantOp::create(builder, loc, havePastTy, 1);
+        moore::BlockingAssignOp::create(builder, loc, havePastVar, one);
+      }
     }
     return success();
   }
@@ -1222,26 +1416,895 @@ struct StmtVisitor {
     // has type DisableIff, negate the `disable` expression, then pass it to
     // the `enable` parameter of AssertOp/AssumeOp.
     Value enable;
-    Value property;
+    const slang::ast::AssertionExpr *propertySpec = &stmt.propertySpec;
     if (auto *disableIff =
             stmt.propertySpec.as_if<slang::ast::DisableIffAssertionExpr>()) {
-      auto disableCond = context.convertRvalueExpression(disableIff->condition);
-      auto enableCond = moore::NotOp::create(builder, loc, disableCond);
+      Value disableCond = context.convertRvalueExpression(disableIff->condition);
+      disableCond = context.convertToBool(disableCond, Domain::TwoValued);
+      if (!disableCond)
+        return failure();
 
+      Value enableCond = moore::NotOp::create(builder, loc, disableCond);
       enable = context.convertToI1(enableCond);
-      property = context.convertAssertionExpression(disableIff->expr, loc);
-    } else {
-      property = context.convertAssertionExpression(stmt.propertySpec, loc);
+      propertySpec = &disableIff->expr;
+    }
+    auto isEmptyAction = [](const slang::ast::Statement *s) -> bool {
+      return !s || s->as_if<slang::ast::EmptyStatement>();
+    };
+
+    // Best-effort extraction of a clock and boolean condition from a concurrent
+    // assertion property spec, including named sequences/properties (which are
+    // represented as assertion-instance expressions).
+    auto extractClockedCondition =
+        [&](const slang::ast::AssertionExpr &root,
+            const slang::ast::SignalEventControl *&clockCtrl,
+            const slang::ast::Expression *&condExpr) -> void {
+      clockCtrl = nullptr;
+      condExpr = nullptr;
+
+      const slang::ast::AssertionExpr *expr = &root;
+      // Keep this conservative; we only want simple, single-cycle sampling.
+      for (unsigned depth = 0; depth < 64 && expr; ++depth) {
+        if (auto *clocked = expr->as_if<slang::ast::ClockingAssertionExpr>()) {
+          if (clocked->clocking.kind !=
+              slang::ast::TimingControlKind::SignalEvent)
+            break;
+          clockCtrl = &clocked->clocking.as<slang::ast::SignalEventControl>();
+          expr = &clocked->expr;
+          continue;
+        }
+
+        if (auto *withMatch =
+                expr->as_if<slang::ast::SequenceWithMatchExpr>()) {
+          if (withMatch->repetition.has_value() ||
+              !withMatch->matchItems.empty())
+            break;
+          expr = &withMatch->expr;
+          continue;
+        }
+
+        if (auto *concat = expr->as_if<slang::ast::SequenceConcatExpr>()) {
+          if (concat->elements.size() != 1)
+            break;
+          const auto &elem = concat->elements.front();
+          if (elem.delay.min != 1 || (elem.delay.max && *elem.delay.max != 1))
+            break;
+          expr = elem.sequence;
+          continue;
+        }
+
+        if (auto *strongWeak =
+                expr->as_if<slang::ast::StrongWeakAssertionExpr>()) {
+          expr = &strongWeak->expr;
+          continue;
+        }
+
+        if (auto *simple = expr->as_if<slang::ast::SimpleAssertionExpr>()) {
+          if (simple->repetition.has_value())
+            break;
+
+          // If we already found a sampling clock, this is the boolean condition.
+          if (clockCtrl) {
+            condExpr = &simple->expr;
+            break;
+          }
+
+          // Otherwise, try to unwrap named sequences/properties:
+          //   assert property (seq) else ...
+          // where `seq` binds to an AssertionInstanceExpression whose body
+          // contains the clocking event and condition.
+          if (auto *inst =
+                  simple->expr.as_if<slang::ast::AssertionInstanceExpression>()) {
+            if (!inst->arguments.empty())
+              break;
+            expr = &inst->body;
+            continue;
+          }
+
+          break;
+        }
+
+        break;
+      }
+    };
+
+    // If the concurrent assertion has action blocks, best-effort lower it to a
+    // clocked procedural check so side effects (e.g. `uvm_info` in `else`)
+    // appear in simulation.
+    bool hasTrueAction = !isEmptyAction(stmt.ifTrue);
+    bool hasFalseAction = !isEmptyAction(stmt.ifFalse);
+    if (hasTrueAction || hasFalseAction) {
+      struct FixedSeqTerm {
+        const slang::ast::Expression *expr = nullptr;
+        uint32_t time = 0;
+      };
+      struct FixedSeqInfo {
+        uint32_t length = 0;
+        SmallVector<FixedSeqTerm, 8> terms;
+      };
+
+      // Best-effort extraction of a sampling clock and the underlying
+      // assertion body, including named sequences/properties.
+      auto extractClockedBody =
+          [&](const slang::ast::AssertionExpr &root,
+              const slang::ast::SignalEventControl *&clockCtrl,
+              const slang::ast::AssertionExpr *&body) -> void {
+        clockCtrl = nullptr;
+        body = nullptr;
+
+        const slang::ast::AssertionExpr *expr = &root;
+        for (unsigned depth = 0; depth < 64 && expr; ++depth) {
+          if (auto *clocked =
+                  expr->as_if<slang::ast::ClockingAssertionExpr>()) {
+            if (clocked->clocking.kind !=
+                slang::ast::TimingControlKind::SignalEvent)
+              break;
+            clockCtrl = &clocked->clocking.as<slang::ast::SignalEventControl>();
+            expr = &clocked->expr;
+            continue;
+          }
+
+          if (auto *withMatch =
+                  expr->as_if<slang::ast::SequenceWithMatchExpr>()) {
+            if (withMatch->repetition.has_value() ||
+                !withMatch->matchItems.empty())
+              break;
+            expr = &withMatch->expr;
+            continue;
+          }
+
+          if (auto *strongWeak =
+                  expr->as_if<slang::ast::StrongWeakAssertionExpr>()) {
+            expr = &strongWeak->expr;
+            continue;
+          }
+
+          if (auto *simple = expr->as_if<slang::ast::SimpleAssertionExpr>()) {
+            if (simple->repetition.has_value())
+              break;
+            if (auto *inst = simple->expr.as_if<
+                    slang::ast::AssertionInstanceExpression>()) {
+              if (!inst->arguments.empty())
+                break;
+              expr = &inst->body;
+              continue;
+            }
+            break;
+          }
+
+          break;
+        }
+
+        if (clockCtrl)
+          body = expr;
+      };
+
+      // Best-effort analysis of a fixed-delay, match-item-free sequence into a
+      // list of boolean terms with absolute cycle offsets and a fixed length.
+      //
+      // This is intentionally conservative; it exists to allow action blocks
+      // on simple sequences (e.g. `assert property (a ##5 b) else ...`) to
+      // execute under simulation even when declarative LTL lowering is not
+      // supported.
+      auto analyzeFixedSequence =
+          [&](const slang::ast::AssertionExpr &root) -> std::optional<FixedSeqInfo> {
+        std::function<std::optional<FixedSeqInfo>(const slang::ast::AssertionExpr &)>
+            analyze = [&](const slang::ast::AssertionExpr &expr)
+            -> std::optional<FixedSeqInfo> {
+          if (auto *strongWeak =
+                  expr.as_if<slang::ast::StrongWeakAssertionExpr>())
+            return analyze(strongWeak->expr);
+
+          if (auto *withMatch = expr.as_if<slang::ast::SequenceWithMatchExpr>()) {
+            if (withMatch->repetition.has_value() || !withMatch->matchItems.empty())
+              return std::nullopt;
+            return analyze(withMatch->expr);
+          }
+
+          if (auto *concat = expr.as_if<slang::ast::SequenceConcatExpr>()) {
+            FixedSeqInfo out;
+            uint32_t cursor = 0;
+            for (const auto &elem : concat->elements) {
+              if (elem.delay.max && *elem.delay.max != elem.delay.min)
+                return std::nullopt;
+              uint32_t delay = elem.delay.min;
+              if (!elem.sequence)
+                return std::nullopt;
+              auto child = analyze(*elem.sequence);
+              if (!child)
+                return std::nullopt;
+              cursor += delay;
+              for (auto term : child->terms)
+                out.terms.push_back({term.expr, cursor + term.time});
+              cursor += child->length;
+            }
+            out.length = cursor;
+            return out;
+          }
+
+          if (auto *binary = expr.as_if<slang::ast::BinaryAssertionExpr>()) {
+            using slang::ast::BinaryAssertionOperator;
+            if (binary->op != BinaryAssertionOperator::And)
+              return std::nullopt;
+            auto lhs = analyze(binary->left);
+            auto rhs = analyze(binary->right);
+            if (!lhs || !rhs)
+              return std::nullopt;
+            FixedSeqInfo out;
+            out.length = std::max(lhs->length, rhs->length);
+            out.terms.append(lhs->terms.begin(), lhs->terms.end());
+            out.terms.append(rhs->terms.begin(), rhs->terms.end());
+            return out;
+          }
+
+          if (auto *simple = expr.as_if<slang::ast::SimpleAssertionExpr>()) {
+            if (simple->repetition.has_value())
+              return std::nullopt;
+            if (auto *inst = simple->expr.as_if<
+                    slang::ast::AssertionInstanceExpression>()) {
+              if (!inst->arguments.empty())
+                return std::nullopt;
+              return analyze(inst->body);
+            }
+            FixedSeqInfo out;
+            out.length = 0;
+            out.terms.push_back({&simple->expr, 0});
+            return out;
+          }
+
+          return std::nullopt;
+        };
+
+        return analyze(root);
+      };
+
+      auto savedIP = builder.saveInsertionPoint();
+      bool restoreInsertionPoint = false;
+      auto restoreIP = llvm::make_scope_exit([&] {
+        if (restoreInsertionPoint)
+          builder.restoreInsertionPoint(savedIP);
+      });
+
+      moore::ProcedureOp procOp;
+      if (auto *block = builder.getInsertionBlock())
+        procOp = dyn_cast<moore::ProcedureOp>(block->getParentOp());
+      moore::SVModuleOp svModule;
+      if (auto *block = builder.getInsertionBlock()) {
+        if (auto *parentOp = block->getParentOp()) {
+          if (auto direct = dyn_cast<moore::SVModuleOp>(parentOp))
+            svModule = direct;
+          else
+            svModule = parentOp->getParentOfType<moore::SVModuleOp>();
+        }
+      }
+      const slang::ast::SignalEventControl *clockCtrl = nullptr;
+      const slang::ast::Expression *condExpr = nullptr;
+      extractClockedCondition(*propertySpec, clockCtrl, condExpr);
+      const slang::ast::AssertionExpr *seqBody = nullptr;
+      std::optional<FixedSeqInfo> fixedSeq;
+      if (!condExpr) {
+        const slang::ast::SignalEventControl *seqClockCtrl = nullptr;
+        extractClockedBody(*propertySpec, seqClockCtrl, seqBody);
+        if (seqClockCtrl && seqBody) {
+          fixedSeq = analyzeFixedSequence(*seqBody);
+          if (fixedSeq)
+            clockCtrl = seqClockCtrl;
+        }
+      }
+
+      // Module-scope concurrent assertions are not inherently procedural.
+      // Create a dedicated `always` block so action blocks (e.g. `else
+      // uvm_info(...)`) can execute in simulation.
+      if (!procOp && svModule && clockCtrl && (condExpr || fixedSeq)) {
+        restoreInsertionPoint = true;
+        Block &modBody = svModule.getBodyRegion().front();
+        if (auto *term = modBody.getTerminator())
+          builder.setInsertionPoint(term);
+        else
+          builder.setInsertionPointToEnd(&modBody);
+        procOp = moore::ProcedureOp::create(builder, loc,
+                                            moore::ProcedureKind::Always);
+        builder.setInsertionPointToEnd(&procOp.getBody().emplaceBlock());
+      }
+
+      if (procOp && clockCtrl && condExpr) {
+        Context::ValueSymbolScope scope(context.valueSymbols);
+
+        unsigned scopeId = context.nextAssertionCallScopeId++;
+        auto prefix = ("__svtests_ca" + Twine(scopeId)).str();
+
+        // Create a per-assertion "has past sample" flag.
+        Value havePastVar;
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          // Store sampled-value state at module scope so it persists across
+          // activations of the generated `always` process.
+          Block &modBody = svModule.getBodyRegion().front();
+          builder.setInsertionPointToStart(&modBody);
+          auto havePastTy =
+              moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+          Value init0 = moore::ConstantOp::create(builder, loc, havePastTy, 0);
+          havePastVar = moore::VariableOp::create(
+              builder, loc,
+              moore::RefType::get(cast<moore::UnpackedType>(havePastTy)),
+              builder.getStringAttr(prefix + "_has_past"), init0);
+        }
+
+        DenseMap<const slang::ast::Expression *, Value> prevVars;
+        DenseMap<const slang::ast::Expression *, Value> curValues;
+        unsigned nextPrevId = 0;
+
+        auto toMatchingIntType = [&](Value value,
+                                     moore::IntType targetType) -> Value {
+          if (!value)
+            return {};
+          auto srcType = dyn_cast<moore::IntType>(value.getType());
+          if (!srcType)
+            return {};
+
+          Value casted = value;
+          if (srcType.getDomain() != targetType.getDomain()) {
+            if (srcType.getDomain() == Domain::TwoValued &&
+                targetType.getDomain() == Domain::FourValued) {
+              casted = moore::IntToLogicOp::create(builder, value.getLoc(), casted);
+            } else if (srcType.getDomain() == Domain::FourValued &&
+                       targetType.getDomain() == Domain::TwoValued) {
+              casted =
+                  moore::LogicToIntOp::create(builder, value.getLoc(), casted);
+            } else {
+              return {};
+            }
+          }
+
+          // Replicate a 1-bit guard to match the target width, if needed.
+          auto srcBits = srcType.getBitSize();
+          auto dstBits = targetType.getBitSize();
+          if (!srcBits || !dstBits)
+            return {};
+          if (*srcBits != *dstBits) {
+            if (*srcBits != 1)
+              return {};
+            casted =
+                moore::ReplicateOp::create(builder, value.getLoc(), targetType,
+                                           casted);
+          }
+          return casted;
+        };
+
+        // Override lowering of assertion-only system calls within the
+        // assertion condition to avoid emitting LTL, and instead model them in
+        // terms of local past-sample state.
+        auto savedOverride = context.assertionCallOverride;
+        context.assertionCallOverride =
+            [&](const slang::ast::CallExpression &expr,
+                const slang::ast::CallExpression::SystemCallInfo &info,
+                Location callLoc) -> Value {
+          const auto &subroutine = *info.subroutine;
+          auto args = expr.arguments();
+          if (args.size() != 1) {
+            mlir::emitError(callLoc, "unsupported assertion call `")
+                << subroutine.name << "` arity: expected 1, got " << args.size();
+            return {};
+          }
+          if (!args[0]) {
+            mlir::emitError(callLoc, "unsupported assertion call `")
+                << subroutine.name << "`: null argument";
+            return {};
+          }
+
+          // Convert the argument expression under the same override. Nested
+          // assertion calls are handled recursively.
+          Value argVal = context.convertRvalueExpression(*args[0]);
+          if (!argVal)
+            return {};
+
+          auto intTy = dyn_cast<moore::IntType>(argVal.getType());
+          if (!intTy) {
+            mlir::emitError(callLoc, "unsupported assertion call `")
+                << subroutine.name << "` operand type: " << argVal.getType();
+            return {};
+          }
+
+          const slang::ast::Expression *argExpr = args[0];
+          Value prevVar = prevVars.lookup(argExpr);
+          if (!prevVar) {
+            OpBuilder::InsertionGuard guard(builder);
+            Block &modBody = svModule.getBodyRegion().front();
+            builder.setInsertionPointToStart(&modBody);
+            Value init0 = moore::ConstantOp::create(builder, callLoc, intTy, 0);
+            auto name = builder.getStringAttr(
+                (Twine(prefix) + "_prev" + Twine(nextPrevId++)).str());
+            prevVar = moore::VariableOp::create(
+                builder, callLoc,
+                moore::RefType::get(cast<moore::UnpackedType>(intTy)), name,
+                init0);
+            prevVars.insert({argExpr, prevVar});
+          }
+
+          // Record the current value for updating past state at the end of the
+          // sampling tick.
+          if (!curValues.count(argExpr))
+            curValues.insert({argExpr, argVal});
+
+          Value havePast = moore::ReadOp::create(builder, callLoc, havePastVar);
+          Value prevVal = moore::ReadOp::create(builder, callLoc, prevVar);
+
+          // Helper to AND a single-bit guard with an arbitrary-width value by
+          // replicating and matching domain.
+          auto guardAnd = [&](Value guard, Value value) -> Value {
+            auto valueTy = dyn_cast<moore::IntType>(value.getType());
+            auto guardTy = dyn_cast<moore::IntType>(guard.getType());
+            if (!valueTy || !guardTy)
+              return Value{};
+            Value guardCast = toMatchingIntType(guard, valueTy);
+            if (!guardCast)
+              return {};
+            return moore::AndOp::create(builder, callLoc, guardCast, value);
+          };
+
+          if (subroutine.name == "$past") {
+            // Approximation: `$past(x)` is `x[-1]` if a past sample exists,
+            // otherwise 0.
+            return guardAnd(havePast, prevVal);
+          }
+
+          if (subroutine.name == "$stable") {
+            // `$stable(x)` is defined only once a past sample exists.
+            Value eq = moore::EqOp::create(builder, callLoc, argVal, prevVal);
+            auto eqTy = cast<moore::IntType>(eq.getType());
+            Value havePastBit = toMatchingIntType(havePast, eqTy);
+            if (!havePastBit)
+              return {};
+            return moore::AndOp::create(builder, callLoc, havePastBit, eq);
+          }
+
+          if (subroutine.name == "$changed") {
+            // `$changed(x)` is the complement of `$stable(x)`.
+            Value eq = moore::EqOp::create(builder, callLoc, argVal, prevVal);
+            auto eqTy = cast<moore::IntType>(eq.getType());
+            Value havePastBit = toMatchingIntType(havePast, eqTy);
+            if (!havePastBit)
+              return {};
+            Value stable =
+                moore::AndOp::create(builder, callLoc, havePastBit, eq);
+            return moore::NotOp::create(builder, callLoc, stable);
+          }
+
+          // $rose/$fell are defined on single-bit arguments.
+          auto width = intTy.getBitSize();
+          if (!width || *width != 1) {
+            mlir::emitError(callLoc, "unsupported assertion call `")
+                << subroutine.name
+                << "` on non-1-bit operand of type: " << intTy;
+            return {};
+          }
+
+          if (subroutine.name == "$rose") {
+            Value notPrev = moore::NotOp::create(builder, callLoc, prevVal);
+            Value core = moore::AndOp::create(builder, callLoc, notPrev, argVal);
+            return guardAnd(havePast, core);
+          }
+
+          if (subroutine.name == "$fell") {
+            Value notCur = moore::NotOp::create(builder, callLoc, argVal);
+            Value core = moore::AndOp::create(builder, callLoc, prevVal, notCur);
+            return guardAnd(havePast, core);
+          }
+
+          mlir::emitError(callLoc) << "unsupported assertion call `"
+                                   << subroutine.name << "`";
+          return {};
+        };
+        auto restoreOverride = llvm::make_scope_exit(
+            [&] { context.assertionCallOverride = savedOverride; });
+
+        // Sample the assertion condition *before* waiting for the clock edge.
+        //
+        // SVA sampled-value semantics observe the values "just before" the
+        // clocking event (preponed). We do not model simulator regions, so we
+        // approximate this by sampling between edges. For signals that change
+        // only on the sampling edge, the between-edge value matches the
+        // pre-edge sampled value.
+        //
+        // Convert the assertion condition with the assertion call override in
+        // place so sampled-value functions (`$past`, `$rose`, ...) use the same
+        // pre-edge snapshot.
+        Value condMoore = context.convertRvalueExpression(*condExpr);
+        if (!condMoore)
+          return failure();
+        condMoore = context.convertToBool(condMoore);
+        if (!condMoore)
+          return failure();
+
+        // Suspend until the sampling clock edge occurs.
+        auto waitOp = moore::WaitEventOp::create(builder, loc);
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
+
+          auto toEdge = [](slang::ast::EdgeKind edge) -> moore::Edge {
+            using slang::ast::EdgeKind;
+            switch (edge) {
+            case EdgeKind::None:
+              return moore::Edge::AnyChange;
+            case EdgeKind::PosEdge:
+              return moore::Edge::PosEdge;
+            case EdgeKind::NegEdge:
+              return moore::Edge::NegEdge;
+            case EdgeKind::BothEdges:
+              return moore::Edge::BothEdges;
+            }
+            llvm_unreachable("all edge kinds handled");
+          };
+
+          Value clkExpr = context.convertRvalueExpression(clockCtrl->expr);
+          if (!clkExpr)
+            return failure();
+          Value iffCond;
+          if (clockCtrl->iffCondition) {
+            iffCond = context.convertRvalueExpression(*clockCtrl->iffCondition);
+            iffCond = context.convertToBool(iffCond, Domain::TwoValued);
+            if (!iffCond)
+              return failure();
+          }
+          moore::DetectEventOp::create(builder, loc, toEdge(clockCtrl->edge),
+                                       clkExpr, iffCond);
+        }
+
+        Value cond = moore::ToBuiltinBoolOp::create(builder, loc, condMoore);
+
+        // Create the blocks for the true and false branches, and the merge
+        // block for state update.
+        Block &mergeBlock = createBlock();
+        Block *falseBlock = hasFalseAction ? &createBlock() : nullptr;
+        Block &trueBlock = createBlock();
+        cf::CondBranchOp::create(builder, loc, cond, &trueBlock,
+                                 falseBlock ? falseBlock : &mergeBlock);
+
+        builder.setInsertionPointToEnd(&trueBlock);
+        if (hasTrueAction) {
+          if (failed(context.convertStatement(*stmt.ifTrue)))
+            return failure();
+        }
+        if (!isTerminated())
+          cf::BranchOp::create(builder, loc, &mergeBlock);
+
+        if (falseBlock) {
+          builder.setInsertionPointToEnd(falseBlock);
+          if (failed(context.convertStatement(*stmt.ifFalse)))
+            return failure();
+          if (!isTerminated())
+            cf::BranchOp::create(builder, loc, &mergeBlock);
+        }
+
+        if (mergeBlock.hasNoPredecessors()) {
+          mergeBlock.erase();
+          setTerminated();
+          return success();
+        }
+
+        builder.setInsertionPointToEnd(&mergeBlock);
+
+        // Update stored past values at the end of the sampling tick.
+        for (auto [expr, cur] : curValues) {
+          Value prevVar = prevVars.lookup(expr);
+          if (!prevVar)
+            continue;
+          moore::BlockingAssignOp::create(builder, loc, prevVar, cur);
+        }
+        auto havePastTy =
+            moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+        Value one = moore::ConstantOp::create(builder, loc, havePastTy, 1);
+        moore::BlockingAssignOp::create(builder, loc, havePastVar, one);
+
+        moore::ReturnOp::create(builder, loc);
+        setTerminated();
+        return success();
+      }
+
+      // Lower `expect (seq) ...` statements with action blocks in a procedural
+      // context by unrolling a fixed-length, fixed-delay sequence. Unlike
+      // `assert property`, `expect` is blocking and only runs once.
+      if (procOp && svModule && clockCtrl && fixedSeq &&
+          stmt.assertionKind == slang::ast::AssertionKind::Expect &&
+          fixedSeq->length <= 64 && !fixedSeq->terms.empty()) {
+        Context::ValueSymbolScope scope(context.valueSymbols);
+
+        auto toEdge = [](slang::ast::EdgeKind edge) -> moore::Edge {
+          using slang::ast::EdgeKind;
+          switch (edge) {
+          case EdgeKind::None:
+            return moore::Edge::AnyChange;
+          case EdgeKind::PosEdge:
+            return moore::Edge::PosEdge;
+          case EdgeKind::NegEdge:
+            return moore::Edge::NegEdge;
+          case EdgeKind::BothEdges:
+            return moore::Edge::BothEdges;
+          }
+          llvm_unreachable("all edge kinds handled");
+        };
+
+        auto emitWaitForClock = [&]() -> LogicalResult {
+          auto waitOp = moore::WaitEventOp::create(builder, loc);
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
+
+          Value clkExpr = context.convertRvalueExpression(clockCtrl->expr);
+          if (!clkExpr)
+            return failure();
+          Value iffCond;
+          if (clockCtrl->iffCondition) {
+            iffCond = context.convertRvalueExpression(*clockCtrl->iffCondition);
+            iffCond = context.convertToBool(iffCond, Domain::TwoValued);
+            if (!iffCond)
+              return failure();
+          }
+          moore::DetectEventOp::create(builder, loc, toEdge(clockCtrl->edge),
+                                       clkExpr, iffCond);
+          return success();
+        };
+
+        auto seqLen = fixedSeq->length;
+        auto bitTy =
+            moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+        Value init1 = moore::ConstantOp::create(builder, loc, bitTy, 1);
+
+        // Bucket the fixed-sequence terms by absolute cycle offset.
+        SmallVector<SmallVector<const slang::ast::Expression *, 4>> termsAt;
+        termsAt.resize(seqLen + 1);
+        for (auto term : fixedSeq->terms) {
+          if (!term.expr)
+            return failure();
+          if (term.time > seqLen)
+            continue;
+          termsAt[term.time].push_back(term.expr);
+        }
+
+        Block &mergeBlock = createBlock();
+        for (uint32_t step = 0; step <= seqLen; ++step) {
+          // Sample the step's terms before waiting for the clock edge. For
+          // signals that change only on the clock edge, this yields the
+          // pre-edge values expected by SVA sampled-value semantics.
+          Value stepCondMoore = init1;
+          for (auto *expr : termsAt[step]) {
+            Value cur = context.convertRvalueExpression(*expr);
+            if (!cur)
+              return failure();
+            cur = context.convertToBool(cur, Domain::TwoValued);
+            if (!cur)
+              return failure();
+            stepCondMoore = moore::AndOp::create(builder, loc, stepCondMoore, cur);
+          }
+
+          if (failed(emitWaitForClock()))
+            return failure();
+
+          Value stepCond = moore::ToBuiltinBoolOp::create(builder, loc, stepCondMoore);
+          Block &okBlock = createBlock();
+          Block &failBlock = createBlock();
+          cf::CondBranchOp::create(builder, loc, stepCond, &okBlock, &failBlock);
+
+          builder.setInsertionPointToEnd(&failBlock);
+          if (hasFalseAction) {
+            if (failed(context.convertStatement(*stmt.ifFalse)))
+              return failure();
+          }
+          if (!isTerminated())
+            cf::BranchOp::create(builder, loc, &mergeBlock);
+
+          builder.setInsertionPointToEnd(&okBlock);
+          if (step == seqLen) {
+            if (hasTrueAction) {
+              if (failed(context.convertStatement(*stmt.ifTrue)))
+                return failure();
+            }
+            if (!isTerminated())
+              cf::BranchOp::create(builder, loc, &mergeBlock);
+            break;
+          }
+        }
+
+        if (mergeBlock.hasNoPredecessors()) {
+          mergeBlock.erase();
+          setTerminated();
+          return success();
+        }
+
+        builder.setInsertionPointToEnd(&mergeBlock);
+        return success();
+      }
+
+      if (procOp && svModule && clockCtrl && fixedSeq &&
+          fixedSeq->length <= 64 && !fixedSeq->terms.empty()) {
+        Context::ValueSymbolScope scope(context.valueSymbols);
+
+        auto seqLen = fixedSeq->length;
+
+        unsigned scopeId = context.nextAssertionCallScopeId++;
+        auto prefix = ("__svtests_ca" + Twine(scopeId)).str();
+
+        // Collect unique term expressions for history tracking.
+        SmallVector<const slang::ast::Expression *> uniqExprs;
+        for (auto term : fixedSeq->terms) {
+          if (!term.expr)
+            return failure();
+          if (llvm::find(uniqExprs, term.expr) == uniqExprs.end())
+            uniqExprs.push_back(term.expr);
+        }
+
+        auto bitTy =
+            moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+        Value init1 = moore::ConstantOp::create(builder, loc, bitTy, 1);
+
+        SmallVector<Value> validVars;
+        DenseMap<const slang::ast::Expression *, SmallVector<Value>> histVars;
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          Block &modBody = svModule.getBodyRegion().front();
+          builder.setInsertionPointToStart(&modBody);
+          Value init0 = moore::ConstantOp::create(builder, loc, bitTy, 0);
+
+          // History-valid shift register (tracks when we have `seqLen` past samples).
+          validVars.reserve(seqLen + 1);
+          for (uint32_t i = 0; i <= seqLen; ++i) {
+            auto name = builder.getStringAttr((Twine(prefix) + "_valid" + Twine(i)).str());
+            validVars.push_back(moore::VariableOp::create(
+                builder, loc, moore::RefType::get(cast<moore::UnpackedType>(bitTy)),
+                name, init0));
+          }
+
+          // Per-term history shift registers (store sampled values as booleans).
+          unsigned exprIdx = 0;
+          for (auto *expr : uniqExprs) {
+            SmallVector<Value> vars;
+            vars.reserve(seqLen + 1);
+            for (uint32_t i = 0; i <= seqLen; ++i) {
+              auto name = builder.getStringAttr(
+                  (Twine(prefix) + "_h" + Twine(exprIdx) + "_" + Twine(i)).str());
+              vars.push_back(moore::VariableOp::create(
+                  builder, loc,
+                  moore::RefType::get(cast<moore::UnpackedType>(bitTy)), name,
+                  init0));
+            }
+            histVars.insert({expr, std::move(vars)});
+            ++exprIdx;
+          }
+        }
+
+        // Sample all tracked expression values *before* the clock edge. For
+        // designs that update state using nonblocking assignments on the same
+        // edge, this avoids sampling post-update values when modeling
+        // sampled-value semantics in a procedural form.
+        DenseMap<const slang::ast::Expression *, Value> preSamples;
+        preSamples.reserve(uniqExprs.size());
+        for (auto *expr : uniqExprs) {
+          Value cur = context.convertRvalueExpression(*expr);
+          if (!cur)
+            return failure();
+          cur = context.convertToBool(cur, Domain::TwoValued);
+          if (!cur)
+            return failure();
+          preSamples.insert({expr, cur});
+        }
+
+        // Suspend until the sampling clock edge occurs.
+        auto waitOp = moore::WaitEventOp::create(builder, loc);
+        {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
+
+          auto toEdge = [](slang::ast::EdgeKind edge) -> moore::Edge {
+            using slang::ast::EdgeKind;
+            switch (edge) {
+            case EdgeKind::None:
+              return moore::Edge::AnyChange;
+            case EdgeKind::PosEdge:
+              return moore::Edge::PosEdge;
+            case EdgeKind::NegEdge:
+              return moore::Edge::NegEdge;
+            case EdgeKind::BothEdges:
+              return moore::Edge::BothEdges;
+            }
+            llvm_unreachable("all edge kinds handled");
+          };
+
+          Value clkExpr = context.convertRvalueExpression(clockCtrl->expr);
+          if (!clkExpr)
+            return failure();
+          Value iffCond;
+          if (clockCtrl->iffCondition) {
+            iffCond = context.convertRvalueExpression(*clockCtrl->iffCondition);
+            iffCond = context.convertToBool(iffCond, Domain::TwoValued);
+            if (!iffCond)
+              return failure();
+          }
+          moore::DetectEventOp::create(builder, loc, toEdge(clockCtrl->edge),
+                                       clkExpr, iffCond);
+        }
+
+        // Shift the "valid history" marker.
+        for (uint32_t i = seqLen; i > 0; --i) {
+          Value prev = moore::ReadOp::create(builder, loc, validVars[i - 1]);
+          moore::BlockingAssignOp::create(builder, loc, validVars[i], prev);
+        }
+        moore::BlockingAssignOp::create(builder, loc, validVars[0], init1);
+        Value haveHistory = moore::ReadOp::create(builder, loc, validVars[seqLen]);
+
+        // Sample and shift all tracked expression histories.
+        for (auto *expr : uniqExprs) {
+          auto it = histVars.find(expr);
+          if (it == histVars.end())
+            continue;
+          auto &vars = it->second;
+          Value cur = preSamples.lookup(expr);
+          if (!cur)
+            return failure();
+
+          for (uint32_t i = seqLen; i > 0; --i) {
+            Value prev = moore::ReadOp::create(builder, loc, vars[i - 1]);
+            moore::BlockingAssignOp::create(builder, loc, vars[i], prev);
+          }
+          moore::BlockingAssignOp::create(builder, loc, vars[0], cur);
+        }
+
+        // Compute match condition at the end of the fixed-length sequence.
+        Value matchCond = init1;
+        for (auto term : fixedSeq->terms) {
+          auto it = histVars.find(term.expr);
+          if (it == histVars.end())
+            continue;
+          uint32_t offset = seqLen >= term.time ? (seqLen - term.time) : 0;
+          Value v = moore::ReadOp::create(builder, loc, it->second[offset]);
+          matchCond = moore::AndOp::create(builder, loc, matchCond, v);
+        }
+
+        // If we have insufficient history, treat the assertion as satisfied to
+        // avoid spurious failures at time 0.
+        Value notHaveHistory = moore::NotOp::create(builder, loc, haveHistory);
+        Value condMoore = moore::OrOp::create(builder, loc, notHaveHistory, matchCond);
+        Value cond = moore::ToBuiltinBoolOp::create(builder, loc, condMoore);
+
+        Block &mergeBlock = createBlock();
+        Block *falseBlock = hasFalseAction ? &createBlock() : nullptr;
+        Block &trueBlock = createBlock();
+        cf::CondBranchOp::create(builder, loc, cond, &trueBlock,
+                                 falseBlock ? falseBlock : &mergeBlock);
+
+        builder.setInsertionPointToEnd(&trueBlock);
+        if (hasTrueAction) {
+          if (failed(context.convertStatement(*stmt.ifTrue)))
+            return failure();
+        }
+        if (!isTerminated())
+          cf::BranchOp::create(builder, loc, &mergeBlock);
+
+        if (falseBlock) {
+          builder.setInsertionPointToEnd(falseBlock);
+          if (failed(context.convertStatement(*stmt.ifFalse)))
+            return failure();
+          if (!isTerminated())
+            cf::BranchOp::create(builder, loc, &mergeBlock);
+        }
+
+        if (mergeBlock.hasNoPredecessors()) {
+          mergeBlock.erase();
+          setTerminated();
+          return success();
+        }
+
+        builder.setInsertionPointToEnd(&mergeBlock);
+        moore::ReturnOp::create(builder, loc);
+        setTerminated();
+        return success();
+      }
     }
 
+    // Fallback: preserve the declarative assertion for verification flows.
+    auto property = context.convertAssertionExpression(*propertySpec, loc);
     if (!property)
       return failure();
 
-    // Ignore action blocks for now. Many sv-tests include `else` blocks that
-    // call `$error` / `uvm_error`, but the verification semantics are captured
-    // by the property itself.
-    //
-    // TODO: Lower action blocks to proper simulation side effects.
     switch (stmt.assertionKind) {
     case slang::ast::AssertionKind::Assert:
     case slang::ast::AssertionKind::Expect:

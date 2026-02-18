@@ -8,6 +8,7 @@
 
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
+#include "slang/ast/SystemSubroutine.h"
 #include "slang/ast/symbols/ClassSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
@@ -1030,12 +1031,197 @@ struct ModuleVisitor : public BaseVisitor {
       return context.convertStatement(body);
     auto procOp = moore::ProcedureOp::create(builder, loc, kind);
     OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(&procOp.getBody().emplaceBlock());
+    auto &entryBlock = procOp.getBody().emplaceBlock();
+    builder.setInsertionPointToEnd(&entryBlock);
     Context::ValueSymbolScope scope(context.valueSymbols);
+
+    // Some SV frontends lower module-scope concurrent assertions into
+    // clocked procedural blocks. Provide best-effort support for sampled-value
+    // assertion system calls (`$past`, `$rose`, ...) when they appear in such
+    // procedural contexts by synthesizing per-procedure state.
+    DenseMap<const slang::ast::Expression *, Value> prevVars;
+    DenseMap<const slang::ast::Expression *, Value> curValues;
+    unsigned nextPrevId = 0;
+    Value havePastVar;
+    unsigned scopeId = context.nextAssertionCallScopeId++;
+    auto prefix = ("__svtests_pa" + Twine(scopeId)).str();
+
+    auto toMatchingIntType = [&](Value value,
+                                 moore::IntType targetType) -> Value {
+      if (!value)
+        return {};
+      auto srcType = dyn_cast<moore::IntType>(value.getType());
+      if (!srcType)
+        return {};
+
+      Value casted = value;
+      if (srcType.getDomain() != targetType.getDomain()) {
+        if (srcType.getDomain() == Domain::TwoValued &&
+            targetType.getDomain() == Domain::FourValued) {
+          casted = moore::IntToLogicOp::create(builder, value.getLoc(), casted);
+        } else if (srcType.getDomain() == Domain::FourValued &&
+                   targetType.getDomain() == Domain::TwoValued) {
+          casted =
+              moore::LogicToIntOp::create(builder, value.getLoc(), casted);
+        } else {
+          return {};
+        }
+      }
+
+      // Replicate a 1-bit guard to match the target width, if needed.
+      auto srcBits = srcType.getBitSize();
+      auto dstBits = targetType.getBitSize();
+      if (!srcBits || !dstBits)
+        return {};
+      if (*srcBits != *dstBits) {
+        if (*srcBits != 1)
+          return {};
+        casted = moore::ReplicateOp::create(builder, value.getLoc(), targetType,
+                                            casted);
+      }
+      return casted;
+    };
+
+    auto ensureHavePastVar = [&](Location declLoc) -> Value {
+      if (havePastVar)
+        return havePastVar;
+
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(&entryBlock);
+      auto havePastTy =
+          moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+      Value init0 = moore::ConstantOp::create(builder, declLoc, havePastTy, 0);
+      havePastVar = moore::VariableOp::create(
+          builder, declLoc,
+          moore::RefType::get(cast<moore::UnpackedType>(havePastTy)),
+          builder.getStringAttr(prefix + "_has_past"), init0);
+      return havePastVar;
+    };
+
+    auto getOrCreatePrevVar =
+        [&](const slang::ast::Expression *argExpr, moore::IntType intTy,
+            Location declLoc) -> Value {
+      if (!argExpr)
+        return {};
+      if (Value existing = prevVars.lookup(argExpr))
+        return existing;
+
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(&entryBlock);
+      Value init0 = moore::ConstantOp::create(builder, declLoc, intTy, 0);
+      auto name = builder.getStringAttr(
+          (Twine(prefix) + "_prev" + Twine(nextPrevId++)).str());
+      Value var = moore::VariableOp::create(
+          builder, declLoc,
+          moore::RefType::get(cast<moore::UnpackedType>(intTy)), name, init0);
+      prevVars.insert({argExpr, var});
+      return var;
+    };
+
+    auto savedOverride = context.assertionCallOverride;
+    context.assertionCallOverride =
+        [&](const slang::ast::CallExpression &expr,
+            const slang::ast::CallExpression::SystemCallInfo &info,
+            Location callLoc) -> Value {
+      const auto &subroutine = *info.subroutine;
+      auto args = expr.arguments();
+      if (args.size() != 1 || !args[0])
+        return {};
+
+      Value argVal = context.convertRvalueExpression(*args[0]);
+      if (!argVal)
+        return {};
+      auto intTy = dyn_cast<moore::IntType>(argVal.getType());
+      if (!intTy)
+        return {};
+
+      const slang::ast::Expression *argExpr = args[0];
+      Value prevVar = getOrCreatePrevVar(argExpr, intTy, callLoc);
+      if (!prevVar)
+        return {};
+      if (!curValues.count(argExpr))
+        curValues.insert({argExpr, argVal});
+
+      Value havePastRef = ensureHavePastVar(callLoc);
+      if (!havePastRef)
+        return {};
+      Value havePast = moore::ReadOp::create(builder, callLoc, havePastRef);
+      Value prevVal = moore::ReadOp::create(builder, callLoc, prevVar);
+
+      auto guardAnd = [&](Value guard, Value value) -> Value {
+        auto valueTy = dyn_cast<moore::IntType>(value.getType());
+        auto guardTy = dyn_cast<moore::IntType>(guard.getType());
+        if (!valueTy || !guardTy)
+          return Value{};
+        Value guardCast = toMatchingIntType(guard, valueTy);
+        if (!guardCast)
+          return {};
+        return moore::AndOp::create(builder, callLoc, guardCast, value);
+      };
+
+      if (subroutine.name == "$past") {
+        // Best-effort: `$past(x)` is `x[-1]` if a past sample exists, else 0.
+        return guardAnd(havePast, prevVal);
+      }
+
+      if (subroutine.name == "$stable") {
+        Value eq = moore::EqOp::create(builder, callLoc, argVal, prevVal);
+        auto eqTy = cast<moore::IntType>(eq.getType());
+        Value havePastBit = toMatchingIntType(havePast, eqTy);
+        if (!havePastBit)
+          return {};
+        return moore::AndOp::create(builder, callLoc, havePastBit, eq);
+      }
+
+      if (subroutine.name == "$changed") {
+        Value eq = moore::EqOp::create(builder, callLoc, argVal, prevVal);
+        auto eqTy = cast<moore::IntType>(eq.getType());
+        Value havePastBit = toMatchingIntType(havePast, eqTy);
+        if (!havePastBit)
+          return {};
+        Value stable = moore::AndOp::create(builder, callLoc, havePastBit, eq);
+        return moore::NotOp::create(builder, callLoc, stable);
+      }
+
+      // $rose/$fell are defined on single-bit arguments.
+      auto width = intTy.getBitSize();
+      if (!width || *width != 1)
+        return {};
+
+      if (subroutine.name == "$rose") {
+        Value notPrev = moore::NotOp::create(builder, callLoc, prevVal);
+        Value core = moore::AndOp::create(builder, callLoc, notPrev, argVal);
+        return guardAnd(havePast, core);
+      }
+
+      if (subroutine.name == "$fell") {
+        Value notCur = moore::NotOp::create(builder, callLoc, argVal);
+        Value core = moore::AndOp::create(builder, callLoc, prevVal, notCur);
+        return guardAnd(havePast, core);
+      }
+
+      return {};
+    };
+    auto restoreOverride = llvm::make_scope_exit(
+        [&] { context.assertionCallOverride = savedOverride; });
+
     if (failed(context.convertStatement(body)))
       return failure();
-    if (builder.getBlock())
+    if (builder.getBlock()) {
+      if (havePastVar) {
+        for (auto [expr, cur] : curValues) {
+          Value prevVar = prevVars.lookup(expr);
+          if (!prevVar)
+            continue;
+          moore::BlockingAssignOp::create(builder, loc, prevVar, cur);
+        }
+        auto havePastTy =
+            moore::IntType::get(context.getContext(), 1, Domain::TwoValued);
+        Value one = moore::ConstantOp::create(builder, loc, havePastTy, 1);
+        moore::BlockingAssignOp::create(builder, loc, havePastVar, one);
+      }
       moore::ReturnOp::create(builder, loc);
+    }
     return success();
   }
 
@@ -1242,6 +1428,195 @@ LogicalResult Context::finalizeUvmShims() {
   if (!intoModuleOp.lookupSymbol<mlir::func::FuncOp>("circt_uvm_run_all_phases"))
     return success();
 
+  auto isUvmPkgScope = [](const slang::ast::Scope *scope) -> bool {
+    if (!scope)
+      return false;
+    const auto &sym = scope->asSymbol();
+    return sym.kind == slang::ast::SymbolKind::Package && sym.name == "uvm_pkg";
+  };
+
+  auto isUvmLibraryMethod =
+      [&](const slang::ast::SubroutineSymbol &method) -> bool {
+    const auto *ownerScope = method.getParentScope();
+    if (!ownerScope)
+      return false;
+    const auto &ownerSym = ownerScope->asSymbol();
+    if (ownerSym.kind != slang::ast::SymbolKind::ClassType)
+      return false;
+
+    auto isUvmName = [&](llvm::StringRef name) -> bool {
+      return name.starts_with("uvm_");
+    };
+
+    bool ownerIsUvm = isUvmName(
+        llvm::StringRef(ownerSym.name.data(), ownerSym.name.size()));
+    if (!ownerIsUvm)
+      if (auto *ownerCls = ownerSym.as_if<slang::ast::ClassType>())
+        if (ownerCls->genericClass)
+          ownerIsUvm = isUvmName(llvm::StringRef(
+              ownerCls->genericClass->name.data(),
+              ownerCls->genericClass->name.size()));
+    if (!ownerIsUvm)
+      return false;
+
+    if (isUvmPkgScope(ownerSym.getParentScope()))
+      return true;
+    if (auto *ownerCls = ownerSym.as_if<slang::ast::ClassType>())
+      if (ownerCls->genericClass &&
+          isUvmPkgScope(ownerCls->genericClass->getParentScope()))
+        return true;
+
+    // Name-based fallback: treat `uvm_*` methods as UVM even if the package
+    // scope isn't directly visible (e.g. generated specializations).
+    return true;
+  };
+
+  auto isUvmDriverClass = [&](const slang::ast::ClassType &cls) -> bool {
+    if (cls.name == "uvm_driver")
+      return true;
+    if (cls.genericClass && cls.genericClass->name == "uvm_driver")
+      return true;
+    return false;
+  };
+
+  auto findUvmDriverBase =
+      [&](const slang::ast::ClassType &cls) -> const slang::ast::ClassType * {
+    const slang::ast::Type *base = cls.getBaseClass();
+    while (base) {
+      const auto *baseCls =
+          base->getCanonicalType().as_if<slang::ast::ClassType>();
+      if (!baseCls)
+        break;
+      if (isUvmDriverClass(*baseCls)) {
+        // Prefer confirming the origin via the uvm_pkg scope, but accept
+        // name-based matches as a fallback (the stub UVM library can
+        // materialize generic-class specializations in non-package scopes).
+        if (isUvmPkgScope(baseCls->getParentScope()))
+          return baseCls;
+        if (baseCls->genericClass &&
+            isUvmPkgScope(baseCls->genericClass->getParentScope()))
+          return baseCls;
+        return baseCls;
+      }
+      base = baseCls->getBaseClass();
+    }
+    return nullptr;
+  };
+
+  auto ensureUvmDriverEndOfElabShim =
+      [&](const slang::ast::ClassType &uvmDriverCls, FunctionType fnTy,
+          Location loc) -> mlir::func::FuncOp {
+    StringRef shimName = "__circt_uvm_shim_uvm_driver_end_of_elaboration_phase";
+    if (auto existing =
+            intoModuleOp.lookupSymbol<mlir::func::FuncOp>(shimName))
+      return existing;
+
+    auto i32Ty = moore::IntType::get(getContext(), /*width=*/32,
+                                     moore::Domain::TwoValued);
+
+    const slang::ast::ClassPropertySymbol *seqItemPortProp = nullptr;
+    for (auto &prop :
+         uvmDriverCls.membersOfType<slang::ast::ClassPropertySymbol>()) {
+      if (prop.name == "seq_item_port") {
+        seqItemPortProp = &prop;
+        break;
+      }
+    }
+    if (!seqItemPortProp)
+      return mlir::func::FuncOp();
+
+    int32_t fieldId = getOrAssignClassFieldId(*seqItemPortProp);
+
+    auto getOrCreateExternFunc = [&](StringRef name, FunctionType type) {
+      if (auto existing = intoModuleOp.lookupSymbol<mlir::func::FuncOp>(name)) {
+        if (existing.getFunctionType() != type) {
+          mlir::emitError(loc, "conflicting declarations for `")
+              << name << "`";
+          return mlir::func::FuncOp();
+        }
+        return existing;
+      }
+
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(intoModuleOp.getBody());
+      getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+      auto fn = mlir::func::FuncOp::create(builder, loc, name, type);
+      fn.setPrivate();
+      symbolTable.insert(fn);
+      return fn;
+    };
+
+    OpBuilder::InsertionGuard g(builder);
+    builder.setInsertionPointToStart(intoModuleOp.getBody());
+    getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+    auto shimFn = mlir::func::FuncOp::create(builder, loc, shimName, fnTy);
+    shimFn.setPrivate();
+    symbolTable.insert(shimFn);
+
+    auto &entry = shimFn.getBody().emplaceBlock();
+    for (auto ty : fnTy.getInputs())
+      entry.addArgument(ty, loc);
+
+    OpBuilder b(getContext());
+    b.setInsertionPointToStart(&entry);
+    Value selfArg = entry.getArgument(0);
+
+    Value fieldIdVal = moore::ConstantOp::create(b, loc, i32Ty, fieldId,
+                                                 /*isSigned=*/true);
+
+    auto getFnTy = FunctionType::get(getContext(), {i32Ty, i32Ty}, {i32Ty});
+    auto getFn = getOrCreateExternFunc("circt_sv_class_get_i32", getFnTy);
+    if (!getFn)
+      return mlir::func::FuncOp();
+    Value portHandle = mlir::func::CallOp::create(
+                           b, loc, getFn, ValueRange{selfArg, fieldIdVal})
+                           .getResult(0);
+
+    auto countFnTy = FunctionType::get(getContext(), {i32Ty}, {i32Ty});
+    auto countFn = getOrCreateExternFunc("circt_uvm_port_conn_count", countFnTy);
+    if (!countFn)
+      return mlir::func::FuncOp();
+    Value count = mlir::func::CallOp::create(b, loc, countFn,
+                                             ValueRange{portHandle})
+                      .getResult(0);
+
+    Value one =
+        moore::ConstantOp::create(b, loc, i32Ty, /*value=*/1, /*isSigned=*/true);
+    Value lt = moore::UltOp::create(b, loc, count, one);
+    Value cond = moore::ToBuiltinBoolOp::create(b, loc, lt);
+
+    Block &warnBlock = shimFn.getBody().emplaceBlock();
+    Block &doneBlock = shimFn.getBody().emplaceBlock();
+    mlir::cf::CondBranchOp::create(b, loc, cond, &warnBlock, ValueRange{},
+                                   &doneBlock, ValueRange{});
+
+    auto makeString = [&](StringRef value) -> Value {
+      auto fmt =
+          moore::FormatLiteralOp::create(b, loc, b.getStringAttr(value));
+      return moore::FormatStringToStringOp::create(b, loc, fmt);
+    };
+
+    b.setInsertionPointToStart(&warnBlock);
+    Value id = makeString("DRVCONNECT");
+    Value message = makeString(
+        "the driver is not connected to a sequencer via the standard "
+        "mechanisms enabled by connect()");
+    Value sevVal = moore::ConstantOp::create(b, loc, i32Ty, /*value=*/1,
+                                             /*isSigned=*/true);
+    auto reportFnTy = FunctionType::get(
+        getContext(), {i32Ty, i32Ty, id.getType(), message.getType()}, {});
+    auto reportFn = getOrCreateExternFunc("circt_uvm_report", reportFnTy);
+    if (!reportFn)
+      return mlir::func::FuncOp();
+    mlir::func::CallOp::create(b, loc, reportFn,
+                               ValueRange{selfArg, sevVal, id, message});
+    mlir::cf::BranchOp::create(b, loc, &doneBlock, ValueRange{});
+
+    b.setInsertionPointToStart(&doneBlock);
+    mlir::func::ReturnOp::create(b, loc);
+    return shimFn;
+  };
+
 	  auto rebuildPhaseDispatch = [&](StringRef methodName,
 	                                  StringRef fnName) -> LogicalResult {
 	    Location loc = UnknownLoc::get(getContext());
@@ -1279,15 +1654,34 @@ LogicalResult Context::finalizeUvmShims() {
 	      if (clsName.starts_with("uvm_"))
         continue;
       const slang::ast::SubroutineSymbol *impl = nullptr;
+      const slang::ast::SubroutineSymbol *inheritedImpl = nullptr;
       for (auto &method : cls->membersOfType<slang::ast::SubroutineSymbol>()) {
-        if (llvm::StringRef(method.name.data(), method.name.size()) ==
-            methodName) {
+        if (llvm::StringRef(method.name.data(), method.name.size()) !=
+            methodName)
+          continue;
+        if (isUvmLibraryMethod(method))
+          continue;
+
+        const auto *ownerScope = method.getParentScope();
+        if (ownerScope && &ownerScope->asSymbol() == cls) {
           impl = &method;
           break;
         }
+        if (!inheritedImpl)
+          inheritedImpl = &method;
       }
       if (!impl)
+        impl = inheritedImpl;
+      if (!impl) {
+        if (methodName == "end_of_elaboration_phase") {
+          if (const auto *uvmDriverBase = findUvmDriverBase(*cls)) {
+            if (auto shimFn =
+                    ensureUvmDriverEndOfElabShim(*uvmDriverBase, fnTy, loc))
+              impls.push_back({classId, shimFn});
+          }
+        }
         continue;
+      }
       if (failed(convertFunction(*impl)))
         continue;
       auto *implLowering = declareFunction(*impl);
@@ -1381,8 +1775,25 @@ LogicalResult Context::finalizeUvmShims() {
   if (failed(rebuildPhaseDispatch("connect_phase",
                                   "__circt_uvm_dispatch_connect_phase")))
     return failure();
+  if (failed(rebuildPhaseDispatch(
+          "end_of_elaboration_phase",
+          "__circt_uvm_dispatch_end_of_elaboration_phase")))
+    return failure();
+  if (failed(rebuildPhaseDispatch(
+          "start_of_simulation_phase",
+          "__circt_uvm_dispatch_start_of_simulation_phase")))
+    return failure();
   if (failed(
           rebuildPhaseDispatch("run_phase", "__circt_uvm_dispatch_run_phase")))
+    return failure();
+  if (failed(rebuildPhaseDispatch("extract_phase",
+                                  "__circt_uvm_dispatch_extract_phase")))
+    return failure();
+  if (failed(rebuildPhaseDispatch("check_phase",
+                                  "__circt_uvm_dispatch_check_phase")))
+    return failure();
+  if (failed(rebuildPhaseDispatch("report_phase",
+                                  "__circt_uvm_dispatch_report_phase")))
     return failure();
 
   // Rebuild the minimal analysis-port dispatch shim used by the UVM bring-up

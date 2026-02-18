@@ -447,14 +447,8 @@ static FailureOr<uint64_t> tryExtractDelayFs(Value delay) {
 }
 
 static bool needsCycleScheduler(llhd::ProcessOp op) {
-  // The current scheduler lowering does not model LLHD process results (wait/halt
-  // yields). Pre-lowering may rewrite some resultful processes into direct
-  // signal drives, at which point they become eligible for cycle scheduling.
-  if (!op.getResults().empty())
-    return false;
-  // Also schedule one-shot processes that end in `llhd.halt` so we can model the
-  // "run once then stop" semantics via the runtime PC state.
-  bool hasHalt = !op.getOps<llhd::HaltOp>().empty();
+  // Track whether the process can suspend. For the existing cycle scheduler
+  // lowering, `llhd.wait` is the only supported suspension point.
   bool hasWait = false;
   bool hasDelay = false;
   bool hasObserved = false;
@@ -465,6 +459,32 @@ static bool needsCycleScheduler(llhd::ProcessOp op) {
     if (!wait.getObserved().empty())
       hasObserved = true;
   });
+
+  // Determine whether the process can terminate. One-shot `llhd.process` ops
+  // (e.g. `initial` blocks) end in `llhd.halt`.
+  bool hasHalt = !op.getOps<llhd::HaltOp>().empty();
+
+  // The scheduler lowering historically avoided LLHD process results (yield
+  // operands on waits/halts). However, some SV frontends lower single-shot
+  // initializations to a resultful process with no waits. Running those as
+  // pure combinational `arc.execute` code replays side effects on every
+  // evaluation (e.g. repeated UVM reports in class-only tests).
+  //
+  // Allow *one-shot* resultful processes (no waits) to be scheduled; their halt
+  // yields can be cached into the scheduler frame once and replayed via the
+  // runtime PC state.
+  if (!op.getResults().empty()) {
+    if (hasWait || hasDelay || hasObserved)
+      return false;
+    if (!hasHalt)
+      return false;
+    // Conservative: require all halts to yield the full result tuple.
+    for (auto halt : op.getOps<llhd::HaltOp>())
+      if (halt.getYieldOperands().size() != op.getNumResults())
+        return false;
+    return true;
+  }
+
   return hasHalt || hasWait || hasDelay || hasObserved;
 }
 
@@ -485,6 +505,7 @@ static bool isRematerializableCallForPolling(mlir::func::CallOp call) {
          callee == "circt_sv_queue_size_i32" ||
          callee == "circt_sv_mailbox_num_i32" ||
          callee == "circt_sv_assoc_exists_str_i32" ||
+         callee == "circt_sv_assoc_num_str_i32" ||
          callee == "circt_sv_assoc_get_str_i32" ||
          callee == "__arcilator_sig_load_u64" ||
          callee == "__arcilator_frame_load_u64" ||
@@ -687,7 +708,7 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   // Create a common exit block that returns from the execute region.
   Block *exitBlock = rewriter.createBlock(&region);
   rewriter.setInsertionPointToEnd(exitBlock);
-  arc::OutputOp::create(rewriter, loc, ValueRange{});
+  auto exitOutput = arc::OutputOp::create(rewriter, loc, ValueRange{});
 
   // Helpers to pack/unpack values stored in the cycle-scheduler frame.
   auto canFrameType = [&](Type ty) -> bool {
@@ -967,6 +988,15 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   }
   uint32_t spillSlotBase = nextPhiSlot;
 
+  // If this is a one-shot process with yield values on `llhd.halt`, cache the
+  // yield operands into the scheduler frame so the `arc.execute` results remain
+  // stable after the process has completed. Only supported for processes
+  // without waits (no suspension points).
+  const bool hasYieldResults = execOp.getNumResults() != 0;
+  uint32_t resultSlotBase = spillSlotBase;
+  if (hasYieldResults)
+    spillSlotBase += execOp.getNumResults();
+
   // If there are no waits, avoid the full PC-based state dispatch and hoisting.
   // We only need to model "run once then stop" semantics for one-shot processes
   // ending in `llhd.halt`.
@@ -977,15 +1007,95 @@ static LogicalResult lowerCycleScheduler(ExecuteOp execOp, uint32_t procId,
   SmallVector<llhd::HaltOp> halts;
   execOp.walk([&](llhd::HaltOp h) { halts.push_back(h); });
   for (auto haltOp : halts) {
-    if (!haltOp.getYieldOperands().empty())
-      return haltOp.emitOpError() << "scheduled halt with yield operands unsupported";
     rewriter.setInsertionPoint(haltOp);
+    if (hasYieldResults) {
+      if (!waits.empty())
+        return haltOp.emitOpError()
+               << "scheduled halt with yield operands unsupported in resumable processes";
+      auto yieldOps = haltOp.getYieldOperands();
+      if (yieldOps.size() != execOp.getNumResults())
+        return haltOp.emitOpError()
+               << "scheduled halt yield arity mismatch (expected "
+               << execOp.getNumResults() << ", got " << yieldOps.size() << ")";
+      for (auto [idx, yielded] : llvm::enumerate(yieldOps)) {
+        uint32_t slot = resultSlotBase + static_cast<uint32_t>(idx);
+        Value slotVal = buildI32Constant(rewriter, haltOp.getLoc(), slot);
+        Type ty = yielded.getType();
+        Type baseTy = ty;
+        while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+          baseTy = alias.getInnerType();
+        if (isa<hw::StringType>(baseTy)) {
+          if (failed(ensureFrameStringFuncs(ty)))
+            return failure();
+          rewriter.create<mlir::func::CallOp>(haltOp.getLoc(),
+                                              "__arcilator_frame_store_str",
+                                              TypeRange{},
+                                              ValueRange{procIdVal, slotVal,
+                                                         yielded});
+        } else {
+          auto packed = packToI64(yielded);
+          if (failed(packed))
+            return haltOp.emitOpError()
+                   << "cannot store halt yield of type " << ty
+                   << " into scheduler frame";
+          rewriter.create<mlir::func::CallOp>(
+              haltOp.getLoc(), "__arcilator_frame_store_u64", TypeRange{},
+              ValueRange{procIdVal, slotVal, *packed});
+        }
+      }
+    }
     // Use an out-of-range state id to make the dispatch default to exit.
     Value doneStateVal = buildI32Constant(rewriter, haltOp.getLoc(), 0xFFFFFFFFu);
     rewriter.create<mlir::func::CallOp>(haltOp.getLoc(), "__arcilator_set_pc",
                                         TypeRange{},
                                         ValueRange{procIdVal, doneStateVal});
     rewriter.replaceOpWithNewOp<mlir::cf::BranchOp>(haltOp, exitBlock);
+  }
+
+  // Materialize stable exit values for one-shot resultful processes by reading
+  // the cached yields back from the frame.
+  if (hasYieldResults) {
+    if (!waits.empty())
+      return execOp.emitOpError()
+             << "scheduled yields are only supported for no-wait processes";
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(exitOutput);
+    SmallVector<Value> results;
+    results.reserve(execOp.getNumResults());
+    for (auto [idx, resultTy] : llvm::enumerate(execOp.getResultTypes())) {
+      uint32_t slot = resultSlotBase + static_cast<uint32_t>(idx);
+      Value slotVal = buildI32Constant(rewriter, loc, slot);
+      Type baseTy = resultTy;
+      while (auto alias = dyn_cast<hw::TypeAliasType>(baseTy))
+        baseTy = alias.getInnerType();
+      if (isa<hw::StringType>(baseTy)) {
+        if (failed(ensureFrameStringFuncs(resultTy)))
+          return failure();
+        Value loaded =
+            rewriter
+                .create<mlir::func::CallOp>(loc, "__arcilator_frame_load_str",
+                                            resultTy,
+                                            ValueRange{procIdVal, slotVal})
+                .getResult(0);
+        results.push_back(loaded);
+      } else {
+        Value packed =
+            rewriter
+                .create<mlir::func::CallOp>(loc, "__arcilator_frame_load_u64",
+                                            rewriter.getI64Type(),
+                                            ValueRange{procIdVal, slotVal})
+                .getResult(0);
+        auto unpacked = unpackFromI64(packed, resultTy, loc);
+        if (failed(unpacked))
+          return execOp.emitOpError()
+                 << "cannot reload halt yield of type " << resultTy
+                 << " from scheduler frame";
+        results.push_back(*unpacked);
+      }
+    }
+    exitOutput.erase();
+    rewriter.setInsertionPointToEnd(exitBlock);
+    arc::OutputOp::create(rewriter, loc, results);
   }
 
   if (waits.empty()) {
