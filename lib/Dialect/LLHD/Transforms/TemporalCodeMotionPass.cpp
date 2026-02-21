@@ -1391,25 +1391,13 @@ LogicalResult TemporalCodeMotionPass::runOnProcess(llhd::ProcessOp procOp) {
         continue;
       }
 
-      OpBuilder builder(op);
-      if (op.getEnable()) {
-        // Multiplex value to be driven
-        auto firstDrive = sigToDrv[sigTimePair];
-        Value muxValue =
-            comb::MuxOp::create(builder, op.getLoc(), op.getEnable(),
-                                op.getValue(), firstDrive.getValue());
-        op.getValueMutable().assign(muxValue);
-
-        // Take the disjunction of the enable conditions
-        if (firstDrive.getEnable()) {
-          Value orVal = comb::OrOp::create(builder, op.getLoc(), op.getEnable(),
-                                           firstDrive.getEnable());
-          op.getEnableMutable().assign(orVal);
-        } else {
-          // No enable is equivalent to a constant 'true' enable
-          op.getEnableMutable().clear();
-        }
-      }
+      // Some frontends can emit multiple drives to the same signal and time,
+      // optionally guarded by enable conditions. In principle, these can be
+      // coalesced by muxing the values and OR'ing the enables.
+      //
+      // However, the mux-based coalescing has been observed to crash on some
+      // real-world designs. Defer drive coalescing to later LLHD passes (e.g.
+      // `combine-drives`) which operate on a more canonical form.
 
       sigToDrv[sigTimePair]->erase();
       sigToDrv[sigTimePair] = op;

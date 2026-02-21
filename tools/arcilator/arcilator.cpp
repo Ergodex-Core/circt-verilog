@@ -884,6 +884,12 @@ static llvm::cl::opt<bool> verifyPasses(
     llvm::cl::desc("Run the verifier after each transformation pass"),
     llvm::cl::init(true), llvm::cl::cat(mainCategory));
 
+static llvm::cl::opt<bool> disableTemporalCodeMotion(
+    "disable-temporal-code-motion",
+    llvm::cl::desc("Disable the LLHD temporal code motion pass (work around "
+                   "known crashes in some designs)"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<bool> verifyDiagnostics(
     "verify-diagnostics",
     llvm::cl::desc("Check that emitted diagnostics match "
@@ -997,7 +1003,8 @@ static void populateHwModuleToArcPipeline(PassManager &pm, bool inputHasMoore) {
     // show up in a process. CSE helps collapse duplicate `llhd.constant_time`
     // ops so the temporal region analysis can succeed on typical always blocks.
     pm.nest<hw::HWModuleOp>().addPass(createCSEPass());
-    pm.nest<hw::HWModuleOp>().addPass(llhd::createTemporalCodeMotion());
+    if (!disableTemporalCodeMotion)
+      pm.nest<hw::HWModuleOp>().addPass(llhd::createTemporalCodeMotion());
     // Promote stack-like memory (`llhd.var` / `llhd.load` / `llhd.store`) to SSA
     // values early so later LLHD and Arc conversions don't have to reason about
     // pointer-typed state.
