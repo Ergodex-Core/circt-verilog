@@ -2490,8 +2490,69 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
       valueSymbols.insert(hierPath.valueSym,
                           lowering.op.getBody()->getArgument(*hierPath.idx));
 
+  bool allowUseBeforeDeclare = options.allowUseBeforeDeclare.value_or(false);
+  SmallVector<std::pair<const slang::ast::VariableSymbol *,
+                        const slang::ast::Expression *>>
+      pendingVarInits;
+  SmallVector<
+      std::pair<const slang::ast::NetSymbol *, const slang::ast::Expression *>>
+      pendingNetDeclAssigns;
+
+  // Slang can parse / type-check some designs that reference module members
+  // before their declaration (`--allow-use-before-declare`), but we still need
+  // to ensure we have created the corresponding Moore variables/nets before we
+  // lower any expressions that refer to them.
+  //
+  // To support this, eagerly declare all module-scope variables and nets up
+  // front, and delay lowering their initializers / declaration assignments
+  // until after the rest of the module body has been converted.
+  if (allowUseBeforeDeclare) {
+    for (auto &member : module->members()) {
+      if (const auto *varNode = member.as_if<slang::ast::VariableSymbol>()) {
+        auto loweredType = convertType(*varNode->getDeclaredType());
+        if (!loweredType)
+          return failure();
+        auto varOp = moore::VariableOp::create(
+            builder, convertLocation(member.location),
+            moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
+            builder.getStringAttr(varNode->name), Value{});
+        valueSymbols.insert(varNode, varOp);
+        if (const auto *init = varNode->getInitializer())
+          pendingVarInits.emplace_back(varNode, init);
+        continue;
+      }
+
+      if (const auto *netNode = member.as_if<slang::ast::NetSymbol>()) {
+        auto loweredType = convertType(*netNode->getDeclaredType());
+        if (!loweredType)
+          return failure();
+
+        auto netkind = convertNetKind(netNode->netType.netKind);
+        if (netkind == moore::NetKind::Interconnect ||
+            netkind == moore::NetKind::UserDefined ||
+            netkind == moore::NetKind::Unknown)
+          return mlir::emitError(convertLocation(member.location),
+                                 "unsupported net kind `")
+                 << netNode->netType.name << "`";
+
+        auto netOp = moore::NetOp::create(
+            builder, convertLocation(member.location),
+            moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
+            builder.getStringAttr(netNode->name), netkind, Value{});
+        valueSymbols.insert(netNode, netOp);
+        if (const auto *init = netNode->getInitializer())
+          pendingNetDeclAssigns.emplace_back(netNode, init);
+        continue;
+      }
+    }
+  }
+
   // Convert the body of the module.
   for (auto &member : module->members()) {
+    if (allowUseBeforeDeclare &&
+        (member.kind == slang::ast::SymbolKind::Variable ||
+         member.kind == slang::ast::SymbolKind::Net))
+      continue;
     auto loc = convertLocation(member.location);
     if (failed(member.visit(ModuleVisitor(*this, loc)))) {
       auto diag = mlir::emitError(loc) << "failed to convert module `"
@@ -2500,6 +2561,45 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
         diag << " `" << member.name << "`";
       diag << " (" << slang::ast::toString(member.kind) << ")";
       return failure();
+    }
+  }
+
+  // Lower declaration assignments (e.g. `wire x = y;`) and variable initializers
+  // after the full module body has been converted so that any referenced values
+  // have been declared and are present in the `valueSymbols` table.
+  if (allowUseBeforeDeclare) {
+    for (const auto &[netSym, init] : pendingNetDeclAssigns) {
+      auto loc = convertLocation(init->sourceRange);
+      Value lvalue = valueSymbols.lookup(netSym);
+      if (!lvalue)
+        return mlir::emitError(loc, "unknown name `") << netSym->name << "`";
+      auto dstType = cast<moore::RefType>(lvalue.getType()).getNestedType();
+      Value rvalue = convertRvalueExpression(*init, dstType);
+      if (!rvalue)
+        return failure();
+      moore::ContinuousAssignOp::create(builder, loc, lvalue, rvalue);
+    }
+
+    if (!pendingVarInits.empty()) {
+      auto procLoc = convertLocation(pendingVarInits.front().second->sourceRange);
+      auto procOp = moore::ProcedureOp::create(builder, procLoc,
+                                               moore::ProcedureKind::Initial);
+      OpBuilder::InsertionGuard guard(builder);
+      auto &entryBlock = procOp.getBody().emplaceBlock();
+      builder.setInsertionPointToEnd(&entryBlock);
+      ValueSymbolScope initScope(valueSymbols);
+      for (const auto &[varSym, init] : pendingVarInits) {
+        auto loc = convertLocation(init->sourceRange);
+        Value lvalue = valueSymbols.lookup(varSym);
+        if (!lvalue)
+          return mlir::emitError(loc, "unknown name `") << varSym->name << "`";
+        auto dstType = cast<moore::RefType>(lvalue.getType()).getNestedType();
+        Value rvalue = convertRvalueExpression(*init, dstType);
+        if (!rvalue)
+          return failure();
+        moore::BlockingAssignOp::create(builder, loc, lvalue, rvalue);
+      }
+      moore::ReturnOp::create(builder, procLoc);
     }
   }
 
