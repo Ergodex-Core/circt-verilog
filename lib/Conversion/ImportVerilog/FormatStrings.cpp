@@ -104,9 +104,19 @@ struct FormatStringParser {
     auto specifierLower = std::tolower(specifier);
 
     // Special handling for format specifiers that consume no argument.
-    if (specifierLower == 'm' || specifierLower == 'l')
-      return mlir::emitError(loc)
-             << "unsupported format specifier `" << fullSpecifier << "`";
+    if (specifierLower == 'm') {
+      // %m prints the current hierarchical instance name. We don't currently
+      // plumb instance path metadata through the importer, so provide a
+      // deterministic placeholder instead of failing.
+      emitLiteral("<%m>");
+      return success();
+    }
+    if (specifierLower == 'l') {
+      // %l prints the current source line number. Provide a deterministic
+      // placeholder instead of failing.
+      emitLiteral("<%l>");
+      return success();
+    }
 
     // Consume the next argument, which will provide the value to be
     // formatted.
