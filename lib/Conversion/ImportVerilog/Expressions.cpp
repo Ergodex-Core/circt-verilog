@@ -9296,19 +9296,55 @@ struct RvalueExprVisitor : public ExprVisitor {
         return moore::ConstantOp::create(context.builder, loc, i1Ty, b ? 1 : 0);
       };
 
-      auto selectI32 = [&](Value cond, Value t, Value f) -> Value {
-        auto condOp =
-            moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
-        auto &tb = condOp.getTrueRegion().emplaceBlock();
-        auto &fb = condOp.getFalseRegion().emplaceBlock();
-        OpBuilder::InsertionGuard gg(context.builder);
-        context.builder.setInsertionPointToStart(&tb);
-        moore::YieldOp::create(context.builder, loc, t);
-        context.builder.setInsertionPointToStart(&fb);
-        moore::YieldOp::create(context.builder, loc, f);
-        context.builder.setInsertionPointAfter(condOp);
-        return condOp.getResult();
-      };
+	      auto selectI32 = [&](Value cond, Value t, Value f) -> Value {
+	        auto condOp =
+	            moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
+	        auto &tb = condOp.getTrueRegion().emplaceBlock();
+	        auto &fb = condOp.getFalseRegion().emplaceBlock();
+	        OpBuilder::InsertionGuard gg(context.builder);
+	        context.builder.setInsertionPointToStart(&tb);
+	        moore::YieldOp::create(context.builder, loc, t);
+	        context.builder.setInsertionPointToStart(&fb);
+	        moore::YieldOp::create(context.builder, loc, f);
+	        context.builder.setInsertionPointAfter(condOp);
+	        return condOp.getResult();
+	      };
+
+	      auto maxI32 = [&](Value a, Value b, bool signedCmp) -> Value {
+	        Value cond;
+	        if (signedCmp)
+	          cond = moore::SgtOp::create(context.builder, loc, a, b);
+	        else
+	          cond = moore::UgtOp::create(context.builder, loc, a, b);
+	        auto condOp = moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
+	        auto &tb = condOp.getTrueRegion().emplaceBlock();
+	        auto &fb = condOp.getFalseRegion().emplaceBlock();
+	        OpBuilder::InsertionGuard gg(context.builder);
+	        context.builder.setInsertionPointToStart(&tb);
+	        moore::YieldOp::create(context.builder, loc, a);
+	        context.builder.setInsertionPointToStart(&fb);
+	        moore::YieldOp::create(context.builder, loc, b);
+	        context.builder.setInsertionPointAfter(condOp);
+	        return condOp.getResult();
+	      };
+
+	      auto minI32 = [&](Value a, Value b, bool signedCmp) -> Value {
+	        Value cond;
+	        if (signedCmp)
+	          cond = moore::SltOp::create(context.builder, loc, a, b);
+	        else
+	          cond = moore::UltOp::create(context.builder, loc, a, b);
+	        auto condOp = moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
+	        auto &tb = condOp.getTrueRegion().emplaceBlock();
+	        auto &fb = condOp.getFalseRegion().emplaceBlock();
+	        OpBuilder::InsertionGuard gg(context.builder);
+	        context.builder.setInsertionPointToStart(&tb);
+	        moore::YieldOp::create(context.builder, loc, a);
+	        context.builder.setInsertionPointToStart(&fb);
+	        moore::YieldOp::create(context.builder, loc, b);
+	        context.builder.setInsertionPointAfter(condOp);
+	        return condOp.getResult();
+	      };
 
       // Declare runtime helpers used by randomize().
       auto getOrCreateExternFunc = [&](StringRef name, FunctionType fnType) {
@@ -9464,8 +9500,72 @@ struct RvalueExprVisitor : public ExprVisitor {
           ceEnabled = moore::BoolCastOp::create(context.builder, loc, mode);
         }
 
-        SmallVector<const slang::ast::Expression *> atoms;
-        collectAtoms(*ce, collectAtoms, atoms);
+        // Dist constraints: treat supported dist lists as implicit bounds on the
+        // randomized variable to improve solver convergence. Note that `dist`
+        // weights affect the probability of selecting a value, but do not remove
+        // a value from the solution set by themselves (even if weight is 0).
+        if (ce->kind == slang::ast::ExpressionKind::Dist) {
+          auto *dist = ce->as_if<slang::ast::DistExpression>();
+          if (!dist)
+            continue;
+
+          auto *lhsNv = dist->left().as_if<slang::ast::NamedValueExpression>();
+          auto *lhsProp =
+              lhsNv ? lhsNv->symbol.as_if<slang::ast::ClassPropertySymbol>() : nullptr;
+          if (!lhsProp || !randSyms.contains(lhsProp))
+            continue;
+
+          auto it = std::find(randProps.begin(), randProps.end(), lhsProp);
+          if (it == randProps.end())
+            continue;
+          size_t idx = static_cast<size_t>(it - randProps.begin());
+
+          // Only handle constant, single-value dist items for now. This is
+          // sufficient for sv-tests' chapter-18 distribution suites.
+          bool haveAny = false;
+          int64_t minAllowed = 0;
+          int64_t maxAllowed = 0;
+
+          for (auto &item : dist->items()) {
+            auto vCv = context.evaluateConstant(item.value);
+            if (!vCv || !vCv.isInteger()) {
+              haveAny = false;
+              break;
+            }
+            auto vOpt = vCv.integer().as<int64_t>();
+            if (!vOpt) {
+              haveAny = false;
+              break;
+            }
+            int64_t v = *vOpt;
+            if (!haveAny) {
+              haveAny = true;
+              minAllowed = v;
+              maxAllowed = v;
+            } else {
+              minAllowed = std::min(minAllowed, v);
+              maxAllowed = std::max(maxAllowed, v);
+            }
+          }
+
+          if (!haveAny)
+            continue;
+
+          Value minVal = moore::ConstantOp::create(context.builder, loc, i32Ty,
+                                                   minAllowed, /*isSigned=*/true);
+          Value maxVal = moore::ConstantOp::create(context.builder, loc, i32Ty,
+                                                   maxAllowed, /*isSigned=*/true);
+          const bool signedCmp = lhsProp->getType().isSigned();
+
+          loVals[idx] =
+              selectI32(ceEnabled, maxI32(loVals[idx], minVal, signedCmp), loVals[idx]);
+          hiVals[idx] =
+              selectI32(ceEnabled, minI32(hiVals[idx], maxVal, signedCmp), hiVals[idx]);
+          continue;
+        }
+
+	        SmallVector<const slang::ast::Expression *> atoms;
+	        collectAtoms(*ce, collectAtoms, atoms);
 
         for (const auto *atom : atoms) {
           auto *bin = atom ? atom->as_if<slang::ast::BinaryExpression>() : nullptr;
@@ -9522,42 +9622,6 @@ struct RvalueExprVisitor : public ExprVisitor {
           auto setLo = [&](Value v) { loVals[idx] = selectI32(ceEnabled, v, loVals[idx]); };
           auto setHi = [&](Value v) { hiVals[idx] = selectI32(ceEnabled, v, hiVals[idx]); };
 
-          auto maxVal = [&](Value a, Value b, bool signedCmp) -> Value {
-            Value cond;
-            if (signedCmp)
-              cond = moore::SgtOp::create(context.builder, loc, a, b);
-            else
-              cond = moore::UgtOp::create(context.builder, loc, a, b);
-            auto condOp = moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
-            auto &tb = condOp.getTrueRegion().emplaceBlock();
-            auto &fb = condOp.getFalseRegion().emplaceBlock();
-            OpBuilder::InsertionGuard gg(context.builder);
-            context.builder.setInsertionPointToStart(&tb);
-            moore::YieldOp::create(context.builder, loc, a);
-            context.builder.setInsertionPointToStart(&fb);
-            moore::YieldOp::create(context.builder, loc, b);
-            context.builder.setInsertionPointAfter(condOp);
-            return condOp.getResult();
-          };
-
-          auto minVal = [&](Value a, Value b, bool signedCmp) -> Value {
-            Value cond;
-            if (signedCmp)
-              cond = moore::SltOp::create(context.builder, loc, a, b);
-            else
-              cond = moore::UltOp::create(context.builder, loc, a, b);
-            auto condOp = moore::ConditionalOp::create(context.builder, loc, i32Ty, cond);
-            auto &tb = condOp.getTrueRegion().emplaceBlock();
-            auto &fb = condOp.getFalseRegion().emplaceBlock();
-            OpBuilder::InsertionGuard gg(context.builder);
-            context.builder.setInsertionPointToStart(&tb);
-            moore::YieldOp::create(context.builder, loc, a);
-            context.builder.setInsertionPointToStart(&fb);
-            moore::YieldOp::create(context.builder, loc, b);
-            context.builder.setInsertionPointAfter(condOp);
-            return condOp.getResult();
-          };
-
           const bool signedCmp = varProp->getType().isSigned();
 
           if (opk == slang::ast::BinaryOperator::Equality) {
@@ -9575,10 +9639,10 @@ struct RvalueExprVisitor : public ExprVisitor {
 
             if (opk == slang::ast::BinaryOperator::GreaterThan ||
                 opk == slang::ast::BinaryOperator::GreaterThanEqual) {
-              setLo(maxVal(loVals[idx], cand, signedCmp));
+              setLo(maxI32(loVals[idx], cand, signedCmp));
             } else if (opk == slang::ast::BinaryOperator::LessThan ||
                        opk == slang::ast::BinaryOperator::LessThanEqual) {
-              setHi(minVal(hiVals[idx], cand, signedCmp));
+              setHi(minI32(hiVals[idx], cand, signedCmp));
             }
           } else {
             // other OP var
@@ -9590,15 +9654,15 @@ struct RvalueExprVisitor : public ExprVisitor {
             if (opk == slang::ast::BinaryOperator::GreaterThan ||
                 opk == slang::ast::BinaryOperator::GreaterThanEqual) {
               // other > var  => var < other
-              setHi(minVal(hiVals[idx], cand, signedCmp));
+	              setHi(minI32(hiVals[idx], cand, signedCmp));
             } else if (opk == slang::ast::BinaryOperator::LessThan ||
                        opk == slang::ast::BinaryOperator::LessThanEqual) {
-              // other < var  => var > other
-              setLo(maxVal(loVals[idx], cand, signedCmp));
-            }
-          }
-        }
-      }
+	              // other < var  => var > other
+	              setLo(maxI32(loVals[idx], cand, signedCmp));
+	            }
+	          }
+	        }
+	      }
 
       // Build the randomization loop in the helper function.
       Block *loop = &helperFn.getBody().emplaceBlock();
@@ -9621,6 +9685,94 @@ struct RvalueExprVisitor : public ExprVisitor {
       mlir::cf::CondBranchOp::create(context.builder, loc, ltI1, tryBlock, fail);
 
       context.builder.setInsertionPointToStart(tryBlock);
+      struct DistItem {
+        int64_t value = 0;
+        int64_t weight = 1;
+      };
+      struct DistConstraintForProp {
+        const slang::ast::ConstraintBlockSymbol *block = nullptr;
+        bool isInline = false;
+        bool supported = false;
+        SmallVector<DistItem> items;
+      };
+
+      SmallVector<DistConstraintForProp> distForProp;
+      distForProp.resize(randProps.size());
+
+      // Collect a single dist constraint per rand property for sampling. If an
+      // inline dist constraint exists for a property, prefer it over any class
+      // constraints for that property (sv-tests uses inline dist to modify the
+      // distribution dynamically).
+      for (const auto &ceInfo : constraintExprs) {
+        const auto *ce = ceInfo.expr;
+        if (!ce || ce->kind != slang::ast::ExpressionKind::Dist)
+          continue;
+        auto *dist = ce->as_if<slang::ast::DistExpression>();
+        if (!dist)
+          continue;
+
+        auto *lhsNv = dist->left().as_if<slang::ast::NamedValueExpression>();
+        auto *lhsProp =
+            lhsNv ? lhsNv->symbol.as_if<slang::ast::ClassPropertySymbol>() : nullptr;
+        if (!lhsProp || !randSyms.contains(lhsProp))
+          continue;
+
+        auto it = std::find(randProps.begin(), randProps.end(), lhsProp);
+        if (it == randProps.end())
+          continue;
+        size_t idx = static_cast<size_t>(it - randProps.begin());
+
+        auto &slot = distForProp[idx];
+        if (slot.supported) {
+          // Keep an existing inline dist constraint if one is already present.
+          // Otherwise allow an inline constraint to override.
+          if (slot.isInline || !ceInfo.isInline)
+            continue;
+        }
+
+        DistConstraintForProp info;
+        info.block = ceInfo.block;
+        info.isInline = ceInfo.isInline;
+        info.supported = true;
+
+        for (auto &item : dist->items()) {
+          auto vCv = context.evaluateConstant(item.value);
+          if (!vCv || !vCv.isInteger()) {
+            info.supported = false;
+            break;
+          }
+          auto vOpt = vCv.integer().as<int64_t>();
+          if (!vOpt) {
+            info.supported = false;
+            break;
+          }
+
+          int64_t w = 1;
+          if (item.weight && item.weight->expr) {
+            auto wCv = context.evaluateConstant(*item.weight->expr);
+            if (!wCv || !wCv.isInteger()) {
+              info.supported = false;
+              break;
+            }
+            auto wOpt = wCv.integer().as<int64_t>();
+            if (!wOpt) {
+              info.supported = false;
+              break;
+            }
+            w = *wOpt;
+          }
+
+          DistItem di;
+          di.value = *vOpt;
+          di.weight = w;
+          info.items.push_back(di);
+        }
+
+        if (!info.supported)
+          continue;
+        slot = std::move(info);
+      }
+
       // Randomize fields.
       for (size_t i = 0, e = randProps.size(); i < e; ++i) {
         auto *prop = randProps[i];
@@ -9629,9 +9781,109 @@ struct RvalueExprVisitor : public ExprVisitor {
             moore::ConstantOp::create(context.builder, loc, i32Ty, fieldId, /*isSigned=*/true);
         Value lo = loVals[i];
         Value hi = hiVals[i];
-        Value r = mlir::func::CallOp::create(context.builder, loc, rangeFn,
-                                             ValueRange{lo, hi})
+
+        Value r;
+        const auto &distInfo = distForProp[i];
+        if (distInfo.supported && !distInfo.items.empty()) {
+          // Sample from the dist items using their weights. Weight 0 items are
+          // legal solutions but have zero probability of being selected unless
+          // all weights are zero.
+          SmallVector<DistItem> weighted;
+          weighted.reserve(distInfo.items.size());
+          int64_t total = 0;
+          for (auto item : distInfo.items) {
+            if (item.weight <= 0)
+              continue;
+            weighted.push_back(item);
+            total += item.weight;
+          }
+
+          if (weighted.empty() || total <= 0) {
+            // Degenerate distribution: fall back to uniform choice among the
+            // listed items.
+            int32_t n = static_cast<int32_t>(distInfo.items.size());
+            Value zero = moore::ConstantOp::create(context.builder, loc, i32Ty, 0,
+                                                  /*isSigned=*/true);
+            Value hiIdx = moore::ConstantOp::create(context.builder, loc, i32Ty, n - 1,
+                                                   /*isSigned=*/true);
+            Value pick = mlir::func::CallOp::create(context.builder, loc, rangeFn,
+                                                    ValueRange{zero, hiIdx})
+                             .getResult(0);
+            // pick >= boundary selects later items.
+            r = moore::ConstantOp::create(context.builder, loc, i32Ty, distInfo.items[0].value,
+                                          /*isSigned=*/true);
+            int64_t boundary = 1;
+            for (size_t j = 1; j < distInfo.items.size(); ++j) {
+              Value boundaryVal =
+                  moore::ConstantOp::create(context.builder, loc, i32Ty, boundary,
+                                            /*isSigned=*/true);
+              Value lt = moore::UltOp::create(context.builder, loc, pick, boundaryVal);
+              Value ge = moore::NotOp::create(context.builder, loc, lt).getResult();
+              Value val = moore::ConstantOp::create(context.builder, loc, i32Ty,
+                                                    distInfo.items[j].value, /*isSigned=*/true);
+              r = selectI32(ge, val, r);
+              boundary++;
+            }
+          } else if (weighted.size() == 1) {
+            r = moore::ConstantOp::create(context.builder, loc, i32Ty, weighted[0].value,
+                                          /*isSigned=*/true);
+          } else {
+            Value zero = moore::ConstantOp::create(context.builder, loc, i32Ty, 0,
+                                                  /*isSigned=*/true);
+            Value totalMinus1 =
+                moore::ConstantOp::create(context.builder, loc, i32Ty, total - 1,
+                                          /*isSigned=*/true);
+            Value pick = mlir::func::CallOp::create(context.builder, loc, rangeFn,
+                                                    ValueRange{zero, totalMinus1})
+                             .getResult(0);
+
+            // First weighted item is the default; subsequent items override if
+            // pick is past their cumulative boundary.
+            r = moore::ConstantOp::create(context.builder, loc, i32Ty, weighted[0].value,
+                                          /*isSigned=*/true);
+            int64_t boundary = weighted[0].weight;
+            for (size_t j = 1; j < weighted.size(); ++j) {
+              Value boundaryVal =
+                  moore::ConstantOp::create(context.builder, loc, i32Ty, boundary,
+                                            /*isSigned=*/true);
+              Value lt = moore::UltOp::create(context.builder, loc, pick, boundaryVal);
+              Value ge = moore::NotOp::create(context.builder, loc, lt).getResult();
+              Value val = moore::ConstantOp::create(context.builder, loc, i32Ty,
+                                                    weighted[j].value, /*isSigned=*/true);
+              r = selectI32(ge, val, r);
+              boundary += weighted[j].weight;
+            }
+          }
+
+          // If the dist constraint is attached to a named constraint block,
+          // gate the sampling by the current constraint_mode for that block.
+          // (Inline constraints are always enabled for the call.)
+          if (distInfo.block) {
+            int32_t blockId = context.getOrAssignConstraintBlockId(*distInfo.block);
+            Value blockIdVal = moore::ConstantOp::create(context.builder, loc, i32Ty, blockId,
+                                                        /*isSigned=*/true);
+            Value mode;
+            if (distInfo.block->flags.has(slang::ast::ConstraintBlockFlags::Static)) {
+              mode = mlir::func::CallOp::create(context.builder, loc,
+                                                constraintModeGetStaticFn, {blockIdVal})
+                         .getResult(0);
+            } else {
+              mode =
+                  mlir::func::CallOp::create(context.builder, loc, constraintModeGetFn,
+                                             ValueRange{entry.getArgument(0), blockIdVal})
                       .getResult(0);
+            }
+            Value enabled = moore::BoolCastOp::create(context.builder, loc, mode);
+            Value uniform = mlir::func::CallOp::create(context.builder, loc, rangeFn,
+                                                       ValueRange{lo, hi})
+                                .getResult(0);
+            r = selectI32(enabled, r, uniform);
+          }
+        } else {
+          r = mlir::func::CallOp::create(context.builder, loc, rangeFn, ValueRange{lo, hi})
+                  .getResult(0);
+        }
+
         Value mode;
         if (prop->lifetime == slang::ast::VariableLifetime::Static) {
           mode = mlir::func::CallOp::create(context.builder, loc, randModeGetStaticFn,
@@ -9654,9 +9906,36 @@ struct RvalueExprVisitor : public ExprVisitor {
         const auto *ce = ceInfo.expr;
         if (!ce)
           continue;
-        if (ce->kind == slang::ast::ExpressionKind::Dist)
-          continue;
-        Value v = context.convertRvalueExpression(*ce);
+
+        Value v;
+        if (ce->kind == slang::ast::ExpressionKind::Dist) {
+          // Dist constraints restrict the LHS to be one of the values/ranges
+          // in the dist list. Weights affect selection probability but do not
+          // remove an item from the legal solution set, even if weight is 0.
+          auto *dist = ce->as_if<slang::ast::DistExpression>();
+          if (!dist)
+            continue;
+
+          Value lhs = context.convertRvalueExpression(dist->left(), i32Ty);
+          if (!lhs)
+            return {};
+
+          Value any = mkBoolConst(false);
+          for (auto &item : dist->items()) {
+            Value val = context.convertRvalueExpression(item.value, i32Ty);
+            if (!val)
+              return {};
+            Value eq = moore::EqOp::create(context.builder, loc, lhs, val);
+            Value eqBool = context.convertToBool(eq, moore::Domain::TwoValued);
+            if (!eqBool)
+              return {};
+            any = moore::OrOp::create(context.builder, loc, any, eqBool);
+          }
+
+          v = any;
+        } else {
+          v = context.convertRvalueExpression(*ce);
+        }
         if (!v)
           return {};
         Value b = context.convertToBool(v, moore::Domain::TwoValued);
