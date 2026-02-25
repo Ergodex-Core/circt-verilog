@@ -2928,8 +2928,83 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   auto returnVarGuard =
       llvm::make_scope_exit([&] { functionReturnVarStack.pop_back(); });
 
-  if (failed(convertStatement(subroutine.getBody())))
-    return failure();
+  bool handledBuiltinBody = false;
+  if (!subroutine.returnValVar) {
+    // Some implicitly provided/built-in methods (e.g. class randomization API)
+    // have empty bodies in the AST. Provide minimal implementations for a
+    // couple of methods that are used by sv-tests' random stability suites.
+    auto getOrCreateExternFunc = [&](StringRef name, FunctionType type) {
+      if (auto existing = intoModuleOp.lookupSymbol<mlir::func::FuncOp>(name)) {
+        if (existing.getFunctionType() != type) {
+          mlir::emitError(lowering->op.getLoc(), "conflicting declarations for `")
+              << name << "`";
+          return mlir::func::FuncOp();
+        }
+        return existing;
+      }
+
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPointToStart(intoModuleOp.getBody());
+      getContext()->getOrLoadDialect<mlir::func::FuncDialect>();
+      auto fn = mlir::func::FuncOp::create(builder, lowering->op.getLoc(), name, type);
+      fn.setPrivate();
+      symbolTable.insert(fn);
+      return fn;
+    };
+
+    auto fnType = lowering->op.getFunctionType();
+
+    if (subroutine.name == "get_randstate") {
+      auto results = fnType.getResults();
+      if (results.size() != 1 || !isa<moore::StringType>(results.front())) {
+        mlir::emitError(lowering->op.getLoc(),
+                        "unsupported built-in `get_randstate` signature for `")
+            << lowering->op.getName() << "`";
+        return failure();
+      }
+      auto externType = FunctionType::get(getContext(), {}, {results.front()});
+      auto fn = getOrCreateExternFunc("circt_sv_get_randstate_str", externType);
+      if (!fn)
+        return failure();
+      Value res = mlir::func::CallOp::create(builder, lowering->op.getLoc(), fn, {})
+                      .getResult(0);
+      mlir::func::ReturnOp::create(builder, lowering->op.getLoc(), res);
+      builder.clearInsertionPoint();
+      handledBuiltinBody = true;
+    } else if (subroutine.name == "set_randstate") {
+      // Receiver is ignored for now; model a single global RNG state.
+      size_t stateArgIdx = subroutine.thisVar ? 1 : 0;
+      if (fnType.getNumInputs() <= stateArgIdx) {
+        mlir::emitError(lowering->op.getLoc(),
+                        "unsupported built-in `set_randstate` signature for `")
+            << lowering->op.getName() << "`";
+        return failure();
+      }
+
+      Type stateTy = fnType.getInput(stateArgIdx);
+      if (!isa<moore::StringType>(stateTy)) {
+        mlir::emitError(lowering->op.getLoc(),
+                        "unsupported built-in `set_randstate` arg type for `")
+            << lowering->op.getName() << "`: " << stateTy;
+        return failure();
+      }
+
+      Value state = block.getArgument(stateArgIdx);
+      auto externType = FunctionType::get(getContext(), {stateTy}, {});
+      auto fn = getOrCreateExternFunc("circt_sv_set_randstate_str", externType);
+      if (!fn)
+        return failure();
+      mlir::func::CallOp::create(builder, lowering->op.getLoc(), fn, {state});
+      mlir::func::ReturnOp::create(builder, lowering->op.getLoc(), ValueRange{});
+      builder.clearInsertionPoint();
+      handledBuiltinBody = true;
+    }
+  }
+
+  if (!handledBuiltinBody) {
+    if (failed(convertStatement(subroutine.getBody())))
+      return failure();
+  }
 
   // If there was no explicit return statement provided by the user, insert a
   // default one.
