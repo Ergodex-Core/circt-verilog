@@ -1917,6 +1917,12 @@ static bool circt_uvm_shims_enabled() {
   return enabled;
 }
 
+static bool circt_uvm_questa_baseline_reports_enabled() {
+  static bool enabled =
+      circt_env_truthy("CIRCT_UVM_QUESTA_BASELINE_REPORTS", /*defaultValue=*/true);
+  return enabled;
+}
+
 static bool circt_uvm_trace_objections_enabled() {
   static bool enabled =
       circt_env_truthy("CIRCT_UVM_TRACE_OBJECTIONS", /*defaultValue=*/false);
@@ -1947,6 +1953,7 @@ static bool circt_uvm_baseline_reports_emitted = false;
 static bool circt_uvm_relnotes_emitted = false;
 static bool circt_uvm_deprecated_run_emitted = false;
 static bool circt_uvm_deprecated_run_needed = false;
+static bool circt_uvm_test_done_notice_emitted = false;
 static bool circt_uvm_has_port_connections = false;
 
 extern "C" void circt_uvm_report(int32_t self, int32_t severity, const char *id,
@@ -1976,6 +1983,12 @@ static void circt_uvm_emit_baseline_reports() {
   // summary counters, not full textual report formatting.
   circt_uvm_report(/*self=*/0, /*severity=*/0, "RNTST",
                    "Running test (shim)");
+
+  // The following messages are modeled after Questa/ModelSim behavior and are
+  // intentionally optional. For VCS/Xcelium baselines, disable them by setting:
+  //   CIRCT_UVM_QUESTA_BASELINE_REPORTS=0
+  if (!circt_uvm_questa_baseline_reports_enabled())
+    return;
 
   // Under UVM_NO_DPI, Questa emits a DPI-related note for name checks.
   circt_uvm_report(/*self=*/0, /*severity=*/0, "UVM/COMP/NAMECHECK",
@@ -2010,6 +2023,8 @@ static void circt_uvm_emit_baseline_reports() {
 static void circt_uvm_maybe_emit_deprecated_run_warning() {
   if (!circt_uvm_shims_enabled())
     return;
+  if (!circt_uvm_questa_baseline_reports_enabled())
+    return;
   if (circt_uvm_deprecated_run_emitted)
     return;
   if (!circt_uvm_baseline_reports_emitted)
@@ -2041,8 +2056,21 @@ static void circt_uvm_update_phase_all_done_state() {
   // "Run done" is based on the minimal objection counter shims and is used by
   // the importer-generated report-phase worker to know when to dispatch
   // extract/check/report.
+  bool prevRunDone = circt_uvm_run_done_state;
   circt_uvm_run_done_state =
       circt_uvm_test_done_requested && (circt_uvm_objection_count <= 0);
+
+  // VCS/Xcelium parity: uvm_objection prints a deterministic TEST_DONE note
+  // when the run phase is ready to proceed (objections cleared). This affects
+  // report summary INFO totals but is not part of the sv-tests exported per-ID
+  // counters, so we emulate it at the counter level here.
+  if (circt_uvm_run_done_state && !prevRunDone &&
+      !circt_uvm_test_done_notice_emitted) {
+    circt_uvm_test_done_notice_emitted = true;
+    circt_uvm_report(
+        /*self=*/0, /*severity=*/0, "TEST_DONE",
+        "'run' phase is ready to proceed to the 'extract' phase (shim)");
+  }
 }
 static std::unordered_map<std::string, int32_t> circt_uvm_resource_db;
 static std::unordered_map<std::string, uintptr_t> circt_uvm_resource_db_ptr;
