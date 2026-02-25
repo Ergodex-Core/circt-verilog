@@ -2064,8 +2064,8 @@ static void circt_uvm_update_phase_all_done_state() {
   // when the run phase is ready to proceed (objections cleared). This affects
   // report summary INFO totals but is not part of the sv-tests exported per-ID
   // counters, so we emulate it at the counter level here.
-  if (circt_uvm_run_done_state && !prevRunDone &&
-      !circt_uvm_test_done_notice_emitted) {
+  if (!circt_uvm_questa_baseline_reports_enabled() && circt_uvm_run_done_state &&
+      !prevRunDone && !circt_uvm_test_done_notice_emitted) {
     circt_uvm_test_done_notice_emitted = true;
     circt_uvm_report(
         /*self=*/0, /*severity=*/0, "TEST_DONE",
